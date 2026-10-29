@@ -20,6 +20,7 @@
 
 #include <llvm/ADT/SmallVector.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
@@ -28,6 +29,7 @@
 
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Utils.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
@@ -222,4 +224,72 @@ llvm::FailureOr<scheduler::DataTransferType> scheduler::getDataTransferType(
 
   // Both source and destination are FIFO slots - unsupported
   return llvm::failure();
+}
+
+auto scheduler::isFloatConversion(mlir::Operation* op) -> bool {
+  auto generic = mlir::dyn_cast_if_present<mlir::linalg::GenericOp>(op);
+  if (!generic || generic.getNumDpsInputs() != 1 ||
+      generic.getNumDpsInits() != 1) {
+    return false;
+  }
+  mlir::Block& body = generic.getRegion().front();
+  if (!llvm::hasSingleElement(body.without_terminator())) return false;
+  mlir::Operation& converting = body.front();
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtFOp>(converting)) {
+    return ext.getIn().getType().isF16() && ext.getType().isF32();
+  }
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(converting)) {
+    return trunc.getIn().getType().isF32() && trunc.getType().isF16();
+  }
+  return false;
+}
+
+auto scheduler::isWideningFloatConversion(mlir::Operation* op) -> bool {
+  return isFloatConversion(op) &&
+         mlir::isa<mlir::arith::ExtFOp>(mlir::cast<mlir::linalg::GenericOp>(op)
+                                            .getRegion()
+                                            .front()
+                                            .front());
+}
+
+void scheduler::markWideConversionSlots(mlir::func::FuncOp func) {
+  llvm::SmallVector<mlir::Value> wide_slots;
+  func.walk([&](mlir::linalg::GenericOp generic) {
+    if (!isFloatConversion(generic)) return;
+    if (isWideningFloatConversion(generic)) {
+      for (auto* user : generic->getResult(0).getUsers()) {
+        if (auto write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(user)) {
+          wide_slots.push_back(write.getFifoSlot());
+        }
+      }
+    } else if (auto read = generic.getDpsInputs()[0]
+                               .getDefiningOp<mlir::ktdf::ReadFromFifoOp>()) {
+      wide_slots.push_back(read.getFifoSlot());
+    }
+  });
+
+  auto* const context = func.getContext();
+  for (auto slot : wide_slots) {
+    for (auto* user : slot.getUsers()) {
+      if (mlir::isa<mlir::ktdf::DataTransferOp>(user)) {
+        user->setAttr(
+            kVectorsPerSlotAttrName,
+            mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), 2));
+      }
+    }
+  }
+}
+
+auto scheduler::getFifoVectorType(mlir::Operation* transfer,
+                                  mlir::VectorType vector_type)
+    -> mlir::VectorType {
+  const auto vectors =
+      transfer->getAttrOfType<mlir::IntegerAttr>(kVectorsPerSlotAttrName);
+  if (!vectors || vectors.getInt() <= 1 ||
+      vector_type.getNumElements() % vectors.getInt() != 0) {
+    return vector_type;
+  }
+  return mlir::VectorType::get(
+      {vector_type.getNumElements() / vectors.getInt()},
+      vector_type.getElementType());
 }

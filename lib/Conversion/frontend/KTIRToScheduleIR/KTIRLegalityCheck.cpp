@@ -60,6 +60,16 @@ namespace {
     return true;
   }
 
+  // Accept the conversions between f16 and f32 in either direction, the two the
+  // device converts with dl16tofp32 and fp32todl16. Any other width is not one
+  // it has an instruction for.
+  if (auto ext = mlir::dyn_cast<mlir::arith::ExtFOp>(op)) {
+    return ext.getIn().getType().isF16() && ext.getType().isF32();
+  }
+  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(op)) {
+    return trunc.getIn().getType().isF32() && trunc.getType().isF16();
+  }
+
   // Accept a constant the body computes against: materialize-registers puts it
   // in the register its maps_to names, so it is a value read, not an operation.
   if (mlir::isa<mlir::arith::ConstantOp>(op)) {
