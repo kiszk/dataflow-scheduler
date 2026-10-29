@@ -129,6 +129,30 @@ struct KTIRMapAndTilePass
   return llvm::success();
 }
 
+/// Gets the element type the vector width of @p op is chosen for.
+///
+/// That is the element @p op produces, except across a conversion between
+/// widths: the device converts a whole vector of the narrower element into
+/// vectors of the wider one, or back, so a tile has to be as many lanes as the
+/// narrower element fills. Sized by the wider one instead, a tile would only
+/// hold part of what one conversion reads, or more than one conversion writes.
+auto getVectorElementType(mlir::linalg::LinalgOp op, mlir::Type result_element)
+    -> mlir::Type {
+  mlir::Type narrowest = result_element;
+  op.getBlock()->walk([&](mlir::Operation* body_op) {
+    if (!llvm::isa<mlir::arith::ExtFOp, mlir::arith::TruncFOp>(body_op)) {
+      return;
+    }
+    for (const auto type :
+         {body_op->getOperand(0).getType(), body_op->getResult(0).getType()}) {
+      if (type.getIntOrFloatBitWidth() < narrowest.getIntOrFloatBitWidth()) {
+        narrowest = type;
+      }
+    }
+  });
+  return narrowest;
+}
+
 /// Maps @p op to the default compute resource, unless it already is, and
 /// annotates the vector width for @p element_type on it as the throttle.
 ///
@@ -169,8 +193,8 @@ auto determineTileSizes(mlir::linalg::LinalgOp op,
          << mlir::OpWithFlags(op, kSkipRegions);
 
   // Map the op to a compute resource, if it isn't already.
-  const auto vector_length =
-      mapToCompute(op, mapping, result_type.getElementType());
+  const auto vector_length = mapToCompute(
+      op, mapping, getVectorElementType(op, result_type.getElementType()));
 
   // The tile-sizes vector must cover every loop dimension (getNumLoops()).
   // Reduction dimensions are skipped (tile size = 0) so the tiling infra does
@@ -640,7 +664,8 @@ void KTIRMapAndTilePass::runOnOperation() {
     }
 
     LDBG() << "mapping nested " << mlir::OpWithFlags(op, kSkipRegions);
-    mapToCompute(op, mapping, result_type.getElementType());
+    mapToCompute(op, mapping,
+                 getVectorElementType(op, result_type.getElementType()));
   }
 
   // Tile all the compute operations and put them into loop nests that feature

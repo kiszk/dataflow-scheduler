@@ -744,6 +744,25 @@ struct LowerDataTransferPattern
  private:
   const ResourceToUnits& components_;
 
+  /// Gets \p map moved \p offset elements along its innermost result, where
+  /// the next of the vectors a FIFO slot is moved as begins.
+  static mlir::AffineMap shiftInnermost(mlir::AffineMap map, int64_t offset) {
+    if (offset == 0 || map.getNumResults() == 0) return map;
+    llvm::SmallVector<mlir::AffineExpr> results(map.getResults());
+    results.back() = results.back() + offset;
+    return mlir::AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                                map.getContext());
+  }
+
+  /// Gets \p sizes with the innermost narrowed to \p lanes, the part of them
+  /// one of the vectors a FIFO slot is moved as covers.
+  static llvm::SmallVector<int64_t> narrowInnermost(
+      llvm::ArrayRef<int64_t> sizes, int64_t lanes) {
+    llvm::SmallVector<int64_t> narrowed(sizes);
+    if (!narrowed.empty()) narrowed.back() = lanes;
+    return narrowed;
+  }
+
   /// Lower as CompositeLoadAndStore.
   ///
   /// An AGEN composite transfer moves at most one hardware vector per time
@@ -951,44 +970,61 @@ struct LowerDataTransferPattern
       return mlir::failure();
     }
 
+    // One send per vector the slot is moved as, each loading the next run of
+    // the innermost dimension. A splat is one load broadcast to the whole
+    // destination, which is never wider than one vector.
+    const auto send_type =
+        is_splat ? vector_type
+                 : getFifoVectorType(data_transfer_op, vector_type);
+    const int64_t lanes = send_type.getNumElements();
+    const int64_t sends = vector_type.getNumElements() / lanes;
+
     auto load_type = is_splat
                          ? mlir::VectorType::get({load_elements},
                                                  vector_type.getElementType())
-                         : vector_type;
+                         : send_type;
 
-    mlir::IntegerSet load_set =
-        buildIntegerSetFromSizes(rewriter.getContext(), src_static_sizes);
+    mlir::IntegerSet load_set = buildIntegerSetFromSizes(
+        rewriter.getContext(),
+        sends == 1 ? llvm::SmallVector<int64_t>(src_static_sizes)
+                   : narrowInnermost(src_static_sizes, lanes));
     mlir::AffineMap load_order = mlir::AffineMap::getMultiDimIdentityMap(
         num_dims, rewriter.getContext());
 
-    // Create vector_load operation
-    auto vector_load_op = mlir::agen::VectorLoadOp::create(
-        rewriter, data_transfer_op.getLoc(), load_type, src_memref,
-        /*dbgName=*/nullptr, src_map, src_indices, load_set, load_order);
+    mlir::Value dest_unit;
+    for (int64_t part = 0; part < sends; ++part) {
+      // Create vector_load operation
+      auto vector_load_op = mlir::agen::VectorLoadOp::create(
+          rewriter, data_transfer_op.getLoc(), load_type, src_memref,
+          /*dbgName=*/nullptr, shiftInnermost(src_map, part * lanes),
+          src_indices, load_set, load_order);
 
-    // For splat: broadcast the granularity-sized load to full destination
-    // width.
-    mlir::Value send_value = vector_load_op.getResult();
-    if (is_splat) {
-      send_value =
-          scheduler::emitSplatShuffle(rewriter, data_transfer_op.getLoc(),
-                                      send_value, vector_type.getNumElements());
+      // For splat: broadcast the granularity-sized load to full destination
+      // width.
+      mlir::Value send_value = vector_load_op.getResult();
+      if (is_splat) {
+        send_value = scheduler::emitSplatShuffle(
+            rewriter, data_transfer_op.getLoc(), send_value,
+            vector_type.getNumElements());
+      }
+
+      // Resolve the destination unit from the FIFO dest attribute
+      if (!dest_unit) {
+        auto dest_unit_result = resolveUnitFromFifoAttr(
+            dst_fifo_slot_type.getDest(), components_, rewriter, program_unit,
+            data_transfer_op.getLoc(), data_transfer_op.getOperation());
+        if (mlir::failed(dest_unit_result)) {
+          return mlir::failure();
+        }
+        dest_unit = *dest_unit_result;
+      }
+
+      // Create dataflow.send operation
+      mlir::dataflow::SendOp::create(rewriter, data_transfer_op.getLoc(),
+                                     dest_unit, send_value,
+                                     /*dir=*/nullptr,
+                                     /*dbgName=*/nullptr);
     }
-
-    // Resolve the destination unit from the FIFO dest attribute
-    auto dest_unit_result = resolveUnitFromFifoAttr(
-        dst_fifo_slot_type.getDest(), components_, rewriter, program_unit,
-        data_transfer_op.getLoc(), data_transfer_op.getOperation());
-    if (mlir::failed(dest_unit_result)) {
-      return mlir::failure();
-    }
-    mlir::Value dest_unit = *dest_unit_result;
-
-    // Create dataflow.send operation
-    mlir::dataflow::SendOp::create(rewriter, data_transfer_op.getLoc(),
-                                   dest_unit, send_value,
-                                   /*dir=*/nullptr,
-                                   /*dbgName=*/nullptr);
 
     // Erase the original data_transfer operation
     rewriter.eraseOp(data_transfer_op);
@@ -1002,9 +1038,16 @@ struct LowerDataTransferPattern
       mlir::ValueRange dst_indices, llvm::ArrayRef<int64_t> dst_static_sizes,
       unsigned num_dims, mlir::VectorType vector_type, mlir::AffineMap dst_map,
       mlir::ktdf::FifoSlotType src_fifo_slot_type) const {
-    // Build store_set from destination sizes
+    // One receive per vector the slot is moved as, each storing the next run of
+    // the innermost dimension.
+    const auto receive_type = getFifoVectorType(data_transfer_op, vector_type);
+    const int64_t lanes = receive_type.getNumElements();
+    const int64_t receives = vector_type.getNumElements() / lanes;
+    const auto store_sizes = receives == 1
+                                 ? llvm::SmallVector<int64_t>(dst_static_sizes)
+                                 : narrowInnermost(dst_static_sizes, lanes);
     auto store_set =
-        buildIntegerSetFromSizes(rewriter.getContext(), dst_static_sizes);
+        buildIntegerSetFromSizes(rewriter.getContext(), store_sizes);
 
     // Build store_order
     auto store_order = mlir::AffineMap::getMultiDimIdentityMap(
@@ -1027,15 +1070,15 @@ struct LowerDataTransferPattern
     }
     mlir::Value src_unit = *src_unit_result;
 
-    // Create dataflow.receive operation
-    auto receive_op = mlir::dataflow::ReceiveOp::create(
-        rewriter, data_transfer_op.getLoc(), vector_type, src_unit,
-        /*dbgName=*/nullptr);
-
-    // Create vector_store operation
-    mlir::agen::VectorStoreOp::create(
-        rewriter, data_transfer_op.getLoc(), receive_op.getData(), dst_memref,
-        /*dbgName=*/nullptr, dst_map, dst_indices, store_set, store_order);
+    for (int64_t part = 0; part < receives; ++part) {
+      auto receive_op = mlir::dataflow::ReceiveOp::create(
+          rewriter, data_transfer_op.getLoc(), receive_type, src_unit,
+          /*dbgName=*/nullptr);
+      mlir::agen::VectorStoreOp::create(
+          rewriter, data_transfer_op.getLoc(), receive_op.getData(), dst_memref,
+          /*dbgName=*/nullptr, shiftInnermost(dst_map, part * lanes),
+          dst_indices, store_set, store_order);
+    }
 
     // Erase the original data_transfer operation
     rewriter.eraseOp(data_transfer_op);

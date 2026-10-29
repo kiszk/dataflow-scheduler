@@ -569,6 +569,181 @@ struct LowerLinalgGenericPattern
   }
 };
 
+/// Pattern to lower a linalg.generic that converts between f16 and f32, the
+/// device's dl16tofp32 and fp32todl16.
+///
+/// The conversion takes one f16 vector to two f32 vectors, or two back to one,
+/// so the f32 side of it is a FIFO slot moved as two vectors. Both FIFO ends
+/// are lowered here, with the conversion between them: dl16tofp32 receives the
+/// f16 vector and sends each half it widens,
+///
+///   %in = dataflow.receive : vector<64xf16>
+///   %w0 = vectorchain.cast %in : vector<64xf16>, vector<64xf32>
+///   %lo = vectorchain.shuffle input(%w0) {indices = [0, 1, 2, 3], ...}
+///   dataflow.send %lo : vector<32xf32>
+///   %w1 = vectorchain.cast %in : vector<64xf16>, vector<64xf32>
+///   %hi = vectorchain.shuffle input(%w1) {indices = [4, 5, 6, 7], ...}
+///   dataflow.send %hi : vector<32xf32>
+///
+/// and fp32todl16 receives both halves and packs them into one,
+///
+///   %s0 = dataflow.receive : vector<32xf32>
+///   %s1 = dataflow.receive : vector<32xf32>
+///   %n0 = vectorchain.cast %s0 : vector<32xf32>, vector<32xf16>
+///   %n1 = vectorchain.cast %s1 : vector<32xf32>, vector<32xf16>
+///   %p = vectorchain.pack %n0, %n1 {indices = [0, ..., 7], ...}
+///
+/// Each shuffle reads a cast of its own: a cast two shuffles share is not one
+/// the code generator selects the conversion from.
+///
+/// The halves are in the order the hardware interleaves them, the staggered
+/// element arrangement, not one after the other: of every 8 f16 lanes the first
+/// 4 go to the first f32 vector and the other 4 to the second.
+struct LowerFloatConversionPattern
+    : public mlir::OpRewritePattern<mlir::linalg::GenericOp> {
+  LowerFloatConversionPattern(mlir::MLIRContext* context,
+                              const ResourceToUnits& components)
+      : OpRewritePattern(context, /*benefit=*/2), components_(components) {}
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::linalg::GenericOp generic_op,
+      mlir::PatternRewriter& rewriter) const override {
+    if (!generic_op.hasPureTensorSemantics() ||
+        !isFloatConversion(generic_op)) {
+      return rewriter.notifyMatchFailure(generic_op, "not a float conversion");
+    }
+    const bool widens = isWideningFloatConversion(generic_op);
+
+    auto narrow_type = getFlattenedVectorType(llvm::cast<mlir::ShapedType>(
+        (widens ? generic_op.getDpsInputs()[0] : generic_op.getResult(0))
+            .getType()));
+    auto wide_type = getFlattenedVectorType(llvm::cast<mlir::ShapedType>(
+        (widens ? generic_op.getResult(0) : generic_op.getDpsInputs()[0])
+            .getType()));
+    if (!narrow_type || !wide_type) {
+      return rewriter.notifyMatchFailure(generic_op, "not statically shaped");
+    }
+
+    // The FIFO slot on the wide side, which this lowers with the conversion.
+    mlir::ktdf::ReadFromFifoOp wide_read;
+    mlir::ktdf::WriteToFifoOp wide_write;
+    if (widens) {
+      if (!generic_op.getResult(0).hasOneUse() ||
+          !(wide_write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(
+                *generic_op.getResult(0).user_begin()))) {
+        return generic_op.emitError(
+            "the widened result of a dl16tofp32 conversion must be written to "
+            "a FIFO and nothing else");
+      }
+    } else {
+      wide_read = generic_op.getDpsInputs()[0]
+                      .getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
+      if (!wide_read || wide_read.getSplat()) {
+        return generic_op.emitError(
+            "the input of a fp32todl16 conversion must be read from a FIFO");
+      }
+    }
+
+    // The wide side is two vectors, each of the instruction's groups of 8
+    // narrow lanes giving 4 to either.
+    constexpr int64_t kGroup = 8;
+    if (narrow_type.getNumElements() % kGroup != 0) {
+      return generic_op.emitError(
+                 "a conversion between f16 and f32 must cover whole groups of ")
+             << kGroup << " lanes; it covers " << narrow_type.getNumElements();
+    }
+    const auto half_type = mlir::VectorType::get(
+        {wide_type.getNumElements() / 2}, wide_type.getElementType());
+
+    auto program_unit =
+        generic_op->getParentOfType<mlir::dataflow::ProgramUnitOp>();
+    if (!program_unit) {
+      return rewriter.notifyMatchFailure(generic_op,
+                                         "not inside a program_unit");
+    }
+
+    const auto loc = generic_op.getLoc();
+    rewriter.setInsertionPoint(generic_op);
+    const int64_t half = half_type.getNumElements();
+    auto narrow_half_type =
+        mlir::VectorType::get({half}, narrow_type.getElementType());
+    auto cast = [&](mlir::Value value, mlir::VectorType type) -> mlir::Value {
+      return mlir::vectorchain::CastOp::create(rewriter, loc, type, value,
+                                               /*mask=*/nullptr,
+                                               /*dbgName=*/nullptr)
+          .getResult();
+    };
+    auto indices = [&](int64_t first, int64_t count) {
+      llvm::SmallVector<mlir::Attribute> result;
+      for (int64_t i = first; i < first + count; ++i) {
+        result.push_back(rewriter.getI32IntegerAttr(static_cast<int32_t>(i)));
+      }
+      return rewriter.getArrayAttr(result);
+    };
+
+    const int64_t repetition = narrow_type.getNumElements() / kGroup;
+
+    if (widens) {
+      auto dest_unit = resolveUnitFromFifoAttr(
+          llvm::cast<mlir::ktdf::FifoSlotType>(
+              wide_write.getFifoSlot().getType())
+              .getDest(),
+          components_, rewriter, program_unit, wide_write.getLoc(),
+          wide_write.getOperation());
+      if (mlir::failed(dest_unit)) return mlir::failure();
+
+      mlir::Value narrow = generic_op.getDpsInputs()[0];
+      auto widened_type = mlir::VectorType::get(narrow_type.getShape(),
+                                                half_type.getElementType());
+      for (int64_t part = 0; part < 2; ++part) {
+        auto shuffle = mlir::vectorchain::ShuffleOp::create(
+            rewriter, loc, half_type, cast(narrow, widened_type),
+            /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
+            /*mask=*/nullptr, /*dbgName=*/nullptr,
+            indices(part * kGroup / 2, kGroup / 2),
+            rewriter.getI32IntegerAttr(static_cast<int32_t>(repetition)));
+        mlir::dataflow::SendOp::create(rewriter, wide_write.getLoc(),
+                                       *dest_unit, shuffle.getOutput(),
+                                       /*dir=*/nullptr, /*dbgName=*/nullptr);
+      }
+      rewriter.eraseOp(wide_write);
+      rewriter.eraseOp(generic_op);
+      return mlir::success();
+    }
+
+    // Both halves are received where the read stood, so whatever else reads a
+    // FIFO in between keeps its place in the order the sender sends.
+    rewriter.setInsertionPoint(wide_read);
+    auto src_unit = resolveUnitFromFifoAttr(
+        llvm::cast<mlir::ktdf::FifoSlotType>(wide_read.getFifoSlot().getType())
+            .getSrc(),
+        components_, rewriter, program_unit, wide_read.getLoc(),
+        wide_read.getOperation());
+    if (mlir::failed(src_unit)) return mlir::failure();
+
+    llvm::SmallVector<mlir::Value, 2> narrowed;
+    for (int64_t part = 0; part < 2; ++part) {
+      narrowed.push_back(mlir::dataflow::ReceiveOp::create(
+                             rewriter, wide_read.getLoc(), half_type, *src_unit,
+                             /*dbgName=*/nullptr)
+                             .getData());
+    }
+    rewriter.setInsertionPoint(generic_op);
+    for (auto& value : narrowed) value = cast(value, narrow_half_type);
+    auto pack = mlir::vectorchain::PackOp::create(
+        rewriter, loc, narrow_type, narrowed[0], narrowed[1],
+        /*mask=*/mlir::Value{}, /*dbgName=*/mlir::StringAttr{},
+        indices(0, kGroup), rewriter.getIndexAttr(repetition),
+        /*sign_extend=*/rewriter.getBoolAttr(false));
+    rewriter.replaceOp(generic_op, pack.getResult());
+    if (wide_read->use_empty()) rewriter.eraseOp(wide_read);
+    return mlir::success();
+  }
+
+ private:
+  const ResourceToUnits& components_;
+};
+
 /// Pattern to lower linalg.fill into:
 ///   vectorchain.constant_bitstream {value = [0x0]} : vector<1xT>
 ///   vectorchain.shuffle ... {indices = [0 : i32], repetition = N}
@@ -693,7 +868,9 @@ struct LowerLinalgFillPattern
 }  // namespace
 
 void scheduler::populateLinalgLoweringPatterns(
-    mlir::RewritePatternSet& patterns, SymbolAllocator& symbols) {
+    mlir::RewritePatternSet& patterns, SymbolAllocator& symbols,
+    const ResourceToUnits& components) {
+  patterns.add<LowerFloatConversionPattern>(patterns.getContext(), components);
   patterns.add<LowerLinalgGenericPattern>(patterns.getContext());
   patterns.add<LowerLinalgFillPattern>(patterns.getContext(), symbols);
 }
