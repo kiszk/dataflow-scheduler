@@ -20,6 +20,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Utils.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
@@ -83,18 +84,6 @@ namespace {
   // it has an instruction for. Where in the body one may stand is checked by
   // checkFloatConversionBody. Reject everything else.
   return isDeviceFloatConversion(op);
-}
-
-[[nodiscard]] auto isStandaloneFloatConversion(mlir::Operation* op) -> bool {
-  auto generic = mlir::dyn_cast_if_present<mlir::linalg::GenericOp>(op);
-  if (!generic || generic.getNumDpsInputs() != 1) return false;
-  mlir::Block& body = generic.getRegion().front();
-  if (!llvm::hasSingleElement(body.without_terminator())) return false;
-  auto& conversion = body.front();
-  return isDeviceFloatConversion(&conversion) &&
-         conversion.getOperand(0) == body.getArgument(0) &&
-         body.getTerminator()->getOperands() ==
-             mlir::ValueRange(conversion.getResult(0));
 }
 
 /// Recognizes an index-preserving f32 unary op between standalone casts.
