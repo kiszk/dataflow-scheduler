@@ -1038,29 +1038,28 @@ struct LowerDataTransferPattern
     }
 
     auto is_copy = transfer_mode == mlir::ktdf::TransferMode::Copy;
-    const auto vectors =
-        data_transfer_op->getAttrOfType<mlir::IntegerAttr>(
-            kVectorsPerSlotAttrName);
+    const auto vectors = data_transfer_op->getAttrOfType<mlir::IntegerAttr>(
+        kVectorsPerSlotAttrName);
     if (!is_copy && vectors && vectors.getInt() > 1) {
       return data_transfer_op.emitError(
-          "splat/pad transfer cannot fill a FIFO slot moved as multiple vectors");
+          "splat/pad transfer cannot fill a FIFO slot moved as multiple "
+          "vectors");
     }
 
     // One send per vector the slot is moved as, each loading the next run of
     // the slot's elements. A splat is one load broadcast to the whole
     // destination, which is never wider than one vector:
     // markWideConversionSlots rejects one into a slot moved as several.
-    const auto send_type =
-        getFifoVectorType(data_transfer_op, vector_type);
+    const auto send_type = getFifoVectorType(data_transfer_op, vector_type);
     const int64_t lanes = send_type.getNumElements();
     const int64_t sends = vector_type.getNumElements() / lanes;
     auto cut = cutIntoParts(data_transfer_op, src_static_sizes, src_map, sends);
     if (mlir::failed(cut)) return mlir::failure();
 
-    auto load_type =
-        is_copy ? send_type
-                : mlir::VectorType::get({load_elements},
-                                       vector_type.getElementType());
+    auto load_type = is_copy
+                         ? send_type
+                         : mlir::VectorType::get({load_elements},
+                                                 vector_type.getElementType());
 
     mlir::IntegerSet load_set =
         buildIntegerSetFromSizes(rewriter.getContext(), cut->sizes);
