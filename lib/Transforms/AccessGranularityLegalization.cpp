@@ -196,6 +196,9 @@ static mlir::LogicalResult legalizeTransfer(
     const mlir::ktdf_arch::ResourceKinds& resource_kinds) {
   // Only loads (memref source) are handled here.
   if (!transfer.isSourceMemRef()) return mlir::success();
+  // Splat legalization widens only the load, preserving the full-width FIFO.
+  if (transfer.getTransferMode() == mlir::ktdf::TransferMode::Splat)
+    return mlir::success();
 
   // Leave splats to splat-legalization.  It has to see how many elements the
   // splat really asked for, and widening the source here would overwrite that.
