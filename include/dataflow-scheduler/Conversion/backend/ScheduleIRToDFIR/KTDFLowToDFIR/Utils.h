@@ -98,7 +98,8 @@ static constexpr llvm::StringLiteral kVectorsPerSlotAttrName =
     "dataflow_scheduler.vectors_per_slot";
 
 /// Gets whether \p generic converts between f16 and f32 and nothing else, and
-/// so has a wide side twice its narrow one.
+/// so has a wide side twice its narrow one: a lane-wise linalg.generic on
+/// tensors whose body converts its one input and yields the result.
 [[nodiscard]] auto isFloatConversion(mlir::Operation* generic) -> bool;
 
 /// Gets whether \p generic is a float conversion that widens, reading f16 and
@@ -110,8 +111,11 @@ static constexpr llvm::StringLiteral kVectorsPerSlotAttrName =
 ///
 /// The conversion takes one vector of the narrow element to two of the wide
 /// one, so its wide slot is two vectors, which both ends of the FIFO have to
-/// agree on.
-void markWideConversionSlots(mlir::func::FuncOp func);
+/// agree on. Fails, with an error, on a conversion whose wide side is not a
+/// FIFO only it uses, or whose FIFO has another end that moves the slot as
+/// one vector.
+[[nodiscard]] auto markWideConversionSlots(mlir::func::FuncOp func)
+    -> mlir::LogicalResult;
 
 /// Gets the vector one send or receive moves for \p transfer, a
 /// `ktdf.data_transfer` of \p vector_type into or out of a FIFO slot.

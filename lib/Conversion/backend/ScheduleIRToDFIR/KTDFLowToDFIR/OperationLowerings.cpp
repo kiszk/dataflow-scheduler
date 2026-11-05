@@ -947,7 +947,8 @@ mlir::LogicalResult scheduler::runOperationLowerings(
   patterns.add<LowerReadFromFifoPattern>(func.getContext(), mapping.byKind(),
                                          components);
   patterns.add<LowerWriteToFifoPattern>(func.getContext(), components);
-  populateDataTransferLoweringPatterns(patterns, components);
+  populateDataTransferLoweringPatterns(patterns, components,
+                                       mapping.byKind().getDefaultCompute());
   patterns.add<LowerSignalPattern>(func.getContext(), scheduler_ctx,
                                    components);
   patterns.add<LowerGetTileSizePattern>(func.getContext(), scheduler_ctx,

@@ -30,7 +30,9 @@
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 
 using namespace scheduler;
@@ -226,22 +228,50 @@ llvm::FailureOr<scheduler::DataTransferType> scheduler::getDataTransferType(
   return llvm::failure();
 }
 
+namespace {
+
+/// Gets whether \p map, an indexing map of a loop nest of \p ranges, takes the
+/// loop iterations to the elements of its operand in the same row-major order:
+/// a permutation that only moves loops of one iteration.
+auto keepsRowMajorOrder(mlir::AffineMap map, llvm::ArrayRef<int64_t> ranges)
+    -> bool {
+  if (!map.isPermutation()) return false;
+  int64_t last = -1;
+  for (auto result : map.getResults()) {
+    const auto dim = llvm::cast<mlir::AffineDimExpr>(result).getPosition();
+    if (ranges[dim] == 1) continue;
+    if (static_cast<int64_t>(dim) < last) return false;
+    last = dim;
+  }
+  return true;
+}
+
+}  // namespace
+
 auto scheduler::isFloatConversion(mlir::Operation* op) -> bool {
   auto generic = mlir::dyn_cast_if_present<mlir::linalg::GenericOp>(op);
   if (!generic || generic.getNumDpsInputs() != 1 ||
-      generic.getNumDpsInits() != 1) {
+      generic.getNumDpsInits() != 1 || !generic.hasPureTensorSemantics() ||
+      generic.getNumResults() != 1) {
     return false;
   }
+  // Lane-wise: every lane of the input converts into the same lane of the
+  // result, so the conversion is one of whole vectors.
+  if (generic.getNumParallelLoops() != generic.getNumLoops() ||
+      !llvm::all_of(generic->getOpOperands(), [&](mlir::OpOperand& operand) {
+        return keepsRowMajorOrder(generic.getMatchingIndexingMap(&operand),
+                                  generic.getStaticLoopRanges());
+      })) {
+    return false;
+  }
+  // The body converts its input and yields that, and does nothing else.
   mlir::Block& body = generic.getRegion().front();
   if (!llvm::hasSingleElement(body.without_terminator())) return false;
   mlir::Operation& converting = body.front();
-  if (auto ext = mlir::dyn_cast<mlir::arith::ExtFOp>(converting)) {
-    return ext.getIn().getType().isF16() && ext.getType().isF32();
-  }
-  if (auto trunc = mlir::dyn_cast<mlir::arith::TruncFOp>(converting)) {
-    return trunc.getIn().getType().isF32() && trunc.getType().isF16();
-  }
-  return false;
+  return isDeviceFloatConversion(&converting) &&
+         converting.getOperand(0) == body.getArgument(0) &&
+         body.getTerminator()->getOperands() ==
+             mlir::ValueRange(converting.getResult(0));
 }
 
 auto scheduler::isWideningFloatConversion(mlir::Operation* op) -> bool {
@@ -252,32 +282,102 @@ auto scheduler::isWideningFloatConversion(mlir::Operation* op) -> bool {
                                             .front());
 }
 
-void scheduler::markWideConversionSlots(mlir::func::FuncOp func) {
-  llvm::SmallVector<mlir::Value> wide_slots;
+auto scheduler::markWideConversionSlots(mlir::func::FuncOp func)
+    -> mlir::LogicalResult {
+  // The FIFO slot on the wide side of each conversion. Each end of the slot is
+  // lowered as two vectors: the conversion lowers its own end, and a transfer
+  // to or from memory is marked so it lowers the other. Any other end would
+  // move the slot as one vector, so it is rejected here, while both ends are
+  // still in sight.
+  bool failed = false;
   func.walk([&](mlir::linalg::GenericOp generic) {
-    if (!isFloatConversion(generic)) return;
-    if (isWideningFloatConversion(generic)) {
-      for (auto* user : generic->getResult(0).getUsers()) {
-        if (auto write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(user)) {
-          wide_slots.push_back(write.getFifoSlot());
+    if (!isFloatConversion(generic)) {
+      // A conversion that is not one of a whole tensor, as the device converts,
+      // is not one this lowers.
+      generic.getRegion().walk([&](mlir::Operation* inner) {
+        if (isDeviceFloatConversion(inner)) {
+          inner->emitError(
+              "a conversion between f16 and f32 must be the only operation of "
+              "a lane-wise linalg.generic on tensors, converting its one "
+              "input");
+          failed = true;
         }
+      });
+      return;
+    }
+
+    const bool widens = isWideningFloatConversion(generic);
+    mlir::Value slot;
+    if (widens) {
+      auto result = generic->getResult(0);
+      auto write =
+          result.hasOneUse()
+              ? mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(*result.user_begin())
+              : nullptr;
+      if (!write) {
+        generic.emitError(
+            "the widened result of a dl16tofp32 conversion must be written to "
+            "a FIFO and nothing else");
+        failed = true;
+        return;
       }
-    } else if (auto read = generic.getDpsInputs()[0]
-                               .getDefiningOp<mlir::ktdf::ReadFromFifoOp>()) {
-      wide_slots.push_back(read.getFifoSlot());
+      slot = write.getFifoSlot();
+    } else {
+      auto input = generic.getDpsInputs()[0];
+      auto read = input.getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
+      if (!read || read.getSplat() || !input.hasOneUse()) {
+        generic.emitError(
+            "the input of a fp32todl16 conversion must be read from a FIFO and "
+            "used by nothing else");
+        failed = true;
+        return;
+      }
+      slot = read.getFifoSlot();
+    }
+
+    for (auto* user : slot.getUsers()) {
+      auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(user);
+      if (!transfer) {
+        // The conversion's own end, or the other end in another compute unit.
+        if (auto write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(user);
+            write &&
+            isWideningFloatConversion(write.getData().getDefiningOp())) {
+          continue;
+        }
+        if (auto read = mlir::dyn_cast<mlir::ktdf::ReadFromFifoOp>(user);
+            read &&
+            llvm::all_of(read->getUsers(),
+                         [](mlir::Operation* use) {
+                           return isFloatConversion(use) &&
+                                  !isWideningFloatConversion(use);
+                         }) &&
+            !read->use_empty()) {
+          continue;
+        }
+        user->emitError(
+                "the f32 side of a conversion between f16 and f32 moves as two "
+                "vectors, so the other end of its FIFO must be a transfer to "
+                "or from memory or another such conversion")
+                .attachNote(generic.getLoc())
+            << "the conversion";
+        failed = true;
+        continue;
+      }
+      if (mlir::ktdf::isBroadcastTransfer(transfer)) {
+        transfer.emitError(
+                    "the f32 side of a conversion between f16 and f32 moves as "
+                    "two vectors, which a splat or pad transfer does not")
+                .attachNote(generic.getLoc())
+            << "the conversion";
+        failed = true;
+        continue;
+      }
+      transfer->setAttr(kVectorsPerSlotAttrName,
+                        mlir::IntegerAttr::get(
+                            mlir::IntegerType::get(func.getContext(), 64), 2));
     }
   });
-
-  auto* const context = func.getContext();
-  for (auto slot : wide_slots) {
-    for (auto* user : slot.getUsers()) {
-      if (mlir::isa<mlir::ktdf::DataTransferOp>(user)) {
-        user->setAttr(
-            kVectorsPerSlotAttrName,
-            mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), 2));
-      }
-    }
-  }
+  return mlir::failure(failed);
 }
 
 auto scheduler::getFifoVectorType(mlir::Operation* transfer,

@@ -596,9 +596,15 @@ struct LowerLinalgGenericPattern
 /// Each shuffle reads a cast of its own: a cast two shuffles share is not one
 /// the code generator selects the conversion from.
 ///
-/// The halves are in the order the hardware interleaves them, the staggered
-/// element arrangement, not one after the other: of every 8 f16 lanes the first
-/// 4 go to the first f32 vector and the other 4 to the second.
+/// The f32 side is in the staggered element arrangement the hardware converts
+/// to and from: of every 8 f16 lanes the first 4 are in the first f32 vector
+/// and the other 4 in the second. The memory end moves the two vectors as the
+/// two halves of the f32 slot one after the other, so the f32 buffer holds the
+/// elements in that arrangement, not in the order of the f16 ones.
+///
+/// markWideConversionSlots has checked beforehand that the wide side is a FIFO
+/// only the conversion uses here, and that its other end moves it as two
+/// vectors too.
 struct LowerFloatConversionPattern
     : public mlir::OpRewritePattern<mlir::linalg::GenericOp> {
   LowerFloatConversionPattern(mlir::MLIRContext* context,
@@ -608,8 +614,7 @@ struct LowerFloatConversionPattern
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const override {
-    if (!generic_op.hasPureTensorSemantics() ||
-        !isFloatConversion(generic_op)) {
+    if (!isFloatConversion(generic_op)) {
       return rewriter.notifyMatchFailure(generic_op, "not a float conversion");
     }
     const bool widens = isWideningFloatConversion(generic_op);
@@ -631,16 +636,16 @@ struct LowerFloatConversionPattern
       if (!generic_op.getResult(0).hasOneUse() ||
           !(wide_write = mlir::dyn_cast<mlir::ktdf::WriteToFifoOp>(
                 *generic_op.getResult(0).user_begin()))) {
-        return generic_op.emitError(
-            "the widened result of a dl16tofp32 conversion must be written to "
-            "a FIFO and nothing else");
+        return rewriter.notifyMatchFailure(
+            generic_op, "widened result is not only written to a FIFO");
       }
     } else {
       wide_read = generic_op.getDpsInputs()[0]
                       .getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
-      if (!wide_read || wide_read.getSplat()) {
-        return generic_op.emitError(
-            "the input of a fp32todl16 conversion must be read from a FIFO");
+      if (!wide_read || wide_read.getSplat() ||
+          !generic_op.getDpsInputs()[0].hasOneUse()) {
+        return rewriter.notifyMatchFailure(
+            generic_op, "input is not only read from a FIFO");
       }
     }
 
@@ -663,7 +668,6 @@ struct LowerFloatConversionPattern
     }
 
     const auto loc = generic_op.getLoc();
-    rewriter.setInsertionPoint(generic_op);
     const int64_t half = half_type.getNumElements();
     auto narrow_half_type =
         mlir::VectorType::get({half}, narrow_type.getElementType());
@@ -684,6 +688,9 @@ struct LowerFloatConversionPattern
     const int64_t repetition = narrow_type.getNumElements() / kGroup;
 
     if (widens) {
+      // Both halves are sent where the write stood, so whatever else writes a
+      // FIFO in between keeps its place in the order the receiver receives.
+      rewriter.setInsertionPoint(wide_write);
       auto dest_unit = resolveUnitFromFifoAttr(
           llvm::cast<mlir::ktdf::FifoSlotType>(
               wide_write.getFifoSlot().getType())
@@ -736,7 +743,7 @@ struct LowerFloatConversionPattern
         indices(0, kGroup), rewriter.getIndexAttr(repetition),
         /*sign_extend=*/rewriter.getBoolAttr(false));
     rewriter.replaceOp(generic_op, pack.getResult());
-    if (wide_read->use_empty()) rewriter.eraseOp(wide_read);
+    rewriter.eraseOp(wide_read);
     return mlir::success();
   }
 
