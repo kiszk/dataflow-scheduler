@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <llvm/ADT/STLExtras.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/TypeSwitch.h>
 #include <llvm/Support/DebugLog.h>
@@ -24,6 +25,7 @@
 #include <mlir/Dialect/Arith/Utils/Utils.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h>
 #include <mlir/Dialect/Linalg/Transforms/Transforms.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
@@ -39,6 +41,7 @@
 #include <mlir/Interfaces/DestinationStyleOpInterface.h>
 #include <mlir/Interfaces/InferTypeOpInterface.h>
 #include <mlir/Interfaces/LoopLikeInterface.h>
+#include <mlir/Interfaces/TilingInterface.h>
 #include <mlir/Interfaces/ViewLikeInterface.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
@@ -84,6 +87,11 @@ struct KTIRMapAndTilePass
   using KTIRMapAndTilePassBase<KTIRMapAndTilePass>::KTIRMapAndTilePassBase;
 
   void runOnOperation() override;
+
+  void getDependentDialects(mlir::DialectRegistry& registry) const override {
+    KTIRMapAndTilePassBase::getDependentDialects(registry);
+    mlir::linalg::registerTilingInterfaceExternalModels(registry);
+  }
 };
 
 /// Given a shape and a target vector_length, compute per-dimension tile sizes
@@ -668,13 +676,53 @@ void KTIRMapAndTilePass::runOnOperation() {
                  getVectorElementType(op, result_type.getElementType()));
   }
 
+  // Tile a round trip from its consumer so both casts process the same tile.
+  llvm::SmallPtrSet<mlir::Operation*, 4> deferred;
+  for (auto op : computes) {
+    if (auto producer = getRoundTripProducer(op)) deferred.insert(producer);
+  }
+
   // Tile all the compute operations and put them into loop nests that feature
   // loop-carried dependencies.
   for (auto& op : computes) {
+    if (deferred.contains(op)) continue;
+    auto producer = getRoundTripProducer(op);
+    if (producer &&
+        (!mlir::cast<mlir::ShapedType>(producer->getResult(0).getType())
+              .hasStaticShape() ||
+         !mlir::cast<mlir::ShapedType>(op->getResult(0).getType())
+              .hasStaticShape())) {
+      op.emitError(
+          "tiling error: a direct float conversion round trip "
+          "requires static tensor shapes");
+      signalPassFailure();
+      return;
+    }
     auto maybe_loops = tile(rewriter, op, mapping);
     if (failed(maybe_loops)) {
       signalPassFailure();
       return;
+    }
+    if (producer) {
+      auto slice =
+          op.getDpsInputs()[0].getDefiningOp<mlir::tensor::ExtractSliceOp>();
+      if (!slice || slice.getSource() != producer.getResult(0)) {
+        op.emitError("tiling error: expected a slice of the widening cast");
+        signalPassFailure();
+        return;
+      }
+      mapToCompute(producer, mapping,
+                   producer.getBody()->getArgument(0).getType());
+      rewriter.setInsertionPoint(slice);
+      auto fused = mlir::tensor::replaceExtractSliceWithTiledProducer(
+          rewriter, slice, producer->getOpResult(0));
+      if (failed(fused)) {
+        op.emitError("tiling error: unable to tile the widening cast");
+        signalPassFailure();
+        return;
+      }
+      rewriter.replaceOp(slice, fused->tiledValues);
+      rewriter.eraseOp(producer);
     }
     if (maybe_loops->empty()) {
       LDBG() << "no loops generated for "
