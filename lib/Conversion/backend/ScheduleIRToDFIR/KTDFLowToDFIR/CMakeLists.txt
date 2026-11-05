@@ -41,6 +41,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
   LINK_MLIR_LIBS
     MLIRAffineAnalysis
     MLIRArithDialect
+    MLIRBufferizationDialect
     MLIRFuncDialect
     MLIRIR
     MLIRMathDialect
