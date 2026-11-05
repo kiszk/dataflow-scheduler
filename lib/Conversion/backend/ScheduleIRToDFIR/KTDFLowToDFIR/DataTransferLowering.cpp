@@ -1037,7 +1037,7 @@ struct LowerDataTransferPattern
       return mlir::failure();
     }
 
-    auto is_copy = transfer_mode == mlir::ktdf::TransferMode::Copy
+    auto is_copy = transfer_mode == mlir::ktdf::TransferMode::Copy;
     const auto vectors =
         data_transfer_op->getAttrOfType<mlir::IntegerAttr>(
             kVectorsPerSlotAttrName);
@@ -1058,7 +1058,7 @@ struct LowerDataTransferPattern
     if (mlir::failed(cut)) return mlir::failure();
 
     auto load_type =
-        is_copy ? sen_type
+        is_copy ? send_type
                 : mlir::VectorType::get({load_elements},
                                        vector_type.getElementType());
 

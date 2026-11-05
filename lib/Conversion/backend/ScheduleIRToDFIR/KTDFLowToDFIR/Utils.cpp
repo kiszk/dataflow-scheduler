@@ -363,7 +363,7 @@ auto scheduler::markWideConversionSlots(mlir::func::FuncOp func)
         failed = true;
         continue;
       }
-      if (mlir::ktdf::isBroadcastTransfer(transfer)) {
+      if (transfer.getTransferMode() != mlir::ktdf::TransferMode::Copy) {
         transfer.emitError(
                     "the f32 side of a conversion between f16 and f32 moves as "
                     "two vectors, which a splat or pad transfer does not")

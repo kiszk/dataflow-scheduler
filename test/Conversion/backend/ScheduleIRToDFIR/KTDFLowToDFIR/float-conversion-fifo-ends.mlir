@@ -201,7 +201,76 @@ module {
       %f_out = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
       ktdf_lowering.execute_on %lu {
         // expected-error @below {{the f32 side of a conversion between f16 and f32 moves as two vectors, which a splat or pad transfer does not}}
-        ktdf.data_transfer from %in[0, 0] size [1, 8] to %f_in size [64] {transfer_mode = "splat"} : memref<1x64xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
+        ktdf.data_transfer from %in[0, 0] size [1, 8] to %f_in size [64] {transfer_mode = #ktdf.transfer_mode<splat>} : memref<1x64xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
+      }
+      ktdf_lowering.execute_on %sfu {
+        %x = ktdf.read_from_fifo %f_in : <"L1LU" -> "SFU", 64xf32> -> tensor<64xf32>
+        %e = tensor.empty() : tensor<64xf16>
+        // expected-note @below {{the conversion}}
+        %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%x : tensor<64xf32>) outs(%e : tensor<64xf16>) {
+        ^bb0(%a: f32, %b: f16):
+          %c = arith.truncf %a : f32 to f16
+          linalg.yield %c : f16
+        } -> tensor<64xf16>
+        ktdf.write_to_fifo %r, %f_out : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// Neither zero-padding mode can fill the two-vector input of fp32todl16.
+#map = affine_map<(d0) -> (d0)>
+module {
+  ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  func.func @zero_pad_front_into_wide_slot() attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %lu = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l1lu", type = "l1lu"} : index
+    %sfu = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-sfu", type = "sfu"} : index
+    %su = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l1su", type = "l1su"} : index
+    %in = builtin.unrealized_conversion_cast %c0 : index to memref<1x64xf32, "L1">
+    ktdf_lowering.execute_on %lu, %sfu, %su {
+      %f_in = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
+      %f_out = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
+      ktdf_lowering.execute_on %lu {
+        // expected-error @below {{the f32 side of a conversion between f16 and f32 moves as two vectors, which a splat or pad transfer does not}}
+        ktdf.data_transfer from %in[0, 0] size [1, 8] to %f_in size [64] {transfer_mode = #ktdf.transfer_mode<zero_pad_front>} : memref<1x64xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
+      }
+      ktdf_lowering.execute_on %sfu {
+        %x = ktdf.read_from_fifo %f_in : <"L1LU" -> "SFU", 64xf32> -> tensor<64xf32>
+        %e = tensor.empty() : tensor<64xf16>
+        // expected-note @below {{the conversion}}
+        %r = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%x : tensor<64xf32>) outs(%e : tensor<64xf16>) {
+        ^bb0(%a: f32, %b: f16):
+          %c = arith.truncf %a : f32 to f16
+          linalg.yield %c : f16
+        } -> tensor<64xf16>
+        ktdf.write_to_fifo %r, %f_out : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+module {
+  ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")
+  func.func @zero_pad_back_into_wide_slot() attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %lu = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l1lu", type = "l1lu"} : index
+    %sfu = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-sfu", type = "sfu"} : index
+    %su = dataflow.get_unit {core = 0 : i32, corelet = 0 : i32, name = "C0-l1su", type = "l1su"} : index
+    %in = builtin.unrealized_conversion_cast %c0 : index to memref<1x64xf32, "L1">
+    ktdf_lowering.execute_on %lu, %sfu, %su {
+      %f_in = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
+      %f_out = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>
+      ktdf_lowering.execute_on %lu {
+        // expected-error @below {{the f32 side of a conversion between f16 and f32 moves as two vectors, which a splat or pad transfer does not}}
+        ktdf.data_transfer from %in[0, 0] size [1, 8] to %f_in size [64] {transfer_mode = #ktdf.transfer_mode<zero_pad_back>} : memref<1x64xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
       }
       ktdf_lowering.execute_on %sfu {
         %x = ktdf.read_from_fifo %f_in : <"L1LU" -> "SFU", 64xf32> -> tensor<64xf32>
