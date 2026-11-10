@@ -17,13 +17,15 @@
 //===----------------------------------------------------------------------===//
 
 // RUN: dataflow-scheduler-opt %s \
-// RUN:   -pass-pipeline='builtin.module(access-granularity-legalization,scalar-broadcast-legalization,splat-legalization,map-reduction-partials,custom-linalg-bufferization)' \
+// RUN:   -pass-pipeline='builtin.module(access-granularity-legalization,splat-legalization,map-reduction-partials,custom-linalg-bufferization)' \
 // RUN:   | FileCheck %s
 
 // Each row produces its own sum in lane 0 of a padded FP32 stick. The next
 // stage must reload that lane, not the neighbouring reduction partials, and
 // broadcast it before adding the original row. Check the shared memory, row
 // index, and store-to-load dependency as well as the consumer's splat.
+// The add indexes the reloaded sum by the identity map, as ktir-map-and-tile
+// leaves a widened broadcast operand.
 // This stops before device-specific SIMD reduction lowering; it does not
 // validate a reduction instruction recipe or its numerical execution.
 
@@ -80,7 +82,6 @@
 !load_fifo = !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
 !store_fifo = !ktdf.fifo.slot<"SFU" -> "L1SU", 32xf32>
 #id = affine_map<(row, lane) -> (row, lane)>
-#broadcast = affine_map<(row, lane) -> (row, 0)>
 #reduce_in = affine_map<(row, lane, out_lane) -> (row, lane)>
 #reduce_out = affine_map<(row, lane, out_lane) -> (row, out_lane)>
 
@@ -151,7 +152,7 @@ func.func @sum_broadcast_add(
             : !load_fifo -> tensor<1x32xf32>
         %empty = tensor.empty() : tensor<1x32xf32>
         %result = linalg.generic {
-          indexing_maps = [#broadcast, #id, #id],
+          indexing_maps = [#id, #id, #id],
           iterator_types = ["parallel", "parallel"]
         } ins(%scalar_value, %vector_value : tensor<1x32xf32>, tensor<1x32xf32>)
             outs(%empty : tensor<1x32xf32>) {

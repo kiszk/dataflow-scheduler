@@ -16,16 +16,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(access-granularity-legalization,scalar-broadcast-legalization,splat-legalization)" %s | FileCheck %s
+// RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(access-granularity-legalization,splat-legalization)" %s | FileCheck %s
 
 ktdf_arch.device @sample_device attributes {}
     import("../Inputs/fp32-splat-device.mlir")
 
 #id = affine_map<(i) -> (i)>
-#broadcast = affine_map<(i) -> (0)>
 
-// Run the three passes in pipeline order: load legalization must not shrink
+// Run the passes in pipeline order: load legalization must not shrink
 // the 32-element FIFO to the four elements required by the physical load.
+// The compute side already indexes the splat input by the identity map, as
+// ktir-map-and-tile leaves a widened broadcast operand.
 // CHECK: #[[ID:.*]] = affine_map<(d0) -> (d0)>
 // CHECK-LABEL: func.func @keep_stick_width(
 // CHECK-SAME: !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
@@ -51,7 +52,7 @@ func.func @keep_stick_width(
       // CHECK: linalg.generic {indexing_maps = [#[[ID]], #[[ID]]]
       // CHECK-SAME: ins(%[[READ]] : tensor<32xf32>)
       %result = linalg.generic {
-        indexing_maps = [#broadcast, #id],
+        indexing_maps = [#id, #id],
         iterator_types = ["parallel"]
       } ins(%read : tensor<32xf32>) outs(%empty : tensor<32xf32>) {
       ^bb0(%value: f32, %out: f32):

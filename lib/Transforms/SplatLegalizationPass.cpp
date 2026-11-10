@@ -205,7 +205,18 @@ mlir::LogicalResult legalizeSplatTransfer(
         "incompatible splat load width, FIFO width, or "
         "sub-SIMD group width");
 
+  // The wider load reads past the element the splat asked for, so make sure
+  // the source buffer really has that many elements from where the load
+  // starts.  Nothing resizes the buffer here: the extra elements are only read,
+  // never used, but they still have to exist.  This runs before the general
+  // bounds proof below so that a load that overruns at a known start reports
+  // how many elements it needs and how many there are.
+  if (mlir::failed(checkSourceFitsWiderLoad(transfer, load_elements)))
+    return mlir::failure();
+
   // Widen within the declared view, never into an assumed backing allocation.
+  // This also rejects what the check above lets through: a start it cannot
+  // fold to a constant, or one that is negative.
   llvm::SmallVector<int64_t> strides;
   int64_t offset;
   if (source_type.getRank() == 0 ||
@@ -232,13 +243,6 @@ mlir::LogicalResult legalizeSplatTransfer(
 
   LDBG(1) << "legalizing splat load from " << src_elements << " to "
           << load_elements << " elements for " << transfer;
-
-  // The wider load reads past the element the splat asked for, so make sure
-  // the source buffer really has that many elements from where the load
-  // starts.  Nothing resizes the buffer here: the extra elements are only read,
-  // never used, but they still have to exist.
-  if (mlir::failed(checkSourceFitsWiderLoad(transfer, load_elements)))
-    return mlir::failure();
 
   // The size operand carries the load width, so the lowering pass reads it
   // straight off the transfer and no extra attribute is needed for it.

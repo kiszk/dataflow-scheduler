@@ -26,7 +26,7 @@ func.func @overrun_at_end(
     %fifo: !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>) {
   ktdf.pipeline {
     ktdf.stage depends_in(none) depends_out(none) {
-      // expected-error @below {{cannot prove widened splat load is within the source view}}
+      // expected-error @below {{the hardware loads 4 elements for this splat, but its source buffer has only 3 element(s) from where the load starts}}
       ktdf.data_transfer from %source[29] size [1] to %fifo size [32]
           {transfer_mode = #ktdf.transfer_mode<splat>}
           : memref<32xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
@@ -45,7 +45,7 @@ func.func @narrow_source_view(
     %fifo: !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>) {
   ktdf.pipeline {
     ktdf.stage depends_in(none) depends_out(none) {
-      // expected-error @below {{cannot prove widened splat load is within the source view}}
+      // expected-error @below {{the hardware loads 4 elements for this splat, but its source buffer has only 1 element(s) from where the load starts}}
       ktdf.data_transfer from %source[0] size [1] to %fifo size [32]
           {transfer_mode = #ktdf.transfer_mode<splat>}
           : memref<1xf32, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 32xf32>
