@@ -19,7 +19,6 @@
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
-#include <llvm/ADT/SmallVectorExtras.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/LogicalResult.h>
@@ -338,12 +337,10 @@ void KTIRPipelinePass::runOnOperation() {
   mlir::ktdf_arch::Mapping mapping(default_device.getRef());
 
   // Create the pipelines.
-  const auto pipelines = llvm::map_to_vector(
-      func.getOps<mlir::scf::ForOp>(),
-      [&](mlir::scf::ForOp outermost) -> mlir::Operation* {
-        rewriter.setInsertionPointToEnd(findInnermost(outermost).getBody());
-        return createPipeline(rewriter, outermost->getLoc(), dominance);
-      });
+  for (auto outermost : func.getOps<mlir::scf::ForOp>()) {
+    rewriter.setInsertionPointToEnd(findInnermost(outermost).getBody());
+    createPipeline(rewriter, outermost->getLoc(), dominance);
+  }
 
   // Normalize the pipelines.
   {
@@ -360,8 +357,15 @@ void KTIRPipelinePass::runOnOperation() {
     }
   }
 
-  // Check that the pipelines are legal.
+  // Check that the pipelines are legal. Normalization erases a pipeline left
+  // empty, e.g. one created for a loop that only calls an extracted compute
+  // group, so collect the pipelines that survived rather than reusing those
+  // that were created.
   {
+    llvm::SmallVector<mlir::Operation*> pipelines;
+    func.walk([&](mlir::ktdf::PipelineOp pipeline) {
+      pipelines.push_back(pipeline);
+    });
     mlir::ConversionTarget target(getContext());
     target.addIllegalOp<mlir::ktdp_lowering::LoadOp>();
     target.addIllegalOp<mlir::ktdp_lowering::StoreOp>();
