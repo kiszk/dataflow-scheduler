@@ -22,22 +22,28 @@
 
 #include "dataflow-scheduler/Pipeline.h"
 
+#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Linalg/Passes.h>
 #include <mlir/IR/BuiltinOps.h>
+#include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 
 using namespace scheduler;
 
-void scheduler::buildKTIRFrontendPipeline(
+static void buildDefaultKTIRFrontendPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   // Checkpoint 'pre_mapping':
   //   - The input is legal KTIR, but not necessarily scheduler-legal.
@@ -65,7 +71,7 @@ void scheduler::buildKTIRFrontendPipeline(
   }
 }
 
-void scheduler::buildSchedulerOptimizationPipeline(
+static void buildDefaultSchedulerOptimizationPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   // Checkpoint 'pre_scheduling':
   //   - The input is 'ktdf' with nested modules (!), but not necessarily
@@ -153,7 +159,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   pm.addPass(createNormalizeGridTo1DPass());
 }
 
-void scheduler::buildDFIRBackendPipeline(
+static void buildDefaultDFIRBackendPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   pm.addPass(mlir::ktdf::createLoopIVAffineMulStrengthReductionPass());
   pm.addPass(createKTDFToKTDFLoweringPass(scheduler_ctx));
@@ -170,6 +176,84 @@ void scheduler::buildDFIRBackendPipeline(
   // And each program given the two levels it is read at: what it is, and the
   // DataflowIR it is compiled from, which takes no arguments.
   pm.addPass(createWrapProgramDFIRPass());
+}
+
+namespace {
+
+using StageBuilder = void (*)(mlir::OpPassManager&, const SchedulerExtContext&);
+
+class CastAwareStagePass
+    : public mlir::PassWrapper<CastAwareStagePass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+ public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CastAwareStagePass)
+
+  CastAwareStagePass(const SchedulerExtContext& ctx, StageBuilder buildDefault,
+                     llvm::StringRef name)
+      : ctx(ctx), buildDefault(buildDefault), name(name) {}
+
+  llvm::StringRef getArgument() const override { return name; }
+
+  void getDependentDialects(mlir::DialectRegistry& registry) const override {
+    mlir::OpPassManager pm;
+    buildDefault(pm, ctx);
+    pm.addPass(createNumericCastPipelinePass());
+    pm.getDependentDialects(registry);
+  }
+
+  void runOnOperation() override {
+    bool hasPhysicalCast = false;
+    getOperation().walk(
+        [&](mlir::spyreop::NumericCast) { hasPhysicalCast = true; });
+    bool hasBufferizedCast = false;
+    getOperation().walk(
+        [&](mlir::ktdf_lowering::NativeCastOp) { hasBufferizedCast = true; });
+    mlir::OpPassManager pm;
+    if (hasPhysicalCast) {
+      if (buildDefault == buildDefaultKTIRFrontendPipeline) {
+        pm.addPass(createNumericCastPipelinePass());
+      } else {
+        getOperation().emitError(
+            "numeric cast requires the KTIR frontend stage");
+        return signalPassFailure();
+      }
+    } else if (hasBufferizedCast &&
+               buildDefault == buildDefaultSchedulerOptimizationPipeline) {
+      // The numeric cast recipe has already fixed and validated routes and
+      // 64-element tiles. Only buffer lifetime and address assignment remain.
+      pm.addPass(createDoubleBufferingPass(ctx));
+      pm.addPass(createAddressAssignmentPass(ctx));
+    } else {
+      buildDefault(pm, ctx);
+    }
+    if (failed(runPipeline(pm, getOperation()))) signalPassFailure();
+  }
+
+ private:
+  const SchedulerExtContext& ctx;
+  StageBuilder buildDefault;
+  llvm::StringRef name;
+};
+
+}  // namespace
+
+void scheduler::buildKTIRFrontendPipeline(mlir::OpPassManager& pm,
+                                          const SchedulerExtContext& ctx) {
+  pm.addPass(std::make_unique<CastAwareStagePass>(
+      ctx, buildDefaultKTIRFrontendPipeline, "dispatch-ktir-frontend"));
+}
+
+void scheduler::buildSchedulerOptimizationPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& ctx) {
+  pm.addPass(std::make_unique<CastAwareStagePass>(
+      ctx, buildDefaultSchedulerOptimizationPipeline,
+      "dispatch-scheduler-optimization"));
+}
+
+void scheduler::buildDFIRBackendPipeline(mlir::OpPassManager& pm,
+                                         const SchedulerExtContext& ctx) {
+  pm.addPass(std::make_unique<CastAwareStagePass>(
+      ctx, buildDefaultDFIRBackendPipeline, "dispatch-dfir-backend"));
 }
 
 void scheduler::buildKTDPToDFIRPipeline(

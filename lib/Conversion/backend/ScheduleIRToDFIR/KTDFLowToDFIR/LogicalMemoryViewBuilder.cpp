@@ -268,6 +268,7 @@ mlir::LogicalResult replaceSourceAChains(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::DenseMap<ResourceType, mlir::Value>& resolved_units,
     const mlir::ktdf_arch::ResourceKinds& resource_kinds,
+    const scheduler::arch_view::MemoryTree& memory_tree,
     llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
     SymbolAllocator& symbols, mlir::OpBuilder& definitions,
     mlir::OpBuilder& builder) {
@@ -381,8 +382,11 @@ mlir::LogicalResult replaceSourceAChains(
         if (!memory_space)
           return cmv.emitError(
               "construct_memory_view: no memory space found in chain");
-        mlir::FailureOr<int64_t> word_size = wordSizeOf(
-            pu, llvm::cast<ResourceType>(*memory_space), resource_kinds);
+        mlir::FailureOr<int64_t> word_size =
+            wordSizeOf(pu,
+                       memory_tree.getCanonicalResource(
+                           llvm::cast<ResourceType>(*memory_space)),
+                       resource_kinds);
         if (mlir::failed(word_size)) return mlir::failure();
 
         mlir::FailureOr<mlir::Value> symbolic = emitSymbolicStartAddress(
@@ -440,8 +444,11 @@ mlir::LogicalResult replaceSourceAChains(
           if (!memory_space)
             return cmv.emitError(
                 "construct_memory_view: no memory space found in chain");
-          mlir::FailureOr<int64_t> word_size = wordSizeOf(
-              pu, llvm::cast<ResourceType>(*memory_space), resource_kinds);
+          mlir::FailureOr<int64_t> word_size =
+              wordSizeOf(pu,
+                         memory_tree.getCanonicalResource(
+                             llvm::cast<ResourceType>(*memory_space)),
+                         resource_kinds);
           if (mlir::failed(word_size)) return mlir::failure();
 
           // No displacement: the offset is in the expression, and the grid
@@ -812,8 +819,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
 
     // Phase 3b: Source A chains (ktdp.construct_memory_view).
     if (mlir::failed(replaceSourceAChains(pu, resolved_units, resource_kinds,
-                                          replacements, symbols, definitions,
-                                          builder)))
+                                          memory_tree, replacements, symbols,
+                                          definitions, builder)))
       return mlir::failure();
 
     // Phase 3b': ktdp_lowering.construct_memory_view (IAB and similar).

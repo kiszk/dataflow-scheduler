@@ -26,7 +26,8 @@
 
 using namespace scheduler;
 
-MemoryTracker::MemoryTracker(const arch_view::MemoryTree& memory_tree) {
+MemoryTracker::MemoryTracker(const arch_view::MemoryTree& memory_tree)
+    : memory_tree_(memory_tree) {
   for (auto node_id : memory_tree.getAllNodeIds()) {
     auto node = memory_tree.getNode(node_id);
     if (node && node->capacity_in_bytes) {
@@ -62,6 +63,7 @@ size_t MemoryTracker::alignAddress(size_t address, size_t alignment) {
 llvm::Expected<size_t> MemoryTracker::allocate(ResourceType memory_resource,
                                                size_t size_in_bytes,
                                                size_t alignment) {
+  memory_resource = memory_tree_.getCanonicalResource(memory_resource);
   assert(next_address_.find(memory_resource) != next_address_.end() &&
          "Memory resource not found in capacity map");
   // Get current address for this memory resource
@@ -109,6 +111,7 @@ llvm::Expected<size_t> MemoryTracker::allocate(ResourceType memory_resource,
 
 size_t MemoryTracker::getNextAvailableAddress(
     ResourceType memory_resource) const {
+  memory_resource = memory_tree_.getCanonicalResource(memory_resource);
   auto it = next_address_.find(memory_resource);
   assert(it != next_address_.end() &&
          "Memory resource not found in next_address_ map");
@@ -116,6 +119,7 @@ size_t MemoryTracker::getNextAvailableAddress(
 }
 
 size_t MemoryTracker::getTotalAllocated(ResourceType memory_resource) const {
+  memory_resource = memory_tree_.getCanonicalResource(memory_resource);
   auto reserved_it = reserved_.find(memory_resource);
   assert(reserved_it != reserved_.end() &&
          "Memory resource not found in reserved_ map");
@@ -124,6 +128,7 @@ size_t MemoryTracker::getTotalAllocated(ResourceType memory_resource) const {
 
 void MemoryTracker::reset(llvm::ArrayRef<ResourceType> memory_resources) {
   for (ResourceType resource : memory_resources) {
+    resource = memory_tree_.getCanonicalResource(resource);
     auto it = next_address_.find(resource);
     if (it != next_address_.end()) {
       auto reserved_it = reserved_.find(resource);

@@ -73,6 +73,9 @@ class MemoryTree : public mlir::ktdf_arch::DeviceView {
   /// Get a memory node by its resource attribute
   std::optional<MemoryNode> getNode(ResourceType memory_resource) const;
 
+  /// Resolve a memory alias; leave unknown resources unchanged.
+  ResourceType getCanonicalResource(ResourceType memory_resource) const;
+
   /// Climbs from @p node up through its ancestors and returns the root node
   /// (the ancestor with no parent). Returns a copy of @p node if it is itself
   /// a root.

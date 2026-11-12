@@ -42,6 +42,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/BufferPhaseLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LinalgLowering.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/NativeCastLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/ParallelLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UniformInfra.h"
@@ -926,6 +927,7 @@ mlir::LogicalResult scheduler::runOperationLowerings(
     SymbolAllocator& symbols) {
   // Lower linalg.generic compute operations and FIFO operations
   mlir::RewritePatternSet patterns(func.getContext());
+  populateNativeCastLoweringPatterns(patterns, components, mapping);
   populateLinalgLoweringPatterns(patterns, symbols);
   patterns.add<LowerMemRefCopyFromFifoPattern>(func.getContext());
   patterns.add<LowerReadFromFifoPattern>(func.getContext(), mapping.byKind(),

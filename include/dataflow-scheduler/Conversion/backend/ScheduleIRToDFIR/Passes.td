@@ -79,6 +79,21 @@ def KTDFLowToDFIRPass : Pass<"ktdflowering-to-dfir", "mlir::ModuleOp"> {
   ];
 }
 
+def NumericCastPipelinePass : Pass<"pipeline-numeric-cast", "mlir::ModuleOp"> {
+  let summary = "Bufferize a numeric cast into a tiled KTDF pipeline";
+  let constructor = "::scheduler::createNumericCastPipelinePass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect",
+    "mlir::ktdf::KTDFDialect",
+    "mlir::ktdf_lowering::KTDFLoweringDialect",
+    "mlir::ktdp::KtdpDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::spyreop::SpyreOpDialect"
+  ];
+}
+
 def WrapProgramDFIRPass : Pass<"wrap-program-dfir", "mlir::ModuleOp"> {
   let summary = "Give each program two levels: what it is, and what it is compiled from";
   let description = [{
