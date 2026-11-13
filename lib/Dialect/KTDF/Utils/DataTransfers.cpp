@@ -53,6 +53,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
+#include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 
 using namespace scheduler;
@@ -379,11 +380,19 @@ struct FoldSliceIntoLoad
   auto matchAndRewrite(mlir::tensor::ExtractSliceOp extract,
                        mlir::PatternRewriter& rewriter) const
       -> llvm::LogicalResult override {
-    // Other users of the load would load the data twice.
     auto load =
         extract.getSource().getDefiningOp<mlir::ktdp_lowering::LoadOp>();
-    if (!load || !load->hasOneUse()) {
-      return rewriter.notifyMatchFailure(extract, "load has multiple users");
+    if (!load) {
+      return rewriter.notifyMatchFailure(extract, "not a load");
+    }
+    if (!load->hasOneUse() &&
+        !llvm::all_of(load->getUsers(), [](mlir::Operation* user) {
+          auto slice = mlir::dyn_cast<mlir::tensor::ExtractSliceOp>(user);
+          return slice && slice->hasOneUse() &&
+                 mlir::isa<mlir::ktdf_lowering::NativeCastValueOp>(
+                     *slice->user_begin());
+        })) {
+      return rewriter.notifyMatchFailure(extract, "load has other users");
     }
 
     auto new_load =
@@ -391,8 +400,10 @@ struct FoldSliceIntoLoad
     if (failed(new_load)) {
       return rewriter.notifyMatchFailure(extract, "can not merge slices");
     }
-    rewriter.replaceOp(extract, *new_load);
-    rewriter.eraseOp(load);
+    rewriter.replaceOp(
+        extract, reshapeTo(rewriter, extract.getLoc(), new_load->getResult(),
+                           extract.getType().getShape()));
+    if (load->use_empty()) rewriter.eraseOp(load);
     return llvm::success();
   }
 };
@@ -593,6 +604,22 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
       }
     }
 
+    if (nest->has_numeric_cast && nest->inserts.size() > 1 && nest->is_update &&
+        !has_reshape && !via) {
+      for (auto insert : llvm::reverse(nest->inserts)) {
+        rewriter.setInsertionPointAfter(insert);
+        auto packet_slice = getSlice(insert);
+        auto packet = reshapeTo(rewriter, insert.getLoc(), insert.getSource(),
+                                getSliceShape(packet_slice));
+        auto packet_store = mlir::ktdp_lowering::StoreOp::create(
+            rewriter, store.getLoc(), packet, store.getAccessTile(),
+            packet_slice);
+        setThrottle(packet_store, getThrottle(insert.getSourceMutable()));
+      }
+      rewriter.eraseOp(store);
+      return mlir::success();
+    }
+
     // Determine the value to store. Conservatively, this must be the result of
     // insert_slice, since we didn't check how that is computed.
     mlir::Value stored = insert_slice.getResult();
@@ -604,7 +631,7 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
 
     // Reshape the tile, and add the hops back in, counting the store as one.
     rewriter.setInsertionPointAfter(insert_slice);
-    if (has_reshape) {
+    if (has_reshape || nest->is_update) {
       stored =
           reshapeTo(rewriter, store.getLoc(), stored, getSliceShape(slice));
     }
@@ -646,12 +673,14 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
   /// Loop nest that yields the result of a `tensor.insert_slice`.
   struct LoopNest {
     mlir::tensor::InsertSliceOp insert_slice;
+    llvm::SmallVector<mlir::tensor::InsertSliceOp> inserts;
     /// Outermost loop of the nest, if any.
     mlir::LoopLikeOpInterface outermost;
     /// Result of outermost that yields the data, if any.
     mlir::OpResult result;
     /// Whether insert_slice updates the iter_arg that it is yielded to.
     bool is_update = false;
+    bool has_numeric_cast = false;
     /// Whether the data is used otherwise inside of the loop nest.
     bool has_inner_user = false;
   };
@@ -690,7 +719,17 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     if (!nest.insert_slice) {
       return llvm::failure();
     }
-    nest.is_update = iter_arg && nest.insert_slice.getDest() == iter_arg;
+    mlir::Value dest = nest.insert_slice.getResult();
+    while (auto insert = dest.getDefiningOp<mlir::tensor::InsertSliceOp>()) {
+      nest.inserts.push_back(insert);
+      dest = insert.getDest();
+    }
+    if (nest.outermost)
+      nest.outermost->walk([&](mlir::ktdf_lowering::NativeCastValueOp) {
+        nest.has_numeric_cast = true;
+      });
+    nest.is_update = iter_arg && (nest.insert_slice.getDest() == iter_arg ||
+                                  (nest.has_numeric_cast && dest == iter_arg));
     return nest;
   }
 

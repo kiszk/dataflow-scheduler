@@ -50,8 +50,6 @@ std::unique_ptr<mlir::Pass> createKTDFLowToDFIRPass(
 
 std::unique_ptr<mlir::Pass> createWrapProgramDFIRPass();
 
-std::unique_ptr<mlir::Pass> createNumericCastPipelinePass();
-
 std::unique_ptr<mlir::Pass> createSplitDFIROutputPass();
 std::unique_ptr<mlir::Pass> createSplitDFIROutputPass(
     llvm::StringRef output_dir);

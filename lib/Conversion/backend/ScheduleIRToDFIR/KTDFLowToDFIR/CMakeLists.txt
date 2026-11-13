@@ -13,7 +13,6 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     DataTransferLowering.cpp
     LinalgLowering.cpp
     NativeCastLowering.cpp
-    NumericCastToDFIR.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR

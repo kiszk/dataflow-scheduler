@@ -735,9 +735,22 @@ void PathExpansionMaterializer::emitSyntheticTransfer(
   assert(transfer_info.dest.resource &&
          "Synthetic transfer must have dest private resource");
 
-  createDataTransfer(loc, materializeSide(transfer_info.source, {}),
-                     materializeSide(transfer_info.dest, {}),
-                     transfer_info.template_op, transfer_info.transfer_mode);
+  auto source = materializeSide(transfer_info.source, {});
+  auto dest = materializeSide(transfer_info.dest, {});
+  auto source_slot =
+      mlir::dyn_cast<mlir::ktdf::FifoSlotType>(source.value.getType());
+  auto dest_slot =
+      mlir::dyn_cast<mlir::ktdf::FifoSlotType>(dest.value.getType());
+  if (source_slot && dest_slot) {
+    auto tensor = mlir::RankedTensorType::get({source_slot.getNumElements()},
+                                              source_slot.getElementType());
+    auto read =
+        mlir::ktdf::ReadFromFifoOp::create(builder_, loc, tensor, source.value);
+    mlir::ktdf::WriteToFifoOp::create(builder_, loc, read, dest.value);
+    return;
+  }
+  createDataTransfer(loc, source, dest, transfer_info.template_op,
+                     transfer_info.transfer_mode);
 }
 
 }  // namespace scheduler
