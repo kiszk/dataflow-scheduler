@@ -22,18 +22,23 @@
 
 #include "dataflow-scheduler/Pipeline.h"
 
+#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Linalg/Passes.h>
 #include <mlir/IR/BuiltinOps.h>
+#include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 
 using namespace scheduler;
 
@@ -57,6 +62,7 @@ void scheduler::buildKTIRFrontendPipeline(
     nested.addPass(mlir::createConvertElementwiseToLinalgPass());
     nested.addPass(mlir::createLinalgMorphOpsPass(
         {.categoryToGeneric = true, .namedToGeneric = true}));
+    nested.addPass(createKTIRNumericCastTilingPass());
     nested.addPass(createSimplifyLinalgPass());
     nested.addPass(createFuseLinalgPass());
     nested.addPass(createKTIRMapAndTilePass());

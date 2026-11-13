@@ -53,9 +53,10 @@ namespace {
 [[nodiscard]] auto isLegalGenericBodyOp(mlir::Operation* op) -> bool {
   // Accept supported arith operations and the 'linalg.yield' terminator.
   if (mlir::isa<mlir::arith::AddFOp, mlir::arith::MulFOp, mlir::arith::SubFOp,
-                mlir::arith::AddIOp, mlir::arith::MaximumFOp,
-                mlir::arith::MinimumFOp, mlir::arith::MaxNumFOp,
-                mlir::arith::CmpFOp, mlir::arith::SelectOp, mlir::math::AbsFOp,
+                mlir::arith::NegFOp, mlir::math::FloorOp, mlir::arith::AddIOp,
+                mlir::arith::MaximumFOp, mlir::arith::MinimumFOp,
+                mlir::arith::MaxNumFOp, mlir::arith::CmpFOp,
+                mlir::arith::SelectOp, mlir::math::AbsFOp,
                 mlir::linalg::YieldOp>(op)) {
     return true;
   }

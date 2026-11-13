@@ -112,7 +112,7 @@ static scheduler::ResourceType resolveLoadUnitKind(
 ///   granule_elements = granule_words × word_size / elem_bytes
 ///
 /// This correctly handles both small-word units (e.g. L1LU, word_size=1)
-/// and large-word units (e.g. L3LU, word_size=128), where one bus word
+/// and large-word units (word_size=128), where one bus word
 /// spans many elements.
 static int64_t computeRequiredLoadElements(
     int64_t src_elements, mlir::Type elem_type, mlir::Attribute memory_space,

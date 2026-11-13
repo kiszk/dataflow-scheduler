@@ -147,9 +147,14 @@ std::optional<MemoryTree::MemoryNode> MemoryTree::getNode(
 
 std::optional<MemoryTree::MemoryNode> MemoryTree::getNode(
     ResourceType memory_resource) const {
-  auto it = resource_to_node_.find(memory_resource);
-  if (it == resource_to_node_.end()) return std::nullopt;
-  return getNode(it->second);
+  auto node_id = getNodeIdForMemory(memory_resource);
+  return node_id ? getNode(*node_id) : std::nullopt;
+}
+
+ResourceType MemoryTree::getCanonicalResource(
+    ResourceType memory_resource) const {
+  auto node = getNode(memory_resource);
+  return node ? node->memory_resource : memory_resource;
 }
 
 MemoryTree::MemoryNode MemoryTree::getRootOf(const MemoryNode& node) const {

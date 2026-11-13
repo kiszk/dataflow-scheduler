@@ -16,21 +16,21 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// SubsumeLinearizeIndex: fold ktdf.tiling.linearize_index into
-// ktdf.data_transfer affine maps.
+// SubsumeLinearizeIndex: fold index calculations into data transfer maps.
 //
-// For each ktdf.data_transfer, any index operand produced by a
-// ktdf.tiling.linearize_index with all-constant strides is replaced by an
-// affine.apply of the weighted-sum expression over the raw tile loop IVs.
-// fullyComposeAffineMapAndOperands then folds those affine.apply ops into the
-// transfer's source_map/dest_map. Dead get_tile_subscript ops are erased.
+// Fold constant-stride linearized indices and constant-scale loop-IV arithmetic
+// into data_transfer source_map/dest_map. AGEN then receives loop IV operands.
 //
 //===----------------------------------------------------------------------===//
 
+#include <optional>
+
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/PatternMatch.h"
@@ -84,8 +84,40 @@ static affine::AffineApplyOp buildSubscriptApply(
   return affine::AffineApplyOp::create(rewriter, op.getLoc(), map, ivs);
 }
 
-/// For one map+operands pair: replace foldable subscript operands with
-/// affine.apply ops, then compose everything into the map.
+struct LinearIndex {
+  Value iv;
+  int64_t scale;
+  int64_t offset;
+};
+
+static std::optional<LinearIndex> matchLinearIndex(Value value) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp());
+        loop && loop.getInductionVar() == arg)
+      return LinearIndex{value, 1, 0};
+  }
+  if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
+    return LinearIndex{{}, 0, constant.value()};
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    auto lhs = matchLinearIndex(add.getLhs());
+    auto rhs = matchLinearIndex(add.getRhs());
+    if (lhs && rhs && (!lhs->iv || !rhs->iv || lhs->iv == rhs->iv))
+      return LinearIndex{lhs->iv ? lhs->iv : rhs->iv, lhs->scale + rhs->scale,
+                         lhs->offset + rhs->offset};
+  }
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    auto lhs = matchLinearIndex(mul.getLhs());
+    auto rhs = matchLinearIndex(mul.getRhs());
+    if (lhs && rhs && (!lhs->iv || !rhs->iv)) {
+      auto factor = lhs->iv ? rhs->offset : lhs->offset;
+      auto term = lhs->iv ? *lhs : *rhs;
+      return LinearIndex{term.iv, term.scale * factor, term.offset * factor};
+    }
+  }
+  return std::nullopt;
+}
+
+/// Compose tiled subscripts, then move linear IV arithmetic into the map.
 static std::pair<AffineMap, llvm::SmallVector<Value>> rewriteMapOperands(
     IRRewriter& rewriter, AffineMap map, ValueRange operands,
     ktdf::DataTransferOp transfer) {
@@ -93,11 +125,27 @@ static std::pair<AffineMap, llvm::SmallVector<Value>> rewriteMapOperands(
 
   for (Value& operand : new_operands) {
     auto subscript = operand.getDefiningOp<ktdf::TilingLinearizeIndexOp>();
-    if (!subscript || !hasAllConstantStrides(subscript)) continue;
-    operand = buildSubscriptApply(rewriter, subscript, transfer);
+    if (subscript && hasAllConstantStrides(subscript))
+      operand = buildSubscriptApply(rewriter, subscript, transfer);
   }
 
   affine::fullyComposeAffineMapAndOperands(&map, &new_operands);
+  llvm::SmallVector<AffineExpr> replacements;
+  for (auto [position, operand] : llvm::enumerate(new_operands)) {
+    auto expr = getAffineDimExpr(position, transfer.getContext());
+    if (auto linear = matchLinearIndex(operand);
+        linear && linear->iv && operand != linear->iv) {
+      expr = expr * linear->scale + linear->offset;
+      new_operands[position] = linear->iv;
+    }
+    replacements.push_back(expr);
+  }
+  llvm::SmallVector<AffineExpr> symbols;
+  for (unsigned i = 0; i < map.getNumSymbols(); ++i)
+    symbols.push_back(getAffineSymbolExpr(i, transfer.getContext()));
+  map = map.replaceDimsAndSymbols(replacements, symbols, new_operands.size(),
+                                  symbols.size());
+  affine::canonicalizeMapAndOperands(&map, &new_operands);
   return {map, new_operands};
 }
 
@@ -113,16 +161,23 @@ struct SubsumeLinearizeIndexPass
 
     auto is_foldable = [](Value v) {
       auto op = v.getDefiningOp<ktdf::TilingLinearizeIndexOp>();
-      return op && hasAllConstantStrides(op);
+      if (op && hasAllConstantStrides(op)) return true;
+      auto linear = matchLinearIndex(v);
+      return linear && linear->iv && linear->iv != v;
     };
 
     for (ktdf::DataTransferOp transfer : transfers) {
-      // Process source side independently if it has a map and foldable indices.
-      if (AffineMapAttr src_attr = transfer.getSourceMapAttr()) {
+      // Process source and destination independently, including implicit
+      // identity maps on memrefs.
+      if (isa<MemRefType>(transfer.getSource().getType())) {
         if (llvm::any_of(transfer.getSourceIndices(), is_foldable)) {
-          auto result_src =
-              rewriteMapOperands(rewriter, src_attr.getValue(),
-                                 transfer.getSourceIndices(), transfer);
+          auto src_attr = transfer.getSourceMapAttr();
+          auto map = src_attr ? src_attr.getValue()
+                              : AffineMap::getMultiDimIdentityMap(
+                                    transfer.getSourceIndices().size(),
+                                    transfer.getContext());
+          auto result_src = rewriteMapOperands(
+              rewriter, map, transfer.getSourceIndices(), transfer);
           auto src_map = result_src.first;
           auto src_ops = result_src.second;
           rewriter.modifyOpInPlace(transfer, [&]() {
@@ -132,12 +187,15 @@ struct SubsumeLinearizeIndexPass
         }
       }
 
-      // Process dest side independently if it has a map and foldable indices.
-      if (AffineMapAttr dst_attr = transfer.getDestMapAttr()) {
+      if (isa<MemRefType>(transfer.getDestination().getType())) {
         if (llvm::any_of(transfer.getDestIndices(), is_foldable)) {
-          auto result_dst =
-              rewriteMapOperands(rewriter, dst_attr.getValue(),
-                                 transfer.getDestIndices(), transfer);
+          auto dst_attr = transfer.getDestMapAttr();
+          auto map = dst_attr ? dst_attr.getValue()
+                              : AffineMap::getMultiDimIdentityMap(
+                                    transfer.getDestIndices().size(),
+                                    transfer.getContext());
+          auto result_dst = rewriteMapOperands(
+              rewriter, map, transfer.getDestIndices(), transfer);
           auto dst_map = result_dst.first;
           auto dst_ops = result_dst.second;
           rewriter.modifyOpInPlace(transfer, [&]() {

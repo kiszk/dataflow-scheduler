@@ -134,6 +134,33 @@ func.func @test_dest_subscript() {
   return
 }
 
+// CHECK-LABEL: func.func @test_two_packet_destination
+// CHECK:       ktdf.data_transfer
+// CHECK-SAME:  to %{{.*}}[%arg0 * 2, %arg1, 0]
+// CHECK:       ktdf.data_transfer
+// CHECK-SAME:  to %{{.*}}[%arg0 * 2 + 1, %arg1, 0]
+func.func @test_two_packet_destination() {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c3 = arith.constant 3 : index
+  %src = "test.source"() : () -> memref<2x32xf32>
+  %dst = "test.dest"() : () -> memref<6x2x32xf32>
+  scf.for %arg0 = %c0 to %c3 step %c1 {
+    %first = arith.muli %arg0, %c2 : index
+    %second = arith.addi %first, %c1 : index
+    scf.for %arg1 = %c0 to %c2 step %c1 {
+      ktdf.data_transfer from %src[%arg1, %c0] size [1, 32]
+                         to %dst[%first, %arg1, %c0] size [1, 1, 32]
+        : memref<2x32xf32>, memref<6x2x32xf32>
+      ktdf.data_transfer from %src[%arg1, %c0] size [1, 32]
+                         to %dst[%second, %arg1, %c0] size [1, 1, 32]
+        : memref<2x32xf32>, memref<6x2x32xf32>
+    }
+  }
+  return
+}
+
 // -----------------------------------------------------------------------------
 // Test 5: single-IV stride-1 subscript (degenerate case)
 //

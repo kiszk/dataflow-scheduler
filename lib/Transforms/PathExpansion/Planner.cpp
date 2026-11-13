@@ -986,6 +986,13 @@ static mlir::LogicalResult routeDataFlows(llvm::MutableArrayRef<DataFlow> flows,
       flow.consumer_begin = last - 1;
       flow.consumer_unit = nodeAt(flow, last - 1).resource;
     }
+    // A consumer transfer unit reads the preceding memory itself.
+    if (last > flow.producer_end + 1 &&
+        nodeAt(flow, last).kind == ResourceKind::LoadStoreUnit &&
+        nodeAt(flow, last - 1).kind == ResourceKind::Memory) {
+      flow.consumer_begin = last - 1;
+      flow.consumer_unit = nodeAt(flow, last).resource;
+    }
   }
   return mlir::success();
 }
@@ -1143,6 +1150,9 @@ static mlir::LogicalResult expandDataFlows(
   // The stage running on each unit. assignOriginalStageUnits() made sure the
   // original stages all run on different units.
   llvm::DenseMap<ResourceType, StageNode*> unit_owner;
+  llvm::DenseMap<std::pair<StageNode*, StageNode*>,
+                 llvm::DenseMap<ResourceType, StageNode*>>
+      compute_owner;
   for (StageNode* stage : sorted_stages)
     if (std::optional<ResourceType> unit =
             plan->getStageInfo(stage).applicable_unit)
@@ -1196,6 +1206,23 @@ static mlir::LogicalResult expandDataFlows(
       return mlir::success();
     };
 
+    auto addComputeHop = [&](ResourceType unit) {
+      auto& owners = compute_owner[{flow.producer, flow.consumer}];
+      auto [it, inserted] = owners.try_emplace(unit);
+      if (inserted) {
+        StageNode* synth = tree.createStageNode(nullptr, next_stage_id++);
+        StageMaterializationInfo info;
+        info.kind = StageMaterializationInfo::Kind::kSyntheticTransfer;
+        info.stage_resource = unit;
+        info.applicable_unit = unit;
+        plan->stage_info[synth] = info;
+        pipeline->insertChildNode(synth, last_inserted);
+        last_inserted = synth;
+        it->second = synth;
+      }
+      chain.push_back(it->second);
+    };
+
     size_t end = flow.middleEnd();
     flow.boundaries.push_back(flow.middleBegin());
     for (size_t i = flow.middleBegin(); i < end;) {
@@ -1230,14 +1257,10 @@ static mlir::LogicalResult expandDataFlows(
           }
           break;
         case ResourceKind::Compute:
-          // Hop stages only move data between memories through load/store
-          // units. Passing data through a compute unit would need a compute
-          // stage that relays it, which path expansion does not create.
-          LDBG(1) << "Path from stage " << flow.producer->getStageId()
-                  << " to stage " << flow.consumer->getStageId()
-                  << " passes through compute unit " << node.resource
-                  << ", which has no stage";
-          return mlir::failure();
+          addComputeHop(node.resource);
+          ++i;
+          flow.boundaries.push_back(i);
+          continue;
       }
       if (mlir::failed(addHop(memory, unit))) return mlir::failure();
       i += width;
@@ -1991,13 +2014,25 @@ static mlir::LogicalResult buildExpansionPlan(
   llvm::SmallVector<StageNode*> expanded_stages = *expanded_stages_or;
 
   // Each unit must still run at most one stage.
-  llvm::DenseSet<ResourceType> used_units;
+  llvm::DenseMap<ResourceType, StageNode*> used_units;
   for (StageNode* stage : expanded_stages) {
     std::optional<ResourceType> unit =
         plan->getStageInfo(stage).applicable_unit;
-    if (unit && !used_units.insert(*unit).second) {
-      LDBG(1) << "Unit " << *unit << " runs more than one stage";
-      return mlir::failure();
+    if (unit) {
+      auto [it, inserted] = used_units.try_emplace(*unit, stage);
+      if (!inserted) {
+        auto node = arch_graph.getNode(*unit);
+        bool relay_pair =
+            node && node->kind == ResourceKind::Compute &&
+            plan->getStageInfo(stage).kind ==
+                StageMaterializationInfo::Kind::kSyntheticTransfer &&
+            plan->getStageInfo(it->second).kind ==
+                StageMaterializationInfo::Kind::kSyntheticTransfer;
+        if (!relay_pair) {
+          LDBG(1) << "Unit " << *unit << " runs more than one stage";
+          return mlir::failure();
+        }
+      }
     }
   }
   LDBG_OS(1, [&](llvm::raw_ostream& os) {

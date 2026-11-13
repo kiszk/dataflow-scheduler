@@ -21,10 +21,12 @@
 #include <llvm/ADT/TypeSwitch.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/MathExtras.h>
+#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Arith/Utils/Utils.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Linalg/Transforms/Transforms.h>
+#include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
 #include <mlir/Dialect/Tensor/Transforms/Transforms.h>
@@ -39,6 +41,7 @@
 #include <mlir/Interfaces/DestinationStyleOpInterface.h>
 #include <mlir/Interfaces/InferTypeOpInterface.h>
 #include <mlir/Interfaces/LoopLikeInterface.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Interfaces/ViewLikeInterface.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
@@ -56,8 +59,10 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "dataflow-scheduler/Transforms/Utils/LoopSimplification.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 
 #define PASS_NAME "ktir-map-and-tile"
 #define DEBUG_TYPE PASS_NAME
@@ -70,6 +75,7 @@ using namespace scheduler;
 
 namespace scheduler {
 #define GEN_PASS_DEF_KTIRMAPANDTILEPASS
+#define GEN_PASS_DEF_KTIRNUMERICCASTTILINGPASS
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h.inc"
 }  // namespace scheduler
 
@@ -83,8 +89,290 @@ struct KTIRMapAndTilePass
     : public impl::KTIRMapAndTilePassBase<KTIRMapAndTilePass> {
   using KTIRMapAndTilePassBase<KTIRMapAndTilePass>::KTIRMapAndTilePassBase;
 
+  void getDependentDialects(mlir::DialectRegistry& registry) const override {
+    registry.insert<mlir::ktdf::KTDFDialect,
+                    mlir::ktdf_lowering::KTDFLoweringDialect,
+                    mlir::ktdp_lowering::KTDPLoweringDialect>();
+  }
+
   void runOnOperation() override;
 };
+
+struct KTIRNumericCastTilingPass
+    : public impl::KTIRNumericCastTilingPassBase<KTIRNumericCastTilingPass> {
+  void runOnOperation() override;
+};
+
+struct PacketUnary {
+  mlir::Operation* op;
+  mlir::Operation* scalar;
+};
+
+std::optional<PacketUnary> packetUnary(mlir::Operation* op) {
+  if (op->hasAttr("ktdf_arch.maps_to") || op->getNumResults() != 1 ||
+      !op->getResult(0).hasOneUse())
+    return std::nullopt;
+  if (mlir::isa<mlir::arith::NegFOp, mlir::math::FloorOp>(op))
+    return PacketUnary{op, op};
+  auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(op);
+  if (!generic || generic.getNumDpsInputs() > 1 ||
+      generic.getNumDpsInits() != 1 || generic.getRegion().empty() ||
+      (generic.getNumDpsInputs() == 1 &&
+       generic.getDpsInputs()[0].getType() != generic.getResult(0).getType()) ||
+      !llvm::all_of(generic.getIndexingMapsArray(),
+                    [](mlir::AffineMap map) { return map.isIdentity(); }) ||
+      !llvm::all_of(generic.getIteratorTypesArray(), [](auto iterator) {
+        return iterator == mlir::utils::IteratorType::parallel;
+      }))
+    return std::nullopt;
+  auto& body = generic.getRegion().front();
+  if (body.getNumArguments() != 1 + generic.getNumDpsInputs() ||
+      !llvm::hasSingleElement(body.without_terminator()))
+    return std::nullopt;
+  auto* scalar = &body.front();
+  auto yield = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
+  if (scalar->getNumOperands() != 1 || scalar->getNumResults() != 1 ||
+      scalar->getNumRegions() || !mlir::isMemoryEffectFree(scalar) ||
+      scalar->getOperand(0) != body.getArgument(0) || !yield ||
+      yield.getOperand(0) != scalar->getResult(0))
+    return std::nullopt;
+  return PacketUnary{op, scalar};
+}
+
+mlir::Value packetUnaryInput(const PacketUnary& unary) {
+  if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(unary.op))
+    return generic.getNumDpsInputs() ? generic.getDpsInputs()[0]
+                                     : generic.getDpsInits()[0];
+  return unary.op->getOperand(0);
+}
+
+mlir::Value applyPacketUnaries(mlir::OpBuilder& builder, mlir::Location loc,
+                               mlir::Value value,
+                               llvm::ArrayRef<PacketUnary> unaries) {
+  for (const auto& unary : unaries) {
+    auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
+    auto init =
+        mlir::tensor::EmptyOp::create(builder, loc, type, mlir::ValueRange{});
+    auto identity =
+        mlir::AffineMap::getMultiDimIdentityMap(1, builder.getContext());
+    auto parallel = mlir::linalg::IteratorTypeAttr::get(
+        builder.getContext(), mlir::utils::IteratorType::parallel);
+    auto generic = mlir::linalg::GenericOp::create(
+        builder, loc, mlir::TypeRange{type}, mlir::ValueRange{value},
+        mlir::ValueRange{init},
+        builder.getAffineMapArrayAttr({identity, identity}),
+        builder.getArrayAttr({parallel}), mlir::StringAttr{},
+        mlir::StringAttr{});
+    mlir::OpBuilder body_builder(builder.getContext());
+    auto* body = body_builder.createBlock(&generic.getRegion());
+    auto element = type.getElementType();
+    auto input = body->addArgument(element, loc);
+    body->addArgument(element, loc);
+    body_builder.setInsertionPointToEnd(body);
+    mlir::OperationState state(loc, unary.scalar->getName().getStringRef());
+    state.addOperands(input);
+    state.addTypes(element);
+    state.addAttributes(unary.scalar->getAttrDictionary().getValue());
+    auto* scalar = body_builder.create(state);
+    mlir::linalg::YieldOp::create(body_builder, loc, scalar->getResult(0));
+    value = generic.getResult(0);
+  }
+  return value;
+}
+
+/// Keep the physical packet axes while tiling a cast by native sticks.  The
+/// packet values have separate SSA results so PipelineBuilder assigns each a
+/// 32-element FIFO slot instead of flattening them into a 64-element slot.
+auto tileNumericCast(mlir::IRRewriter& rewriter,
+                     mlir::spyreop::NumericCast cast_op,
+                     mlir::ktdf_arch::Mapping& mapping) -> mlir::LogicalResult {
+  auto input_type =
+      mlir::cast<mlir::RankedTensorType>(cast_op.getInput().getType());
+  auto output_type = mlir::cast<mlir::RankedTensorType>(cast_op.getType());
+  const bool widening = cast_op.getKind() == "dl16tofp32";
+  auto native_type = widening ? input_type : output_type;
+  const int64_t rank = native_type.getRank();
+  if ((rank != 2 && rank != 3) || input_type.getRank() != rank ||
+      output_type.getRank() != rank || native_type.getDimSize(0) <= 0 ||
+      input_type.getDimSize(rank - 1) != (widening ? 64 : 32) ||
+      output_type.getDimSize(rank - 1) != (widening ? 32 : 64) ||
+      input_type.getDimSize(0) != (widening ? native_type.getDimSize(0)
+                                            : 2 * native_type.getDimSize(0)) ||
+      output_type.getDimSize(0) != (widening ? 2 * native_type.getDimSize(0)
+                                             : native_type.getDimSize(0)) ||
+      (rank == 3 && input_type.getDimSize(1) != output_type.getDimSize(1)))
+    return cast_op.emitError("numeric cast requires matching physical packets");
+  const int64_t rows = rank == 3 ? native_type.getDimSize(1) : 1;
+  auto loc = cast_op.getLoc();
+  llvm::SmallVector<PacketUnary> before, after;
+  mlir::Value input = cast_op.getInput();
+  while (auto* op = input.getDefiningOp()) {
+    auto unary = packetUnary(op);
+    if (!unary) break;
+    before.push_back(*unary);
+    input = packetUnaryInput(*unary);
+  }
+  std::reverse(before.begin(), before.end());
+  mlir::Value last = cast_op.getResult();
+  while (!last.use_empty()) {
+    auto* user = *last.user_begin();
+    if (!llvm::all_of(last.getUsers(),
+                      [&](mlir::Operation* other) { return other == user; }))
+      break;
+    auto unary = packetUnary(user);
+    if (!unary || packetUnaryInput(*unary) != last) break;
+    after.push_back(*unary);
+    last = unary->op->getResult(0);
+  }
+  rewriter.setInsertionPoint(cast_op);
+  auto zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+  auto one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+  auto two = mlir::arith::ConstantIndexOp::create(rewriter, loc, 2);
+  auto chunks = mlir::arith::ConstantIndexOp::create(rewriter, loc,
+                                                     native_type.getDimSize(0));
+  auto row_count = mlir::arith::ConstantIndexOp::create(rewriter, loc, rows);
+  auto init = mlir::tensor::EmptyOp::create(rewriter, loc, output_type,
+                                            mlir::ValueRange{});
+  mlir::ktdf_arch::ExecutionUnitOp default_compute;
+  for (const auto& kind : mapping.byKind()) {
+    auto unit = mlir::dyn_cast<mlir::ktdf_arch::ExecutionUnitOp>(
+        kind.getExemplar().getOperation());
+    if (!unit || !unit.getFeature<mlir::ktdf_arch::feature::Compute>())
+      continue;
+    if (default_compute)
+      return cast_op.emitError(
+          "numeric cast requires one default compute kind");
+    default_compute = unit;
+  }
+  if (!default_compute)
+    return cast_op.emitError("numeric cast requires one default compute kind");
+  auto compute = mapping.getOrMap<mlir::ktdf_arch::ExecutionUnitOp>(
+      cast_op, default_compute.getKind());
+  if (!compute || !compute.getFeature<mlir::ktdf_arch::feature::SIMD>())
+    return cast_op.emitError("numeric cast requires a SIMD compute unit");
+
+  auto packet_type = mlir::RankedTensorType::get(
+      {widening ? 64 : 32},
+      widening ? rewriter.getF16Type() : rewriter.getF32Type());
+  auto result_packet_type = mlir::RankedTensorType::get(
+      {widening ? 32 : 64},
+      widening ? rewriter.getF32Type() : rewriter.getF16Type());
+  auto slice = [&](mlir::OpBuilder& builder, mlir::Value source,
+                   mlir::Value packet, mlir::Value row,
+                   mlir::RankedTensorType type) -> mlir::Value {
+    llvm::SmallVector<mlir::OpFoldResult> offsets{packet};
+    llvm::SmallVector<mlir::OpFoldResult> sizes{builder.getIndexAttr(1)};
+    if (rank == 3) {
+      offsets.push_back(row);
+      sizes.push_back(builder.getIndexAttr(1));
+    }
+    offsets.push_back(builder.getIndexAttr(0));
+    sizes.push_back(builder.getIndexAttr(type.getDimSize(0)));
+    llvm::SmallVector<mlir::OpFoldResult> strides(rank,
+                                                  builder.getIndexAttr(1));
+    return mlir::tensor::ExtractSliceOp::create(builder, loc, type, source,
+                                                offsets, sizes, strides);
+  };
+  auto insert = [&](mlir::OpBuilder& builder, mlir::Value packet_value,
+                    mlir::Value output, mlir::Value packet,
+                    mlir::Value row) -> mlir::Value {
+    llvm::SmallVector<mlir::OpFoldResult> offsets{packet};
+    llvm::SmallVector<mlir::OpFoldResult> sizes{builder.getIndexAttr(1)};
+    if (rank == 3) {
+      offsets.push_back(row);
+      sizes.push_back(builder.getIndexAttr(1));
+    }
+    offsets.push_back(builder.getIndexAttr(0));
+    sizes.push_back(builder.getIndexAttr(result_packet_type.getDimSize(0)));
+    llvm::SmallVector<mlir::OpFoldResult> strides(rank,
+                                                  builder.getIndexAttr(1));
+    return mlir::tensor::InsertSliceOp::create(builder, loc, packet_value,
+                                               output, offsets, sizes, strides);
+  };
+  auto cast_row = [&](mlir::OpBuilder& builder, mlir::Value chunk,
+                      mlir::Value row, mlir::Value output) -> mlir::Value {
+    auto first = mlir::arith::MulIOp::create(builder, loc, chunk, two);
+    auto second = mlir::arith::AddIOp::create(builder, loc, first, one);
+    llvm::SmallVector<mlir::Value> inputs;
+    if (widening) {
+      inputs.push_back(applyPacketUnaries(
+          builder, loc, slice(builder, input, chunk, row, packet_type),
+          before));
+    } else {
+      inputs.push_back(applyPacketUnaries(
+          builder, loc, slice(builder, input, first, row, packet_type),
+          before));
+      inputs.push_back(applyPacketUnaries(
+          builder, loc, slice(builder, input, second, row, packet_type),
+          before));
+    }
+    mlir::OperationState state(loc, "ktdf_lowering.native_cast_value");
+    state.addOperands(inputs);
+    state.addTypes(
+        llvm::SmallVector<mlir::Type>(widening ? 2 : 1, result_packet_type));
+    state.addAttribute("kind", builder.getStringAttr(cast_op.getKind()));
+    auto* conversion = builder.create(state);
+    std::ignore = mlir::ktdf_arch::Mappable::setMapsTo(
+        conversion, mlir::ktdf_arch::Mappable::getMapsTo(cast_op));
+    if (widening) {
+      output = insert(
+          builder,
+          applyPacketUnaries(builder, loc, conversion->getResult(0), after),
+          output, first, row);
+      return insert(
+          builder,
+          applyPacketUnaries(builder, loc, conversion->getResult(1), after),
+          output, second, row);
+    }
+    return insert(
+        builder,
+        applyPacketUnaries(builder, loc, conversion->getResult(0), after),
+        output, chunk, row);
+  };
+  auto loop = mlir::scf::ForOp::create(
+      rewriter, loc, zero, chunks, one, mlir::ValueRange{init},
+      [&](mlir::OpBuilder& builder, mlir::Location, mlir::Value chunk,
+          mlir::ValueRange carried) {
+        if (rank == 2) {
+          mlir::scf::YieldOp::create(
+              builder, loc, cast_row(builder, chunk, zero, carried.front()));
+          return;
+        }
+        auto row_loop = mlir::scf::ForOp::create(
+            builder, loc, zero, row_count, one, carried,
+            [&](mlir::OpBuilder& row_builder, mlir::Location, mlir::Value row,
+                mlir::ValueRange row_carried) {
+              mlir::scf::YieldOp::create(
+                  row_builder, loc,
+                  cast_row(row_builder, chunk, row, row_carried.front()));
+            });
+        mlir::scf::YieldOp::create(builder, loc, row_loop.getResult(0));
+      });
+  if (after.empty())
+    rewriter.replaceOp(cast_op, loop.getResult(0));
+  else {
+    rewriter.replaceAllUsesWith(last, loop.getResult(0));
+    for (auto unary : llvm::reverse(after)) rewriter.eraseOp(unary.op);
+    rewriter.eraseOp(cast_op);
+  }
+  for (auto unary : llvm::reverse(before)) rewriter.eraseOp(unary.op);
+  return mlir::success();
+}
+
+void KTIRNumericCastTilingPass::runOnOperation() {
+  auto func = getOperation();
+  auto casts = llvm::to_vector(func.getOps<mlir::spyreop::NumericCast>());
+  if (casts.empty()) return;
+  auto& default_device = getAnalysis<mlir::ktdf_arch::DefaultDevice>();
+  if (!default_device) return signalPassFailure();
+  mlir::ktdf_arch::Mapping mapping(default_device.getRef());
+  mlir::IRRewriter rewriter(func);
+  for (auto cast_op : casts)
+    if (failed(tileNumericCast(rewriter, cast_op, mapping))) {
+      signalPassFailure();
+      return;
+    }
+}
 
 /// Given a shape and a target vector_length, compute per-dimension tile sizes
 /// working rightmost-first until the product of covered dims reaches
@@ -654,7 +942,10 @@ void KTIRMapAndTilePass::runOnOperation() {
       nested_computes.push_back(op);
     }
   });
-  if (computes.empty() && nested_computes.empty()) {
+  bool has_numeric_cast = false;
+  func.walk(
+      [&](mlir::ktdf_lowering::NativeCastValueOp) { has_numeric_cast = true; });
+  if (computes.empty() && nested_computes.empty() && !has_numeric_cast) {
     return;
   }
 

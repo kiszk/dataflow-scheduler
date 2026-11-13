@@ -12,6 +12,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     BufferPhaseLowering.cpp
     DataTransferLowering.cpp
     LinalgLowering.cpp
+    NativeCastLowering.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR
@@ -27,13 +28,16 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     KTIR::SpyreOpDialect
     DataflowSchedulerDialects::AgenDialect
     DataflowScheduler::ConversionUtils
+    DataflowScheduler::Analysis
     DataflowSchedulerDialects::DataflowDialect
     DataflowSchedulerDialects::KTDFDialect
+    DataflowSchedulerDialects::KTDFTransforms
     DataflowScheduler::KTDFLoweringDialect
     DataflowScheduler::KTDFToKTDFLow
     DataflowScheduler::KTDFUtils
     DataflowScheduler::KTDPLoweringDialect
     DataflowScheduler::TransformUtils
+    DataflowScheduler::Transforms
     DataflowSchedulerDialects::SymbolDialect
     DataflowSchedulerDialects::UniformDialect
     DataflowScheduler::Utils
@@ -44,9 +48,12 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     MLIRArithDialect
     MLIRFuncDialect
     MLIRIR
+    MLIRLinalgDialect
     MLIRMathDialect
+    MLIRMemRefDialect
     MLIRPass
     MLIRSCFDialect
+    MLIRTensorDialect
     MLIRTransformUtils
     MLIRViewLikeInterface
 )

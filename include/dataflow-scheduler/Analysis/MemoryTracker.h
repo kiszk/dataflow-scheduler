@@ -68,6 +68,8 @@ class MemoryTracker {
   void reset(llvm::ArrayRef<ResourceType> memory_resources);
 
  private:
+  const arch_view::MemoryTree& memory_tree_;
+
   /// Memory resource capacities (total bytes per resource)
   llvm::DenseMap<ResourceType, size_t> capacities_;
 

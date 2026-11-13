@@ -24,6 +24,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/DebugLog.h"
 
 #define DEBUG_TYPE "ktdf-to-operand-lowering"
@@ -132,18 +133,31 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
   LDBG(1) << "Materializing memory units";
   auto loc = func_.getLoc();
 
+  llvm::SmallDenseSet<ResourceType> materialized;
   for (auto mspace_attr : needed_spaces) {
+    if (!materialized.insert(memory_tree.getCanonicalResource(mspace_attr))
+             .second)
+      continue;
+    auto record_unit = [&](int core, mlir::Value unit) {
+      for (auto alias : memory_tree.getAliases(mspace_attr))
+        memory_unit_ssa[{alias, core}] = unit;
+    };
     std::string space_name;
     llvm::raw_string_ostream os(space_name);
     mspace_attr.print(os);
     os.flush();
-    std::string type_tag = unitTypeTag(mspace_attr);
+    auto type_space = mspace_attr;
+    for (auto alias : memory_tree.getAliases(mspace_attr))
+      if (mlir::isa<mlir::ktdp::MemorySpaceAttr>(alias) &&
+          needed_spaces.contains(alias))
+        type_space = alias;
+    std::string type_tag = unitTypeTag(type_space);
 
     if (memory_tree.isGlobalMemory(mspace_attr)) {
       auto get_unit_op = mlir::dataflow::GetUnitOp::create(
           builder, loc, mlir::TypeRange{builder.getIndexType()}, type_tag,
           type_tag);
-      memory_unit_ssa[{mspace_attr, -1}] = get_unit_op.getUnit();
+      record_unit(-1, get_unit_op.getUnit());
       LDBG(1) << "  Created global memory unit for " << space_name;
     } else if (memory_tree.isPerCoreScratchPadMemory(mspace_attr)) {
       for (int core = 0; core < grid_size; ++core) {
@@ -152,7 +166,7 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
             builder, loc, mlir::TypeRange{builder.getIndexType()}, unit_name,
             type_tag);
         get_unit_op->setAttr("core", builder.getI32IntegerAttr(core));
-        memory_unit_ssa[{mspace_attr, core}] = get_unit_op.getUnit();
+        record_unit(core, get_unit_op.getUnit());
         LDBG(1) << "  Created memory unit for " << space_name << " core "
                 << core;
       }
@@ -160,7 +174,7 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
       auto get_unit_op = mlir::dataflow::GetUnitOp::create(
           builder, loc, mlir::TypeRange{builder.getIndexType()}, type_tag,
           type_tag);
-      memory_unit_ssa[{mspace_attr, -1}] = get_unit_op.getUnit();
+      record_unit(-1, get_unit_op.getUnit());
       LDBG(1) << "  Created below-scratchpad memory unit for " << space_name;
     } else {
       return func_.emitError("Unknown memory space classification for: ")

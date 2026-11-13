@@ -51,6 +51,13 @@ void registerPassPipelinesForScheduler() {
       llvm::cl::value_desc("filename"), llvm::cl::init(""));
 
   mlir::PassPipelineRegistration<>(
+      "ktir-to-schedule-ir", "Convert KTIR to ScheduleIR",
+      [](mlir::OpPassManager& pm) {
+        scheduler::buildKTIRFrontendPipeline(
+            pm, scheduler::SchedulerExtContext::dummyContext());
+      });
+
+  mlir::PassPipelineRegistration<>(
       "ktir-to-dfir", "Schedule and lower KTIR to DataflowIR",
       [&](mlir::OpPassManager& pm) {
         scheduler::buildKTDPToDFIRPipeline(
