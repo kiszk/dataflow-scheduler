@@ -23,6 +23,7 @@
 
 #DDR = { kind = "DDR", size = 17179869184 }
 #L1 = { kind = "L1", size = 2097152 }
+#SFU_REG = { kind = "SFU_REG", size = 2048 }
 
 #MNILU = {
   kind = "MNILU",
@@ -132,6 +133,7 @@ ktdf_arch.device @sample_device attributes {
     datapath %mnisu to %ddr : exec_unit, memory
 
     group share(%l1) {
+      %sfu_reg = memory #SFU_REG
       %l1lu = exec_unit #L1LU
       %mpe_array = exec_unit #MPE_ARRAY
       %sfu = exec_unit #SFU
@@ -142,6 +144,48 @@ ktdf_arch.device @sample_device attributes {
       datapath #L1LU_SUBCORE_FIFO %mpe_array to %sfu : exec_unit, exec_unit
       datapath #L1SU_SUBCORE_FIFO %sfu to %l1su : exec_unit, exec_unit
       datapath #L1SU_CORE_FIFO %l1su to %l1 : exec_unit, memory
+    }
+  }
+
+  patterns ["pre_scheduling"] {
+    pdl.pattern : benefit(1) {
+      %f16 = type : f16
+      %in = operand : %f16
+      %exp = operation "spyreop.exp" (%in : !pdl.value) -> (%f16 : !pdl.type)
+      rewrite {
+        %reg_file = attribute = "SFU_REG"
+        %c0_value = attribute = 1.0 : f16
+        %c0_op = operation "arith.constant"
+          {"value" = %c0_value, "ktdf_arch.maps_to" = %reg_file}
+          -> (%f16 : !pdl.type)
+        %c0 = result 0 of %c0_op
+        %reg = type : memref<f16, "SFU_REG">
+        %no_dyn_operands = attribute = array<i32: 0, 0>
+        %in_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %in_reg = result 0 of %in_op
+        %in_store = operation "memref.store"
+          (%in, %in_reg : !pdl.value, !pdl.value)
+        %out_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %out_reg = result 0 of %out_op
+        %t0_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %t0 = result 0 of %t0_op
+        %template = attribute = "fake_exp"
+        %register_names = attribute = ["c0", "in0", "out0", "t0_0"]
+        %segments = attribute = array<i32: 2, 2>
+        %opaque_op = operation "ktdf.opaque"
+          (%c0, %in_reg, %out_reg, %t0
+            : !pdl.value, !pdl.value, !pdl.value, !pdl.value)
+          {"template_name" = %template, "func_name" = %template,
+           "dataflow_scheduler.register_names" = %register_names,
+           "operandSegmentSizes" = %segments}
+        %unwrap_op = operation "memref.load" (%out_reg : !pdl.value)
+          -> (%f16 : !pdl.type)
+        %unwrapped = result 0 of %unwrap_op
+        replace %exp with (%unwrapped : !pdl.value)
+      }
     }
   }
 }

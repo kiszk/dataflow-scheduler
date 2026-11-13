@@ -28,12 +28,12 @@
 
 // bf16 is not the f16 storage carrier used by this conversion recipe.
 // RUN: sed -e 's/f16/bf16/g' -e 's/@narrow(/@bf16_output(/' \
-// RUN:   -e '/^    %result =/i\    // expected-error @below {{requires tensor<Nx64xf16> and tensor<(2*N)x32xf32> without encodings, N > 0}}' %t.narrow.mlir > %t.bf16_output.mlir
+// RUN:   -e '/^    %result =/i\    // expected-error @below {{requires tensor<Nx64xf16> -> tensor<(2*N)x32xf32>}}' %t.narrow.mlir > %t.bf16_output.mlir
 // RUN: grep -q 'expected-error @below' %t.bf16_output.mlir && dataflow-scheduler-opt -ktir-to-dfir -verify-diagnostics %t.bf16_output.mlir
 
 // One packet cannot supply the complete 64-value conversion unit.
 // RUN: sed -e 's/@narrow(/@one_input_packet(/' -e 's/2x32/1x32/g' -e 's/1x64/1x32/g' \
 // RUN:   -e 's/\[2, 32\]/[1, 32]/g' -e 's/\[1, 64\]/[1, 32]/g' -e 's/\[64, 1\]/[32, 1]/g' \
 // RUN:   -e 's/-d0 + 1/-d0/' -e 's/-d1 + 63/-d1 + 31/' -e 's/\[#identity, #native\]/[#identity, #identity]/' \
-// RUN:   -e '/^    %result =/i\    // expected-error @below {{requires tensor<Nx64xf16> and tensor<(2*N)x32xf32> without encodings, N > 0}}' %t.narrow.mlir > %t.one_input_packet.mlir
+// RUN:   -e '/^    %result =/i\    // expected-error @below {{requires tensor<Nx64xf16> -> tensor<(2*N)x32xf32>}}' %t.narrow.mlir > %t.one_input_packet.mlir
 // RUN: grep -q 'expected-error @below' %t.one_input_packet.mlir && dataflow-scheduler-opt -ktir-to-dfir -verify-diagnostics %t.one_input_packet.mlir

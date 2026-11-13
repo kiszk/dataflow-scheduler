@@ -190,3 +190,26 @@ void NativeCastOp::getEffects(
                          ktdf::FifoResource::get());
   }
 }
+
+LogicalResult NativeCastValueOp::verify() {
+  const bool widening = getKind() == "dl16tofp32";
+  if (!widening && getKind() != "fp32todl16")
+    return emitOpError("requires kind 'dl16tofp32' or 'fp32todl16'");
+  if (getInputs().size() != (widening ? 1u : 2u) ||
+      getOutputs().size() != (widening ? 2u : 1u))
+    return emitOpError("requires one native and two FP32 packet values");
+  auto valid = [](Type type, bool fp32) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    return tensor && !tensor.getEncoding() && tensor.getRank() == 1 &&
+           tensor.getDimSize(0) == (fp32 ? 32 : 64) &&
+           (fp32 ? tensor.getElementType().isF32()
+                 : tensor.getElementType().isF16());
+  };
+  for (Value input : getInputs())
+    if (!valid(input.getType(), !widening))
+      return emitOpError("has an invalid input packet type");
+  for (Value output : getOutputs())
+    if (!valid(output.getType(), widening))
+      return emitOpError("has an invalid output packet type");
+  return success();
+}

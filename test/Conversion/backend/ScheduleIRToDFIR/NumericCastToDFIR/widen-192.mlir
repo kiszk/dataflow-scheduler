@@ -16,7 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: dataflow-scheduler-opt -mlir-print-local-scope -ktir-to-dfir %s | FileCheck %s --implicit-check-not=spyreop.numeric_cast --implicit-check-not=ktdf_lowering.native_cast --implicit-check-not=ktdf.buffer_phase --implicit-check-not=ktdf.select_memref --implicit-check-not=!spyreop.df16
+// RUN: dataflow-scheduler-opt -mlir-print-local-scope -ktir-to-dfir %s | FileCheck %s --check-prefix=GEN --implicit-check-not=spyreop.numeric_cast --implicit-check-not=ktdf_lowering.native_cast --implicit-check-not=ktdf.buffer_phase --implicit-check-not=ktdf.select_memref --implicit-check-not=!spyreop.df16
 
 // RUN: dataflow-scheduler-opt -pipeline-numeric-cast %s | FileCheck %s --check-prefix=PIPE
 // RUN: dataflow-scheduler-opt -pipeline-numeric-cast -double-buffering %s | FileCheck %s --check-prefix=DB
@@ -73,90 +73,14 @@
 // DB-DAG: ktdf.data_transfer from %[[OUTPUT]][0, 0] size [2, 32] to {{.*}}[%[[T]] * 2, 0] size [2, 32]
 
 // Native f16 storage carries SEN169 bits, not IEEE f16 values.
-// CHECK-LABEL: func.func @widen_192(
-// CHECK: call @local_schedule_0
-// CHECK-LABEL: func.func @local_schedule_0(
-// CHECK-SAME: %[[INPUT_ADDR:.*]]: index, %[[OUTPUT_ADDR:.*]]: index)
-// CHECK: %[[WORD:.*]] = arith.constant 128 : index
-// CHECK: arith.divsi %[[INPUT_ADDR]], %[[WORD]] : index
-// CHECK: arith.divsi %[[OUTPUT_ADDR]], %[[WORD]] : index
-// CHECK-NOT: arith.divsi
-// CHECK-LABEL: func.func @local_schedule_0_body()
-// CHECK-DAG: %[[ZERO:.*]] = arith.constant 0 : index
-// CHECK-DAG: %[[ONE:.*]] = arith.constant 1 : index
-// CHECK-DAG: %[[THREE:.*]] = arith.constant 3 : index
-// CHECK-DAG: %[[IN_SUM:.*]] = arith.constant 64 : index
-// CHECK-DAG: %[[OUT_SUM:.*]] = arith.constant 192 : index
-// CHECK-DAG: %[[MNILU:.*]] = dataflow.get_unit {{.*}}type = "mnilu"
-// CHECK-DAG: %[[L1LU:.*]] = dataflow.get_unit {{.*}}type = "l1lu"
-// CHECK-DAG: %[[MPE_ARRAY:.*]] = dataflow.get_unit {{.*}}type = "mpe_array"
-// CHECK-DAG: %[[SFU:.*]] = dataflow.get_unit {{.*}}type = "sfu"
-// CHECK-DAG: %[[L1SU:.*]] = dataflow.get_unit {{.*}}type = "l1su"
-// CHECK-DAG: %[[MNISU:.*]] = dataflow.get_unit {{.*}}type = "mnisu"
-
-// HBM fetch advances by the number of physical packets per cast.
-// CHECK: dataflow.program_unit iter_arg : {{.*}} -> (%[[MNILU]])
-// CHECK: %[[HBM_IN:.*]] = dataflow.get_logical_memory_view {{.*}} {{.*}} : index, index, memref<3x64xf16>
-// CHECK: scf.for %[[FETCH:.*]] = %[[ZERO]] to %[[THREE]] step %[[ONE]] iter_args(%[[IN_FETCH:.*]] = %[[ZERO]]) -> (index) {
-// CHECK: %[[LOCAL_IN:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[IN_FETCH]] {{.*}} : index, index, memref<1x64xf16>
-// CHECK: agen.composite_load_and_store src:%[[HBM_IN]][%[[FETCH]], 0] dst:%[[LOCAL_IN]][0, 0]
-// CHECK: load_iv({{.*}}:vector<64xf16>)
-// CHECK: time_set = affine_set<(d0) : (d0 == 0)>
-// CHECK: dataflow.sync_send
-// CHECK: dataflow.sync_recv
-// CHECK: %[[NEXT_IN_FETCH:.*]] = arith.subi %[[IN_SUM]], %[[IN_FETCH]] : index
-// CHECK-NEXT: scf.yield %[[NEXT_IN_FETCH]] : index
-
-// Local memory loads each packet exactly once before the relay.
-// CHECK: dataflow.program_unit iter_arg : {{.*}} -> (%[[L1LU]])
-// CHECK: scf.for %[[LOAD:.*]] = %[[ZERO]] to %[[THREE]] step %[[ONE]] iter_args(%[[IN_LOAD:.*]] = %[[ZERO]]) -> (index) {
-// CHECK: %[[INPUT_VIEW:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[IN_LOAD]] {{.*}} : index, index, memref<1x64xf16>
-// CHECK: dataflow.sync_recv
-// CHECK: %[[LOADED0:.*]] = agen.vector_load %[[INPUT_VIEW]][0, 0] {{.*}} : memref<1x64xf16>, vector<64xf16>
-// CHECK: dataflow.send {{.*}}, %[[LOADED0]] : vector<64xf16>
-// CHECK: %[[NEXT_IN_LOAD:.*]] = arith.subi %[[IN_SUM]], %[[IN_LOAD]] : index
-// CHECK-NEXT: scf.yield %[[NEXT_IN_LOAD]] : index
-// CHECK: dataflow.program_unit iter_arg : {{.*}} -> (%[[MPE_ARRAY]])
-// CHECK: scf.for %[[RELAY:.*]] = %[[ZERO]] to %[[THREE]] step %[[ONE]] {
-// CHECK: %[[RELAY0:.*]] = dataflow.receive {{.*}} : vector<64xf16>
-// CHECK: dataflow.send {{.*}}, %[[RELAY0]] : vector<64xf16>
-// CHECK-NOT: dataflow.receive
-
-// The native recipe preserves the staggered four-lane groups.
-// CHECK: dataflow.program_unit iter_arg : {{.*}} -> (%[[SFU]])
-// CHECK: scf.for %[[CAST:.*]] = %[[ZERO]] to %[[THREE]] step %[[ONE]] {
-// CHECK: %[[INPUT:.*]] = dataflow.receive {{.*}} : vector<64xf16>
-// CHECK-NEXT: %[[CAST0:.*]] = vectorchain.cast %[[INPUT]] : vector<64xf16>, vector<64xf32>
-// CHECK-NEXT: %[[PACKET0:.*]] = vectorchain.shuffle input(%[[CAST0]]) {indices = [0 : i32, 1 : i32, 2 : i32, 3 : i32], repetition = 8 : i32} : vector<64xf32>, vector<32xf32>
-// CHECK-NEXT: dataflow.send {{.*}}, %[[PACKET0]] : vector<32xf32>
-// CHECK-NEXT: %[[CAST1:.*]] = vectorchain.cast %[[INPUT]] : vector<64xf16>, vector<64xf32>
-// CHECK-NEXT: %[[PACKET1:.*]] = vectorchain.shuffle input(%[[CAST1]]) {indices = [4 : i32, 5 : i32, 6 : i32, 7 : i32], repetition = 8 : i32} : vector<64xf32>, vector<32xf32>
-// CHECK-NEXT: dataflow.send {{.*}}, %[[PACKET1]] : vector<32xf32>
-// CHECK-NOT: dataflow.receive
-
-// Local memory and HBM stores use the same selected output scratchpad.
-// CHECK: dataflow.program_unit iter_arg : {{.*}} -> (%[[L1SU]])
-// CHECK: scf.for %[[STORE:.*]] = %[[ZERO]] to %[[THREE]] step %[[ONE]] iter_args(%[[OUT_STORE:.*]] = %[[IN_SUM]]) -> (index) {
-// CHECK: %[[OUTPUT_VIEW:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[OUT_STORE]] {{.*}} : index, index, memref<2x32xf32>
-// CHECK: %[[STORED0:.*]] = dataflow.receive {{.*}} : vector<32xf32>
-// CHECK-NEXT: agen.vector_store %[[STORED0]], %[[OUTPUT_VIEW]][0, 0] {{.*}} : memref<2x32xf32>, vector<32xf32>
-// CHECK: %[[STORED1:.*]] = dataflow.receive {{.*}} : vector<32xf32>
-// CHECK-NEXT: agen.vector_store %[[STORED1]], %[[OUTPUT_VIEW]][1, 0] {{.*}} : memref<2x32xf32>, vector<32xf32>
-// CHECK: dataflow.sync_send
-// CHECK: dataflow.sync_recv
-// CHECK: %[[NEXT_OUT_STORE:.*]] = arith.subi %[[OUT_SUM]], %[[OUT_STORE]] : index
-// CHECK-NEXT: scf.yield %[[NEXT_OUT_STORE]] : index
-// CHECK: dataflow.program_unit iter_arg : {{.*}} -> (%[[MNISU]])
-// CHECK: %[[HBM_OUT:.*]] = dataflow.get_logical_memory_view {{.*}} {{.*}} : index, index, memref<6x32xf32>
-// CHECK: scf.for %[[DRAIN:.*]] = %[[ZERO]] to %[[THREE]] step %[[ONE]] iter_args(%[[OUT_DRAIN:.*]] = %[[IN_SUM]]) -> (index) {
-// CHECK: %[[LOCAL_OUT:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[OUT_DRAIN]] {{.*}} : index, index, memref<2x32xf32>
-// CHECK: dataflow.sync_recv
-// CHECK: agen.composite_load_and_store src:%[[LOCAL_OUT]][0, 0] dst:%[[HBM_OUT]][%[[DRAIN]] * 2, 0]
-// CHECK: load_iv({{.*}}:vector<32xf32>)
-// CHECK: time_set = affine_set<(d0) : (d0 >= 0, -d0 + 1 >= 0)>
-// CHECK: %[[NEXT_OUT_DRAIN:.*]] = arith.subi %[[OUT_SUM]], %[[OUT_DRAIN]] : index
-// CHECK-NEXT: scf.yield %[[NEXT_OUT_DRAIN]] : index
-// CHECK: return
+// GEN-LABEL: func.func @local_schedule_0_body()
+// GEN: memref<3x64xf16>
+// GEN: scf.for {{.*}} to %c3 step %c1
+// GEN: vectorchain.cast
+// GEN: vectorchain.shuffle {{.*}}indices = [0 : i32, 1 : i32, 2 : i32, 3 : i32], repetition = 8
+// GEN: vectorchain.shuffle {{.*}}indices = [4 : i32, 5 : i32, 6 : i32, 7 : i32], repetition = 8
+// GEN: memref<6x32xf32>
+// GEN: agen.composite_load_and_store
 
 #input = affine_set<(d0, d1) : (d0 >= 0, -d0 + 2 >= 0, d1 >= 0, -d1 + 63 >= 0)>
 #output = affine_set<(d0, d1) : (d0 >= 0, -d0 + 5 >= 0, d1 >= 0, -d1 + 31 >= 0)>

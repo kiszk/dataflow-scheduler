@@ -147,6 +147,72 @@ struct LowerNativeCastPattern : OpRewritePattern<ktdf_lowering::NativeCastOp> {
   ktdf_arch::Mapping& mapping_;
 };
 
+struct LowerNativeCastValuePattern
+    : OpRewritePattern<ktdf_lowering::NativeCastValueOp> {
+  LowerNativeCastValuePattern(MLIRContext* context, ktdf_arch::Mapping& mapping)
+      : OpRewritePattern(context), mapping_(mapping) {}
+
+  LogicalResult matchAndRewrite(ktdf_lowering::NativeCastValueOp op,
+                                PatternRewriter& rewriter) const override {
+    if (!llvm::all_of(op.getInputs(), [](Value input) {
+          return isa<VectorType>(input.getType());
+        }))
+      return failure();
+    auto program = op->getParentOfType<dataflow::ProgramUnitOp>();
+    if (!program)
+      return op.emitError("native_cast_value requires a program_unit");
+    auto compute = mapping_.resolve<ktdf_arch::ExecutionUnitOp>(program);
+    if (failed(scheduler::verifyNativeCastUnit(compute, op))) return failure();
+    auto simd = compute.getFeature<ktdf_arch::feature::SIMD>();
+    int64_t native_lanes = simd.getLanes(rewriter.getF16Type());
+    int64_t fp32_lanes = simd.getLanes(rewriter.getF32Type());
+    int64_t native_sub = simd.getSubSimdLanes(rewriter.getF16Type());
+    int64_t fp32_sub = simd.getSubSimdLanes(rewriter.getF32Type());
+    int64_t groups = native_lanes / native_sub;
+    SmallVector<Value> results;
+    if (op.getKind() == "dl16tofp32") {
+      for (int64_t part = 0; part < 2; ++part) {
+        auto casted = vectorchain::CastOp::create(
+            rewriter, op.getLoc(),
+            VectorType::get({native_lanes}, rewriter.getF32Type()),
+            op.getInputs()[0], nullptr, nullptr);
+        SmallVector<Attribute> indices;
+        for (int64_t lane = 0; lane < fp32_sub; ++lane)
+          indices.push_back(rewriter.getI32IntegerAttr(part * fp32_sub + lane));
+        auto packet = vectorchain::ShuffleOp::create(
+            rewriter, op.getLoc(),
+            VectorType::get({fp32_lanes}, rewriter.getF32Type()),
+            casted.getData(), ValueRange{}, ValueRange{}, nullptr, nullptr,
+            rewriter.getArrayAttr(indices), rewriter.getI32IntegerAttr(groups));
+        results.push_back(packet.getOutput());
+      }
+    } else {
+      SmallVector<Value> converted;
+      for (Value input : op.getInputs())
+        converted.push_back(
+            vectorchain::CastOp::create(
+                rewriter, op.getLoc(),
+                VectorType::get({fp32_lanes}, rewriter.getF16Type()), input,
+                nullptr, nullptr)
+                .getData());
+      SmallVector<Attribute> indices;
+      for (int64_t lane = 0; lane < native_sub; ++lane)
+        indices.push_back(rewriter.getI32IntegerAttr(lane));
+      auto packed = vectorchain::PackOp::create(
+          rewriter, op.getLoc(),
+          VectorType::get({native_lanes}, rewriter.getF16Type()), converted[0],
+          converted[1], nullptr, nullptr, rewriter.getArrayAttr(indices),
+          rewriter.getIndexAttr(groups));
+      results.push_back(packed.getData());
+    }
+    rewriter.replaceOp(op, results);
+    return success();
+  }
+
+ private:
+  ktdf_arch::Mapping& mapping_;
+};
+
 }  // namespace
 
 void scheduler::populateNativeCastLoweringPatterns(
@@ -154,4 +220,5 @@ void scheduler::populateNativeCastLoweringPatterns(
     ktdf_arch::Mapping& mapping) {
   patterns.add<LowerNativeCastPattern>(patterns.getContext(), components,
                                        mapping);
+  patterns.add<LowerNativeCastValuePattern>(patterns.getContext(), mapping);
 }

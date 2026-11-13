@@ -986,6 +986,13 @@ static mlir::LogicalResult routeDataFlows(llvm::MutableArrayRef<DataFlow> flows,
       flow.consumer_begin = last - 1;
       flow.consumer_unit = nodeAt(flow, last - 1).resource;
     }
+    // A consumer transfer unit reads the preceding memory itself.
+    if (last > flow.producer_end + 1 &&
+        nodeAt(flow, last).kind == ResourceKind::LoadStoreUnit &&
+        nodeAt(flow, last - 1).kind == ResourceKind::Memory) {
+      flow.consumer_begin = last - 1;
+      flow.consumer_unit = nodeAt(flow, last).resource;
+    }
   }
   return mlir::success();
 }

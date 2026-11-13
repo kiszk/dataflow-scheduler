@@ -165,4 +165,15 @@ def KTDFLowering_NativeCastOp : KTDFLowering_Op<"native_cast", [
   let hasVerifier = 1;
 }
 
+def KTDFLowering_NativeCastValueOp : KTDFLowering_Op<"native_cast_value", [Pure]> {
+  let summary = "Convert native DL16 and staggered FP32 tensor packets";
+  let arguments = (ins Variadic<AnyRankedTensor>:$inputs, StrAttr:$kind);
+  let results = (outs Variadic<AnyRankedTensor>:$outputs);
+  let assemblyFormat = [{
+    `ins` `(` $inputs `:` type($inputs) `)`
+    `outs` `(` type($outputs) `)` attr-dict
+  }];
+  let hasVerifier = 1;
+}
+
 #endif // DATAFLOW_SCHEDULER_DIALECT_KTDFLOWERING_KTDFLOWERING_TD

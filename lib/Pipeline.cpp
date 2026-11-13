@@ -36,7 +36,6 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
-#include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/SpyreOp/SpyreOp.h"
@@ -205,9 +204,6 @@ class CastAwareStagePass
     bool hasPhysicalCast = false;
     getOperation().walk(
         [&](mlir::spyreop::NumericCast) { hasPhysicalCast = true; });
-    bool hasBufferizedCast = false;
-    getOperation().walk(
-        [&](mlir::ktdf_lowering::NativeCastOp) { hasBufferizedCast = true; });
     mlir::OpPassManager pm;
     if (hasPhysicalCast) {
       if (buildDefault == buildDefaultKTIRFrontendPipeline) {
@@ -217,12 +213,6 @@ class CastAwareStagePass
             "numeric cast requires the KTIR frontend stage");
         return signalPassFailure();
       }
-    } else if (hasBufferizedCast &&
-               buildDefault == buildDefaultSchedulerOptimizationPipeline) {
-      // The numeric cast recipe has already fixed and validated routes and
-      // 64-element tiles. Only buffer lifetime and address assignment remain.
-      pm.addPass(createDoubleBufferingPass(ctx));
-      pm.addPass(createAddressAssignmentPass(ctx));
     } else {
       buildDefault(pm, ctx);
     }

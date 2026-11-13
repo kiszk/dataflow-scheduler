@@ -24,7 +24,10 @@
 // RUN: not dataflow-scheduler-opt -ktir-to-dfir %t.extra.mlir 2>&1 | FileCheck %s --check-prefix=EXTRA
 // RUN: sed '/%result = spyreop.numeric_cast/a\    %other = spyreop.numeric_cast %value {kind = "dl16tofp32"} : tensor<1x64xf16> -> tensor<2x32xf32>' %t.base.mlir > %t.duplicate.mlir
 // RUN: not dataflow-scheduler-opt -ktir-to-dfir %t.duplicate.mlir 2>&1 | FileCheck %s --check-prefix=DUPLICATE
+// RUN: sed '/%result = spyreop.numeric_cast/a\    %unused = arith.negf %result : tensor<2x32xf32>' %t.base.mlir > %t.unused.mlir
+// RUN: not dataflow-scheduler-opt -ktir-to-dfir %t.unused.mlir 2>&1 | FileCheck %s --check-prefix=UNUSED
 
 // KIND: kind must be dl16tofp32 or fp32todl16
 // EXTRA: unsupported operation beside numeric cast
 // DUPLICATE: only one numeric cast is supported
+// UNUSED: numeric cast requires a single load, unary chain, cast, unary chain and store

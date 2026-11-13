@@ -16,6 +16,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
+
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/ArchViews/RoutingGraph.h"
 #include "dataflow-scheduler/Conversion/Utils/Utils.h"
@@ -32,10 +34,15 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
 namespace scheduler {
@@ -53,9 +60,15 @@ struct Buffer {
   int64_t address = 0;
 };
 
+struct UnaryStep {
+  StringAttr kind;
+  DictionaryAttr attrs;
+};
+
 struct CastPlan {
   func::FuncOp function;
   spyreop::NumericCast conversion;
+  SmallVector<UnaryStep> before, after;
   Buffer input;
   Buffer output;
   int64_t cores;
@@ -111,13 +124,16 @@ LogicalResult readBuffer(Value access, RankedTensorType type,
   }
   SmallVector<Attribute> offsets;
   if (failed(tile.getBaseMap().constantFold(indices, offsets)) ||
-      offsets.size() != 2 || !llvm::all_of(offsets, [](Attribute attr) {
+      offsets.size() != static_cast<size_t>(type.getRank()) ||
+      !llvm::all_of(offsets, [](Attribute attr) {
         return cast<IntegerAttr>(attr).getInt() == 0;
       })) {
     return tile.emitError("numeric cast requires zero tile offsets");
   }
   const auto shape = type.getShape();
-  const SmallVector<int64_t> strides{shape.back(), 1};
+  SmallVector<int64_t> strides(shape.size(), 1);
+  for (int64_t axis = shape.size() - 2; axis >= 0; --axis)
+    strides[axis] = strides[axis + 1] * shape[axis + 1];
   auto memory_type = cast<MemRefType>(view.getResult().getType());
   if (view.getMemorySpace().getKind() != ktdp::MemorySpaceKind::global ||
       view.getStaticSizes() != shape ||
@@ -144,6 +160,51 @@ LogicalResult readBuffer(Value access, RankedTensorType type,
   return success();
 }
 
+StringAttr unaryKind(Operation* op) {
+  if (op->hasAttr("ktdf_arch.maps_to")) return {};
+  if (isa<arith::NegFOp, math::FloorOp>(op))
+    return StringAttr::get(op->getContext(), op->getName().getStringRef());
+  auto generic = dyn_cast<linalg::GenericOp>(op);
+  if (!generic || generic.getNumDpsInputs() != 1 ||
+      generic.getNumDpsInits() != 1 || generic.getNumResults() != 1 ||
+      generic.getRegion().empty() ||
+      generic.getDpsInputs()[0].getType() != generic.getResult(0).getType() ||
+      !generic.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() ||
+      !generic.getDpsInits()[0].hasOneUse() ||
+      !llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }) ||
+      !llvm::all_of(generic.getIteratorTypesArray(), [](auto iterator) {
+        return iterator == utils::IteratorType::parallel;
+      }))
+    return {};
+  auto& body = generic.getRegion().front();
+  if (body.getNumArguments() != 2 ||
+      !llvm::hasSingleElement(body.without_terminator()))
+    return {};
+  auto& unary = body.front();
+  auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+  if (unary.hasAttr("ktdf_arch.maps_to") || unary.getNumOperands() != 1 ||
+      unary.getNumResults() != 1 || unary.getNumRegions() != 0 ||
+      !isMemoryEffectFree(&unary) ||
+      unary.getResult(0).getType() != body.getArgument(0).getType() ||
+      unary.getOperand(0) != body.getArgument(0) || !yield ||
+      yield.getNumOperands() != 1 || yield.getOperand(0) != unary.getResult(0))
+    return {};
+  return StringAttr::get(op->getContext(), unary.getName().getStringRef());
+}
+
+Value unaryInput(Operation* op) {
+  if (auto generic = dyn_cast<linalg::GenericOp>(op))
+    return generic.getDpsInputs()[0];
+  return op->getOperand(0);
+}
+
+UnaryStep unaryStep(Operation* op, StringAttr kind) {
+  if (auto generic = dyn_cast<linalg::GenericOp>(op))
+    op = &generic.getRegion().front().front();
+  return {kind, op->getAttrDictionary()};
+}
+
 FailureOr<CastPlan> matchCast(ModuleOp module) {
   SmallVector<func::FuncOp> functions(module.getOps<func::FuncOp>());
   if (functions.size() != 1) {
@@ -162,7 +223,8 @@ FailureOr<CastPlan> matchCast(ModuleOp module) {
         "arguments");
   }
   spyreop::NumericCast conversion;
-  unsigned loads = 0, stores = 0, views = 0, tiles = 0;
+  unsigned loads = 0, stores = 0, views = 0, tiles = 0, unary_count = 0;
+  unsigned generic_count = 0, empty_count = 0;
   for (Operation& op : function.getBody().front()) {
     if (auto cast_op = dyn_cast<spyreop::NumericCast>(op)) {
       if (conversion) {
@@ -177,11 +239,17 @@ FailureOr<CastPlan> matchCast(ModuleOp module) {
       ++views;
     } else if (isa<ktdp::ConstructAccessTilesOp>(op)) {
       ++tiles;
+    } else if (unaryKind(&op)) {
+      ++unary_count;
+      generic_count += isa<linalg::GenericOp>(op);
+    } else if (isa<tensor::EmptyOp>(op)) {
+      ++empty_count;
     } else if (!isa<func::ReturnOp, arith::ConstantIndexOp>(op)) {
       return op.emitError("unsupported operation beside numeric cast");
     }
   }
-  if (!conversion || loads != 1 || stores != 1 || views != 2 || tiles != 2) {
+  if (!conversion || loads != 1 || stores != 1 || views != 2 || tiles != 2 ||
+      generic_count != empty_count) {
     return function.emitError(
         "numeric cast requires one global load, cast and global "
         "store");
@@ -192,28 +260,59 @@ FailureOr<CastPlan> matchCast(ModuleOp module) {
   auto native = widening ? input : output;
   auto wide = widening ? output : input;
   if (!native.hasStaticShape() || !wide.hasStaticShape() ||
-      native.getRank() != 2 || wide.getRank() != 2 ||
+      (native.getRank() != 2 && native.getRank() != 3) ||
+      wide.getRank() != native.getRank() ||
+      (native.getRank() == 3 && (native.getDimSize(1) <= 0 ||
+                                 native.getDimSize(1) != wide.getDimSize(1))) ||
       native.getDimSize(0) <= 0 || wide.getDimSize(0) % 2 ||
       native.getDimSize(0) != wide.getDimSize(0) / 2 ||
-      native.getDimSize(1) != 64 || wide.getDimSize(1) != 32 ||
+      native.getShape().back() != 64 || wide.getShape().back() != 32 ||
       !native.getElementType().isF16() || native.getEncoding() ||
       wide.getEncoding() || !wide.getElementType().isF32()) {
     return conversion.emitError(
         "numeric cast requires tensor<Nx64xf16> and "
-        "tensor<(2*N)x32xf32>, N > 0");
+        "tensor<(2*N)x32xf32>, or their matching-row rank-3 forms, N > 0");
   }
-  auto load = conversion.getInput().getDefiningOp<ktdp::LoadOp>();
-  auto store =
-      conversion.getResult().hasOneUse()
-          ? dyn_cast<ktdp::StoreOp>(*conversion.getResult().user_begin())
-          : ktdp::StoreOp();
-  if (!load || !load->hasOneUse() || !store ||
-      store.getDataTile() != conversion.getResult()) {
+  CastPlan plan{function,
+                conversion,
+                {},
+                {},
+                {},
+                {},
+                cast<IntegerAttr>(grid[0]).getInt()};
+  auto trace = [&](Value value, SmallVectorImpl<UnaryStep>& unary) {
+    while (auto* op = value.getDefiningOp()) {
+      auto kind = unaryKind(op);
+      if (!kind || !op->getResult(0).hasOneUse() ||
+          unaryInput(op).getType() != op->getResult(0).getType())
+        break;
+      unary.push_back(unaryStep(op, kind));
+      value = unaryInput(op);
+    }
+    return value;
+  };
+  auto load =
+      trace(conversion.getInput(), plan.before).getDefiningOp<ktdp::LoadOp>();
+  Value stored = conversion.getResult();
+  while (stored.hasOneUse()) {
+    auto* user = *stored.user_begin();
+    auto kind = unaryKind(user);
+    if (!kind || unaryInput(user) != stored ||
+        user->getResult(0).getType() != stored.getType())
+      break;
+    plan.after.push_back(unaryStep(user, kind));
+    stored = user->getResult(0);
+  }
+  auto store = stored.hasOneUse()
+                   ? dyn_cast<ktdp::StoreOp>(*stored.user_begin())
+                   : ktdp::StoreOp();
+  if (!load || !load->hasOneUse() || !store || store.getDataTile() != stored ||
+      plan.before.size() + plan.after.size() != unary_count) {
     return conversion.emitError(
-        "numeric cast must connect one load directly to one store");
+        "numeric cast requires a single load, unary chain, cast, unary "
+        "chain and store");
   }
-  CastPlan plan{
-      function, conversion, {}, {}, cast<IntegerAttr>(grid[0]).getInt()};
+  std::reverse(plan.before.begin(), plan.before.end());
   if (native.getDimSize(0) % plan.cores) {
     return function.emitError(
         "numeric cast requires whole sticks evenly divided among cores");
@@ -385,6 +484,35 @@ FailureOr<CastRoute> findCastRoute(const CastPlan& plan,
   return result;
 }
 
+Value emitUnaries(OpBuilder& builder, Location loc, Value input,
+                  ArrayRef<UnaryStep> steps) {
+  for (const auto& step : steps) {
+    auto type = cast<RankedTensorType>(input.getType());
+    auto init = tensor::EmptyOp::create(builder, loc, type, ValueRange{});
+    auto identity = AffineMap::getMultiDimIdentityMap(1, builder.getContext());
+    auto parallel = linalg::IteratorTypeAttr::get(
+        builder.getContext(), utils::IteratorType::parallel);
+    auto generic = linalg::GenericOp::create(
+        builder, loc, TypeRange{type}, ValueRange{input}, ValueRange{init},
+        builder.getAffineMapArrayAttr({identity, identity}),
+        builder.getArrayAttr({parallel}), StringAttr{}, StringAttr{});
+    OpBuilder body_builder(builder.getContext());
+    auto* body = body_builder.createBlock(&generic.getRegion());
+    auto element = type.getElementType();
+    Value value = body->addArgument(element, loc);
+    body->addArgument(element, loc);
+    body_builder.setInsertionPointToEnd(body);
+    OperationState state(loc, step.kind.getValue());
+    state.addOperands(value);
+    state.addTypes(element);
+    state.addAttributes(step.attrs.getValue());
+    auto* unary = body_builder.create(state);
+    linalg::YieldOp::create(body_builder, loc, unary->getResult(0));
+    input = generic.getResult(0);
+  }
+  return input;
+}
+
 // This is the bufferization boundary: f16 carries SEN169 bits in memory and
 // FIFOs; native_cast retains the numerical conversion and staggered packet
 // order.
@@ -418,8 +546,9 @@ void emitPipeline(func::FuncOp program, const CastPlan& plan,
     }
     auto memory = ktdp::MemorySpaceAttr::get(b.getContext(),
                                              ktdp::MemorySpaceKind::global, -1);
-    SmallVector<int64_t> shape(buffer.type.getShape());
-    shape[0] /= plan.cores;
+    SmallVector<int64_t> shape{buffer.type.getNumElements() /
+                                   (buffer.type.getShape().back() * plan.cores),
+                               buffer.type.getShape().back()};
     auto element = buffer.type.getElementType();
     return ktdp::ConstructMemoryViewOp::create(
         b, loc, MemRefType::get(shape, element, nullptr, memory), address,
@@ -437,10 +566,21 @@ void emitPipeline(func::FuncOp program, const CastPlan& plan,
   }
   auto zero = arith::ConstantIndexOp::create(builder, loc, 0);
   auto one = arith::ConstantIndexOp::create(builder, loc, 1);
+  int64_t rows =
+      plan.input.type.getRank() == 3 ? plan.input.type.getDimSize(1) : 1;
   auto count = arith::ConstantIndexOp::create(
-      builder, loc, plan.input.type.getNumElements() / (64 * plan.cores));
+      builder, loc,
+      plan.input.type.getNumElements() / (64 * plan.cores * rows));
+  // Separate IVs preserve the HBM address jump between groups of rows.
   auto loop = scf::ForOp::create(builder, loc, zero, count, one);
   builder.setInsertionPointToStart(loop.getBody());
+  Value row = zero;
+  if (rows > 1) {
+    auto row_count = arith::ConstantIndexOp::create(builder, loc, rows);
+    auto row_loop = scf::ForOp::create(builder, loc, zero, row_count, one);
+    row = row_loop.getInductionVar();
+    builder.setInsertionPointToStart(row_loop.getBody());
+  }
   ktdf::PipelineBuilder pipeline(builder, loc);
   auto& private_builder = pipeline.getPrivateBuilder();
   bool widening = !plan.input.type.getElementType().isF32();
@@ -474,11 +614,34 @@ void emitPipeline(func::FuncOp program, const CastPlan& plan,
   auto dma = [&](OpBuilder& b, Value global, Value scratch, bool load) {
     auto type = cast<MemRefType>(scratch.getType());
     auto packets = type.getDimSize(0);
-    auto map = AffineMap::get(
-        1, 0, {b.getAffineDimExpr(0) * packets, zero_expr}, b.getContext());
+    SmallVector<Value> global_indices{loop.getInductionVar()};
+    if (rows > 1) global_indices.push_back(row);
+    if (rows > 1 && packets == 2) {
+      auto chunk = b.getAffineDimExpr(0);
+      auto row_index = b.getAffineDimExpr(1);
+      for (int64_t part = 0; part < 2; ++part) {
+        auto packet = chunk * (2 * rows) + row_index + part * rows;
+        auto global_map =
+            AffineMap::get(2, 0, {packet, zero_expr}, b.getContext());
+        auto local_map = AffineMap::get(
+            0, 0, {b.getAffineConstantExpr(part), zero_expr}, b.getContext());
+        SmallVector<int64_t> size{1, 32};
+        auto transfer = ktdf::DataTransferOp::create(
+            b, loc, load ? global : scratch, load ? global_map : local_map,
+            load ? ValueRange(global_indices) : ValueRange{}, size,
+            load ? scratch : global, load ? local_map : global_map,
+            load ? ValueRange{} : ValueRange(global_indices), size);
+        transfer->setAttr("dataflow_scheduler.throttle",
+                          b.getI64IntegerAttr(32));
+      }
+      return;
+    }
+    auto address = b.getAffineDimExpr(0) * (packets * rows);
+    if (rows > 1) address = address + b.getAffineDimExpr(1);
+    auto map = AffineMap::get(global_indices.size(), 0, {address, zero_expr},
+                              b.getContext());
     auto scratch_map =
         AffineMap::get(0, 0, {zero_expr, zero_expr}, b.getContext());
-    SmallVector<Value> global_indices{loop.getInductionVar()};
     auto transfer = ktdf::DataTransferOp::create(
         b, loc, load ? global : scratch, load ? map : scratch_map,
         load ? ValueRange(global_indices) : ValueRange{}, type.getShape(),
@@ -526,9 +689,37 @@ void emitPipeline(func::FuncOp program, const CastPlan& plan,
   };
   relays(route.input, inputs);
   stage(route.input.back(), [&](OpBuilder& b, Location) {
-    ktdf_lowering::NativeCastOp::create(
-        b, loc, inputs.back(), outputs.front(),
-        b.getStringAttr(widening ? "dl16tofp32" : "fp32todl16"));
+    if (plan.before.empty() && plan.after.empty()) {
+      ktdf_lowering::NativeCastOp::create(
+          b, loc, inputs.back(), outputs.front(),
+          b.getStringAttr(widening ? "dl16tofp32" : "fp32todl16"));
+      return;
+    }
+    SmallVector<Value> values;
+    for (Value slot : inputs.back()) {
+      auto type = cast<ktdf::FifoSlotType>(slot.getType());
+      auto tensor =
+          RankedTensorType::get({type.getNumElements()}, type.getElementType());
+      auto read = ktdf::ReadFromFifoOp::create(b, loc, tensor, slot);
+      values.push_back(emitUnaries(b, loc, read.getResult(), plan.before));
+    }
+    SmallVector<Type> result_types;
+    for (Value slot : outputs.front()) {
+      auto type = cast<ktdf::FifoSlotType>(slot.getType());
+      result_types.push_back(RankedTensorType::get({type.getNumElements()},
+                                                   type.getElementType()));
+    }
+    OperationState state(loc, "ktdf_lowering.native_cast_value");
+    state.addOperands(values);
+    state.addTypes(result_types);
+    state.addAttribute("kind",
+                       b.getStringAttr(widening ? "dl16tofp32" : "fp32todl16"));
+    auto* conversion = b.create(state);
+    for (auto [result, slot] :
+         llvm::zip(conversion->getResults(), outputs.front())) {
+      Value value = emitUnaries(b, loc, result, plan.after);
+      ktdf::WriteToFifoOp::create(b, loc, value, slot);
+    }
   });
   relays(route.output, outputs);
   stage(route.output.back(), [&](OpBuilder& b, Location) {

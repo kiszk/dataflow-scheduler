@@ -46,7 +46,7 @@ void buildKTIRFrontendPipeline(
 /// IR in place — routing data movement, tiling, coarsening, double buffering,
 /// cross-instance parallelization, tile size selection, address assignment and
 /// grid normalization.
-/// Numeric casts do not use these general scheduling transforms.
+/// Numeric casts use these transforms after their packetized stages are built.
 ///
 /// Both the input and the output of this stage are Schedule IR (KTDF). Passes
 /// come from `Transforms` and `Dialect/KTDF/Transforms`.
