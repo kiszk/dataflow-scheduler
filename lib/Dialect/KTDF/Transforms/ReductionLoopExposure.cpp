@@ -232,9 +232,10 @@ static LogicalResult collectReductionGenericOps(
       stage.getBody()->walk<WalkOrder::PreOrder>([&](Operation* op) {
         if (isa<ktdf::StageOp>(op)) return WalkResult::skip();
         if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
-          // Skip chained generics whose input comes from another generic —
-          // those are inner-dim ops left for a later pass.
-          if (generic.getInputs().front().getDefiningOp<linalg::GenericOp>())
+          // Output-only bodies have no input reduction domain. Chained
+          // generics are inner-dim ops left for a later pass.
+          if (generic.getInputs().empty() ||
+              generic.getInputs().front().getDefiningOp<linalg::GenericOp>())
             return WalkResult::advance();
           ReductionInfo info;
           FailureOr<bool> exposable = collectReductionInfo(generic, info);

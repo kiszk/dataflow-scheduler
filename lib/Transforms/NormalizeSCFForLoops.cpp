@@ -42,6 +42,19 @@ namespace scheduler {
 
 namespace {
 
+/// Affine composition promotes loop-invariant indices to symbols. Transfer
+/// indices are all dimensions, preserving the composed dims/symbols ordering.
+void composeTransferMap(mlir::AffineMap& map,
+                        llvm::SmallVectorImpl<mlir::Value>& operands) {
+  mlir::affine::fullyComposeAffineMapAndOperands(&map, &operands);
+  auto inputs = mlir::AffineMap::getMultiDimIdentityMap(map.getNumInputs(),
+                                                        map.getContext())
+                    .getResults();
+  map = map.replaceDimsAndSymbols(inputs.take_front(map.getNumDims()),
+                                  inputs.drop_front(map.getNumDims()),
+                                  map.getNumInputs(), 0);
+}
+
 /// Fold any affine.apply ops (e.g. those introduced by loop normalization) that
 /// appear as data-transfer index operands into the transfer's affine maps.
 ///
@@ -63,7 +76,7 @@ void foldAffineApplyIntoDataTransfers(mlir::Operation* root,
       llvm::SmallVector<mlir::Value> operands(
           transfer.getSourceIndices().begin(),
           transfer.getSourceIndices().end());
-      mlir::affine::fullyComposeAffineMapAndOperands(&map, &operands);
+      composeTransferMap(map, operands);
       rewriter.modifyOpInPlace(transfer, [&]() {
         transfer.setSourceMapAttr(mlir::AffineMapAttr::get(map));
         transfer.getSourceIndicesMutable().assign(operands);
@@ -74,7 +87,7 @@ void foldAffineApplyIntoDataTransfers(mlir::Operation* root,
       mlir::AffineMap map = dst_attr.getValue();
       llvm::SmallVector<mlir::Value> operands(transfer.getDestIndices().begin(),
                                               transfer.getDestIndices().end());
-      mlir::affine::fullyComposeAffineMapAndOperands(&map, &operands);
+      composeTransferMap(map, operands);
       rewriter.modifyOpInPlace(transfer, [&]() {
         transfer.setDestMapAttr(mlir::AffineMapAttr::get(map));
         transfer.getDestIndicesMutable().assign(operands);

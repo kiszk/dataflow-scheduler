@@ -338,12 +338,21 @@ void KTIRPipelinePass::runOnOperation() {
   mlir::ktdf_arch::Mapping mapping(default_device.getRef());
 
   // Create the pipelines.
-  const auto pipelines = llvm::map_to_vector(
-      func.getOps<mlir::scf::ForOp>(),
-      [&](mlir::scf::ForOp outermost) -> mlir::Operation* {
-        rewriter.setInsertionPointToEnd(findInnermost(outermost).getBody());
-        return createPipeline(rewriter, outermost->getLoc(), dominance);
-      });
+  llvm::SmallVector<mlir::ktdf::StageOp> phases;
+  func.walk([&](mlir::ktdf::StageOp stage) {
+    if (!stage.getBody()->getOps<mlir::ktdp_lowering::StoreOp>().empty())
+      phases.push_back(stage);
+  });
+  for (auto loop : func.getOps<mlir::scf::ForOp>()) {
+    auto* block = findInnermost(loop).getBody();
+    if (!block->getOps<mlir::ktdf::PipelineOp>().empty()) continue;
+    rewriter.setInsertionPointToEnd(block);
+    createPipeline(rewriter, loop.getLoc(), dominance);
+  }
+  for (auto stage : phases) {
+    rewriter.setInsertionPointToEnd(stage.getBody());
+    createPipeline(rewriter, stage.getLoc(), dominance);
+  }
 
   // Normalize the pipelines.
   {
@@ -369,7 +378,7 @@ void KTIRPipelinePass::runOnOperation() {
     target.addIllegalOp<mlir::ktdp_lowering::IndStoreOp>();
     target.addIllegalOp<mlir::ktdf::ViaOp>();
 
-    if (failed(mlir::applyPartialConversion(pipelines, target, {}))) {
+    if (failed(mlir::applyPartialConversion(getOperation(), target, {}))) {
       signalPassFailure();
       return;
     }
