@@ -16,6 +16,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "AccessOrderMaterialization.h"
+
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallVectorExtras.h>
@@ -1106,6 +1108,7 @@ void KTIRBufferizePass::runOnOperation() {
   }
 
   mlir::func::FuncOp func = getOperation();
+
   // Obtain the default device and start a mapping.
   auto& default_device = getAnalysis<mlir::ktdf_arch::DefaultDevice>();
   if (!default_device) {
@@ -1120,6 +1123,23 @@ void KTIRBufferizePass::runOnOperation() {
       map) {
     mem_space_map.insert_range(map);
   }
+
+  mlir::ktdf_arch::Mapping mapping(default_device.getRef());
+  if (failed(materializeAccessOrders(func, mapping, mem_space_map)))
+    return signalPassFailure();
+
+  // Replacing an access tile by a memref drops its order. Only do so after
+  // the element permutation has been materialized as data movement.
+  auto unresolved = func.walk([](mlir::ktdp::ConstructAccessTilesOp tile) {
+    if (!tile->use_empty() && !tile.getAccessTileOrder().isIdentity()) {
+      tile.emitOpError(
+          "access_tile_order must be materialized before bufferization; "
+          "no target data-movement recipe has been selected");
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  if (unresolved.wasInterrupted()) return signalPassFailure();
 
   mlir::RewritePatternSet patterns(&getContext());
   patterns.add<LowerLoad, LowerStore>(patterns.getContext(), mem_space_map);

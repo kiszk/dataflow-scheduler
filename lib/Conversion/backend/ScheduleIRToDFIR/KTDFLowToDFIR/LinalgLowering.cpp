@@ -186,6 +186,12 @@ struct LowerLinalgGenericPattern
               .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
                 return lowerMulFOp(op, rewriter, identity_map);
               })
+              .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, false);
+              })
+              .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
+              })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
               })
@@ -355,6 +361,12 @@ struct LowerLinalgGenericPattern
           mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
               .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
                 return lowerMulFOp(op, rewriter, identity_map);
+              })
+              .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, false);
+              })
+              .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
               })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
@@ -612,6 +624,22 @@ struct LowerLinalgGenericPattern
         rewriter, op->getLoc(), vector_type, lhs, rhs, addend,
         /*mask=*/nullptr, /*dbgName=*/nullptr, identity_map);
     rewriter.replaceOp(op, mac_op.getData());
+    return mlir::success();
+  }
+
+  mlir::LogicalResult lowerUnaryFOp(mlir::Operation* op, mlir::Value input,
+                                    mlir::PatternRewriter& rewriter,
+                                    bool floor) const {
+    auto type = mlir::dyn_cast<mlir::VectorType>(input.getType());
+    if (!type) return mlir::failure();
+    mlir::Value output =
+        floor ? mlir::vectorchain::FloorOp::create(rewriter, op->getLoc(), type,
+                                                   input, nullptr, nullptr)
+                    .getData()
+              : mlir::vectorchain::NegOp::create(rewriter, op->getLoc(), type,
+                                                 input, nullptr, nullptr)
+                    .getData();
+    rewriter.replaceOp(op, output);
     return mlir::success();
   }
 

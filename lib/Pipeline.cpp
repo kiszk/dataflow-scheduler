@@ -59,6 +59,7 @@ void scheduler::buildKTIRFrontendPipeline(
         {.categoryToGeneric = true, .namedToGeneric = true}));
     nested.addPass(createSimplifyLinalgPass());
     nested.addPass(createFuseLinalgPass());
+    nested.addPass(createKTIRNumericCastTilingPass());
     nested.addPass(createKTIRMapAndTilePass());
     nested.addPass(createKTIRBufferizePass());
     nested.addPass(createKTIRPipelinePass());

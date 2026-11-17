@@ -48,6 +48,17 @@ def KTIRLegalityCheckPass : Pass<"ktir-legality-check", "mlir::ModuleOp"> {
   ];
 }
 
+def KTIRNumericCastTilingPass : Pass<"ktir-numeric-cast-tiling", "mlir::func::FuncOp"> {
+  let summary = "Tile physical numeric casts into native sticks and FP32 packets";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::ktdf_lowering::KTDFLoweringDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 def KTIRMapAndTilePass : Pass<"ktir-map-and-tile", "mlir::func::FuncOp"> {
   let summary = "Maps and tiles KTIR programs";
   let description = [{

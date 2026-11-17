@@ -29,6 +29,7 @@
 
 #include "dataflow-scheduler/Analysis/Mapping.h"
 #include "dataflow-scheduler/Analysis/WriteSetScan.h"
+#include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/PipelineExecutionTransform.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ScratchpadConflicts.h"
@@ -47,11 +48,14 @@
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "ktdf-to-ktdflowering"
@@ -65,6 +69,132 @@ namespace scheduler {
 }  // namespace scheduler
 
 namespace {
+
+// Trace views and private results, including every possible physical buffer
+// selected by double buffering. Keep storage-producing memref values as roots;
+// an address-producing scalar is not itself a storage identity.
+static llvm::SmallSetVector<mlir::Value, 4> getStorageOrigins(
+    mlir::Value value) {
+  llvm::SmallSetVector<mlir::Value, 4> roots;
+  llvm::SmallVector<mlir::Value> pending{value};
+  llvm::DenseSet<mlir::Value> seen;
+  while (!pending.empty()) {
+    value = pending.pop_back_val();
+    if (!seen.insert(value).second) continue;
+    auto* op = value.getDefiningOp();
+    if (auto priv = mlir::dyn_cast_or_null<mlir::ktdf::PrivateOp>(op)) {
+      pending.push_back(priv.getYieldOp().getOperand(
+          mlir::cast<mlir::OpResult>(value).getResultNumber()));
+      continue;
+    }
+    if (auto select = mlir::dyn_cast_or_null<mlir::ktdf::SelectMemrefOp>(op)) {
+      llvm::append_range(pending, select.getCandidates());
+      continue;
+    }
+    mlir::Value source;
+    if (auto view = mlir::dyn_cast_or_null<mlir::ViewLikeOpInterface>(op))
+      source = view.getViewSource();
+    else if (auto cast = mlir::dyn_cast_or_null<mlir::memref::CastOp>(op))
+      source = cast.getSource();
+    else if (auto cast =
+                 mlir::dyn_cast_or_null<mlir::memref::MemorySpaceCastOp>(op))
+      source = cast.getSource();
+    if (source && mlir::isa<mlir::MemRefType>(source.getType()))
+      pending.push_back(source);
+    else
+      roots.insert(value);
+  }
+  return roots;
+}
+
+// RAW signals publish data before a reader starts; WAR completion signals
+// protect storage from the next group's writes after that reader finishes.
+// Synchronize only actual memory writer/reader pairs. Compute stages are
+// ordered by their FIFOs and need no direct sync with memory-transfer units.
+static mlir::LogicalResult insertPhaseCompletionSignals(
+    mlir::func::FuncOp func, const StageToUnitsMap& stage_to_units) {
+  auto has_pipeline = [](mlir::ktdf::StageOp stage) {
+    return stage
+        .walk([](mlir::ktdf::PipelineOp) {
+          return mlir::WalkResult::interrupt();
+        })
+        .wasInterrupted();
+  };
+  struct BufferUsers {
+    llvm::SmallSetVector<mlir::Operation*, 4> writers;
+    llvm::SmallSetVector<mlir::Operation*, 4> readers;
+  };
+  auto result = func.walk([&](mlir::ktdf::PipelineOp pipeline) {
+    if (pipeline.getNumStages() < 2 ||
+        !llvm::all_of(pipeline.getStages(), has_pipeline))
+      return mlir::WalkResult::advance();
+    llvm::MapVector<mlir::Value, BufferUsers> buffers;
+    auto record = [&](mlir::Value buffer, mlir::Operation* stage, bool write) {
+      if (!mlir::isa<mlir::MemRefType>(buffer.getType())) return;
+      for (mlir::Value origin : getStorageOrigins(buffer)) {
+        auto& users = buffers[origin];
+        (write ? users.writers : users.readers).insert(stage);
+      }
+    };
+    auto leaves = pipeline.walk([&](mlir::ktdf::StageOp stage) {
+      if (has_pipeline(stage)) return mlir::WalkResult::advance();
+      auto found = stage_to_units.mapping.find(stage);
+      if (found == stage_to_units.mapping.end() || found->second.empty()) {
+        stage.emitError("phase completion requires assigned leaf-stage units");
+        return mlir::WalkResult::interrupt();
+      }
+      stage.walk([&](mlir::ktdf::DataTransferOp transfer) {
+        record(transfer.getSource(), stage, false);
+        record(transfer.getDestination(), stage, true);
+      });
+      stage.walk([&](mlir::ktdf::IndDataTransferOp transfer) {
+        record(transfer.getDirSrc(), stage, false);
+        record(transfer.getDirDst(), stage, true);
+      });
+      return mlir::WalkResult::advance();
+    });
+    if (leaves.wasInterrupted()) return mlir::WalkResult::interrupt();
+
+    mlir::OpBuilder builder(pipeline.getContext());
+    builder.setInsertionPointToEnd(pipeline.getBody());
+    llvm::SmallVector<llvm::SmallVector<mlir::Value>> emitted;
+    // MapVector and SetVector preserve a common order in every unit program,
+    // so overlapping pairwise barriers cannot wait on each other cyclically.
+    for (auto& [buffer, users] : buffers) {
+      for (auto* writer : users.writers) {
+        for (auto* reader : users.readers) {
+          llvm::SmallSetVector<mlir::Value, 8> units;
+          llvm::SmallSetVector<scheduler::ResourceType, 2> kinds;
+          for (auto* stage : {writer, reader}) {
+            for (mlir::Value unit : stage_to_units.mapping.at(stage)) {
+              auto kind = scheduler::getUnitResourceType(unit);
+              if (!kind) {
+                stage->emitError("phase completion unit has no resource kind");
+                return mlir::WalkResult::interrupt();
+              }
+              units.insert(unit);
+              kinds.insert(*kind);
+            }
+          }
+          // A unit's own program already orders its reads and next writes.
+          if (kinds.size() < 2) continue;
+          if (llvm::any_of(emitted, [&](const auto& previous) {
+                return previous.size() == units.size() &&
+                       llvm::all_of(previous, [&](mlir::Value unit) {
+                         return units.contains(unit);
+                       });
+              }))
+            continue;
+          emitted.push_back(llvm::to_vector(units.getArrayRef()));
+          mlir::ktdf_lowering::SignalOp::create(builder, pipeline.getLoc(),
+                                                units.getArrayRef());
+        }
+      }
+    }
+    return mlir::WalkResult::advance();
+  });
+  return mlir::failure(result.wasInterrupted());
+}
 
 // ---------------------------------------------------------------------------
 // Check whether there is a genuine cross-iteration scratchpad dependency
@@ -475,6 +605,8 @@ struct KTDFToKTDFLoweringPass
                                      conflicts, back_edges))) {
         return signalPassFailure();
       }
+      if (mlir::failed(insertPhaseCompletionSignals(func, stage_to_units)))
+        return signalPassFailure();
 
       // Steps 9-12: Process each pipeline independently (innermost
       // first).
