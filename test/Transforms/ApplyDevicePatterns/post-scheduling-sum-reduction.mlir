@@ -1,4 +1,4 @@
-// RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect -apply-device-patterns='groups=post_scheduling' | FileCheck %s
+// RUN: dataflow-scheduler-opt %s --split-input-file -allow-unregistered-dialect -apply-device-patterns='groups=post_scheduling' | FileCheck %s
 
 // CHECK-LABEL:   func.func @sum_reduction() {
 // CHECK-NEXT:     %[[ALLOC_0:.*]] = memref.alloc() : memref<64x32xf16, "L1">
@@ -36,6 +36,33 @@ module {
       linalg.yield %sum : f16
     }
 
+    return
+  }
+}
+
+// -----
+
+// FP32 must not select the legacy FP16 SUM template.
+// CHECK-LABEL: func.func @sum_reduction_f32()
+// CHECK: linalg.generic
+// CHECK: arith.addf {{.*}} : f32
+// CHECK-NOT: test.simd_reduction_sum
+// CHECK: return
+module {
+  ktdf_arch.device @sample_device import("../../Dialect/KTDFArch/sample_device.mlir")
+  func.func @sum_reduction_f32() {
+    %input = memref.alloc() : memref<32xf32, "SFU_REG">
+    %head = memref.subview %input[0] [1] [1]
+        : memref<32xf32, "SFU_REG"> to memref<1xf32, "SFU_REG">
+    linalg.generic {
+      indexing_maps = [affine_map<(l, o) -> (l)>, affine_map<(l, o) -> (o)>],
+      iterator_types = ["reduction", "parallel"]
+    } ins(%input : memref<32xf32, "SFU_REG">)
+      outs(%head : memref<1xf32, "SFU_REG">) {
+    ^bb0(%value: f32, %acc: f32):
+      %sum = arith.addf %value, %acc : f32
+      linalg.yield %sum : f32
+    }
     return
   }
 }

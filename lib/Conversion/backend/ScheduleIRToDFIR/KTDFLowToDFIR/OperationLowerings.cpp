@@ -929,7 +929,7 @@ mlir::LogicalResult scheduler::runOperationLowerings(
   // Lower linalg.generic compute operations and FIFO operations
   mlir::RewritePatternSet patterns(func.getContext());
   populateNumericCastLoweringPatterns(patterns, components, mapping);
-  populateLinalgLoweringPatterns(patterns, symbols);
+  populateLinalgLoweringPatterns(patterns, symbols, mapping);
   patterns.add<LowerMemRefCopyFromFifoPattern>(func.getContext());
   patterns.add<LowerReadFromFifoPattern>(func.getContext(), mapping.byKind(),
                                          components);

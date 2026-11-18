@@ -198,6 +198,16 @@ auto ktdfIsReductionKind(mlir::PatternRewriter& /*rewriter*/,
       values[1].cast<mlir::Attribute>());
   if (!expected) return mlir::failure();
 
+  // The legacy SUM device template is FP16-only. FP32 inner sums are lowered
+  // to typed VectorChain operations by KTDFLowToDFIR instead.
+  if (expected.getValue() == "sum" &&
+      llvm::any_of(generic.getOutputs(), [](mlir::Value output) {
+        return mlir::cast<mlir::ShapedType>(output.getType())
+            .getElementType()
+            .isF32();
+      }))
+    return mlir::failure();
+
   mlir::Operation* yield = generic.getRegion().front().getTerminator();
   if (yield->getNumOperands() == 0) return mlir::failure();
 
@@ -205,6 +215,20 @@ auto ktdfIsReductionKind(mlir::PatternRewriter& /*rewriter*/,
     if (reductionKindOf(yielded) != expected.getValue()) return mlir::failure();
   }
   return mlir::success();
+}
+
+// Target patterns choose the register bank for non-immediate float constants.
+auto ktdfNeedsConstantRegister(mlir::PatternRewriter&, mlir::PDLResultList&,
+                               llvm::ArrayRef<mlir::PDLValue> values)
+    -> mlir::LogicalResult {
+  auto op = mlir::dyn_cast<mlir::arith::ConstantOp>(
+      values[0].cast<mlir::Operation*>());
+  if (!op || op->hasAttr("ktdf_arch.maps_to")) return mlir::failure();
+  auto value = mlir::dyn_cast<mlir::FloatAttr>(op.getValue());
+  if (!value) return mlir::failure();
+  double number = value.getValueAsDouble();
+  return mlir::success(number != 0 && number != 1 && number != 2 &&
+                       number != 3);
 }
 
 // Constraint: ktdf.is_tensor_type(type)
@@ -302,6 +326,8 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
                                         ktdfIsInnerDimReduction);
     patterns.registerConstraintFunction("ktdf.is_reduction_kind",
                                         ktdfIsReductionKind);
+    patterns.registerConstraintFunction("ktdf.needs_constant_register",
+                                        ktdfNeedsConstantRegister);
     patterns.registerConstraintFunction("ktdf.is_tensor_type",
                                         ktdfIsTensorType);
     patterns.registerConstraintFunction("linalg.is_contraction",

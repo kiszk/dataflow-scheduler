@@ -120,7 +120,9 @@ static bool matchAbsMaxOperands(mlir::arith::MaxNumFOp maxnum_op,
 /// Pattern to lower linalg.generic compute operations
 struct LowerLinalgGenericPattern
     : public mlir::OpRewritePattern<mlir::linalg::GenericOp> {
-  using OpRewritePattern::OpRewritePattern;
+  LowerLinalgGenericPattern(mlir::MLIRContext* context,
+                            mlir::ktdf_arch::Mapping& mapping)
+      : OpRewritePattern(context), mapping_(mapping) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
@@ -136,8 +138,8 @@ struct LowerLinalgGenericPattern
 
     // ReductionLoopExposure and MapReductionPartials run before this pass and
     // rewrite every tensor-semantics linalg.generic with reduction dims into
-    // explicit scf.for loops, leaving only parallel iterators here. Nothing
-    // below lowers a reduction, and the elementwise path would take one for an
+    // explicit scf.for loops, leaving only parallel iterators here. The tensor
+    // path below would take a remaining reduction for an
     // elementwise op and give a wrong answer, so say so rather than assert it:
     // an assert is gone in a release build and the fall-through is silent.
     if (llvm::any_of(generic_op.getIteratorTypesArray(), [](auto iter_type) {
@@ -288,6 +290,86 @@ struct LowerLinalgGenericPattern
   }
 
  private:
+  mlir::ktdf_arch::Mapping& mapping_;
+
+  // MapReductionPartials leaves the lane reduction as a generic that writes
+  // the head of its input register. It must not become an elementwise add.
+  mlir::LogicalResult lowerInnerSum(mlir::linalg::GenericOp op,
+                                    mlir::PatternRewriter& rewriter) const {
+    using namespace mlir;
+    if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1)
+      return op.emitError("inner reduction requires one input and output");
+    Value input = op.getInputs().front();
+    auto type = dyn_cast<MemRefType>(input.getType());
+    auto subview = op.getOutputs().front().getDefiningOp<memref::SubViewOp>();
+    Block& body = op.getRegion().front();
+    auto add = dyn_cast<arith::AddFOp>(body.front());
+    auto yield = cast<linalg::YieldOp>(body.getTerminator());
+    if (!type || !type.hasStaticShape() || !type.getElementType().isF32() ||
+        type.getNumElements() != 32 || type.getShape().back() != 32 ||
+        !subview || subview.getSource() != input ||
+        !subview.getType().hasStaticShape() ||
+        subview.getType().getNumElements() != 1 ||
+        llvm::any_of(subview.getStaticOffsets(),
+                     [](int64_t n) { return n != 0; }) ||
+        llvm::any_of(subview.getStaticStrides(),
+                     [](int64_t n) { return n != 1; }) ||
+        !llvm::hasSingleElement(body.without_terminator()) || !add ||
+        add.getLhs() != body.getArgument(0) ||
+        add.getRhs() != body.getArgument(1) ||
+        yield.getOperand(0) != add.getResult())
+      return op.emitError(
+          "unsupported inner reduction: expected a 32-lane f32 sum into "
+          "the input register's head subview");
+
+    auto program = op->getParentOfType<dataflow::ProgramUnitOp>();
+    auto unit = program ? mapping_.resolve<ktdf_arch::ExecutionUnitOp>(program)
+                        : ktdf_arch::ExecutionUnitOp();
+    auto simd = unit ? unit.getFeature<ktdf_arch::feature::SIMD>()
+                     : ktdf_arch::feature::SIMD();
+    if (!unit || !unit.getFeature<ktdf_arch::feature::Compute>() || !simd ||
+        simd.getLanes(rewriter.getF32Type()) != 32 ||
+        simd.getSubSimdLanes(rewriter.getF32Type()) != 4)
+      return op.emitError(
+          "f32 inner sum requires a compute unit with 32 SIMD lanes and "
+          "4 sub-SIMD lanes");
+
+    Location loc = op.getLoc();
+    auto vector = VectorType::get({32}, rewriter.getF32Type());
+    auto ones = arith::ConstantOp::create(
+        rewriter, loc,
+        DenseElementsAttr::get(vector, rewriter.getF32FloatAttr(1.0)));
+    auto identity = rewriter.getDimIdentityMap();
+    // Neighbor forwarding first sums pairs, then puts each four-lane group's
+    // sum in its head. The two forwarding modes use MAC ports 0 and 2.
+    const int32_t neighbor_indices[][4] = {{1, 0, 3, 3}, {2, 0, 1, 3}};
+    for (auto [step, indices] : llvm::enumerate(neighbor_indices)) {
+      Value value = scheduler::emitVectorLoad(rewriter, loc, vector, input);
+      auto neighbor = vectorchain::ShuffleOp::create(
+          rewriter, loc, vector, value, ValueRange{}, ValueRange{}, nullptr,
+          nullptr, rewriter.getI32ArrayAttr(indices), 8);
+      // The target tracks operand reuse by load operation. The forwarded and
+      // ordinary ports need distinct loads even though they read one register.
+      Value plain = scheduler::emitVectorLoad(rewriter, loc, vector, input);
+      auto sum = vectorchain::MultiplyAndAccumulateOp::create(
+          rewriter, loc, vector, step == 0 ? neighbor.getResult() : plain,
+          ones.getResult(), step == 0 ? plain : neighbor.getResult(), nullptr,
+          nullptr, identity);
+      scheduler::emitVectorStore(rewriter, loc, sum.getResult(), input);
+    }
+    Value partial = scheduler::emitVectorLoad(rewriter, loc, vector, input);
+    // Match the target's REDUCE recipe: combine the eight sub-SIMD groups.
+    // Only lane 0 is the logical result; the rest is whole-stick padding.
+    auto sum = vectorchain::ScanWithGapOp::create(
+        rewriter, loc, vector, partial, nullptr,
+        vectorchain::VectorChainBinaryOperator::add, llvm::APInt(64, 8),
+        vectorchain::VectorChainScanOpEvalOrders::left_to_right);
+    scheduler::emitVectorStore(rewriter, loc, sum.getResult(), input);
+    rewriter.eraseOp(op);
+    if (subview->use_empty()) rewriter.eraseOp(subview);
+    return success();
+  }
+
   // Lowers a linalg.generic with buffer semantics (memref init operand).
   // The resulting accumulated vector is written back to the output buffer via
   // agen.vector_store.
@@ -295,6 +377,17 @@ struct LowerLinalgGenericPattern
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const {
     mlir::Location loc = generic_op.getLoc();
+
+    if (!generic_op.getInputs().empty()) {
+      auto map = generic_op.getIndexingMapsArray().front();
+      if (map.getNumResults()) {
+        auto lane = mlir::dyn_cast<mlir::AffineDimExpr>(
+            map.getResult(map.getNumResults() - 1));
+        if (lane && generic_op.getIteratorTypesArray()[lane.getPosition()] ==
+                        mlir::utils::IteratorType::reduction)
+          return lowerInnerSum(generic_op, rewriter);
+      }
+    }
 
     mlir::Block& body = generic_op.getRegion().front();
     auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
@@ -396,6 +489,10 @@ struct LowerLinalgGenericPattern
               })
               .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
                 return lowerSelectOp(op, rewriter);
+              })
+              .Case<mlir::dataflow::OpaqueOp>([&](mlir::dataflow::OpaqueOp op) {
+                rewriter.moveOpBefore(op, generic_op);
+                return mlir::success();
               })
               .Case<mlir::spyreop::Identity>([&](mlir::spyreop::Identity op) {
                 return lowerIdentity(op, rewriter, identity_map);
@@ -649,12 +746,25 @@ struct LowerLinalgGenericPattern
       mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
       mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
       mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
-    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(lhs.getType());
+    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(
+        mlir::isa<mlir::ShapedType>(lhs.getType()) ? lhs.getType()
+                                                   : rhs.getType());
     if (!lhs_ty) {
       return llvm::failure();
     }
     auto vector_type = getFlattenedVectorType(lhs_ty);
     if (!vector_type) return mlir::failure();
+
+    for (mlir::Value* operand : {&lhs, &rhs}) {
+      if (mlir::isa<mlir::ShapedType>(operand->getType())) continue;
+      auto constant = operand->getDefiningOp<mlir::arith::ConstantOp>();
+      if (!constant || constant.getType() != vector_type.getElementType())
+        return rewriter.notifyMatchFailure(
+            op, "expected a vector or scalar constant");
+      *operand = mlir::arith::ConstantOp::create(
+          rewriter, op->getLoc(),
+          mlir::DenseElementsAttr::get(vector_type, constant.getValue()));
+    }
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
         rewriter, op->getLoc(), vector_type, lhs, rhs,
@@ -830,7 +940,8 @@ struct LowerLinalgFillPattern
 }  // namespace
 
 void scheduler::populateLinalgLoweringPatterns(
-    mlir::RewritePatternSet& patterns, SymbolAllocator& symbols) {
-  patterns.add<LowerLinalgGenericPattern>(patterns.getContext());
+    mlir::RewritePatternSet& patterns, SymbolAllocator& symbols,
+    mlir::ktdf_arch::Mapping& mapping) {
+  patterns.add<LowerLinalgGenericPattern>(patterns.getContext(), mapping);
   patterns.add<LowerLinalgFillPattern>(patterns.getContext(), symbols);
 }

@@ -214,6 +214,21 @@ ktdf_arch.device @sample_device {
   // allocated as a single element of the compute type -- how many lanes one
   // holds is the scheduler's to fill in.
   patterns ["pre_scheduling"] {
+    // A fractional FP32 scale needs a register; it is not a MAC immediate.
+    pdl.pattern : benefit(1) {
+      %f32 = type : f32
+      %value = attribute
+      %constant = operation "arith.constant" {"value" = %value}
+        -> (%f32 : !pdl.type)
+      apply_native_constraint "ktdf.needs_constant_register"(%constant : !pdl.operation)
+      rewrite {
+        %bank = attribute = "SFU_REG"
+        %mapped = operation "arith.constant"
+          {"value" = %value, "ktdf_arch.maps_to" = %bank} -> (%f32 : !pdl.type)
+        replace %constant with %mapped
+      }
+    }
+
     pdl.pattern : benefit(1) {
       %f16 = type : f16
       %in = operand : %f16
@@ -262,6 +277,26 @@ ktdf_arch.device @sample_device {
   }
 
   patterns ["post_scheduling"] {
+    // A sub-SIMD shuffle must finish in a register before arithmetic reads it.
+    pdl.pattern : benefit(1) {
+      %slot = operand
+      %type = type
+      %mode = attribute
+      %read = operation "ktdf.read_from_fifo" (%slot : !pdl.value)
+        {"splat" = %mode} -> (%type : !pdl.type)
+      apply_native_constraint "ktdf.is_tensor_type"(%type : !pdl.type)
+      rewrite {
+        %bank = attribute = "SFU_REG"
+        %reg_type = apply_native_rewrite "ktdf.memref_type_in_space"(%type, %bank : !pdl.type, !pdl.attribute) : !pdl.type
+        %alloc = operation "memref.alloc" -> (%reg_type : !pdl.type)
+        %reg = result 0 of %alloc
+        %input = apply_native_rewrite "ktdf.memref_read_from_fifo"(%read : !pdl.operation) : !pdl.value
+        %copy = operation "memref.copy" (%input, %reg : !pdl.value, !pdl.value)
+        %view = operation "bufferization.to_tensor" (%reg : !pdl.value) -> (%type : !pdl.type)
+        replace %read with %view
+      }
+    }
+
     // SUM  →  simdreduction_sum
     pdl.pattern : benefit(1) {
       %in  = operand
