@@ -16,8 +16,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "AccessOrderMaterialization.h"
-
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallVectorExtras.h>
@@ -45,6 +43,7 @@
 
 #include <limits>
 
+#include "AccessOrderMaterialization.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep

@@ -5,4 +5,8 @@ set(DataflowScheduler_DIALECTS_SOURCE_DIR
   CACHE PATH "Dataflow scheduler dialects source directory")
 add_subdirectory("${DataflowScheduler_DIALECTS_SOURCE_DIR}"
   "${CMAKE_CURRENT_BINARY_DIR}/dataflow-scheduler-dialects")
-add_subdirectory(ktir-mlir-frontend)
+set(DataflowScheduler_KTIR_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/ktir-mlir-frontend"
+  CACHE PATH "KTIR frontend source directory")
+add_subdirectory("${DataflowScheduler_KTIR_SOURCE_DIR}"
+  "${CMAKE_CURRENT_BINARY_DIR}/ktir-mlir-frontend")

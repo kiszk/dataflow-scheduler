@@ -27,6 +27,7 @@
 #include <mlir/IR/DialectImplementation.h>
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
 #include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
@@ -151,11 +152,13 @@ LogicalResult NumericCastOp::verify() {
     for (Value slot : slots) {
       auto type = cast<ktdf::FifoSlotType>(slot.getType());
       if (type.getNumElements() != (fp32 ? 32 : 64) ||
-          (fp32 ? !type.getElementType().isF32()
-                : !type.getElementType().isF16())) {
-        return emitOpError(fp32
-                               ? "requires 32xf32 FIFO slots on the FP32 side"
-                               : "requires 64xf16 FIFO slots on the DL16 side");
+          (fp32
+               ? !type.getElementType().isF32()
+               : !isa<spyreop::DF16Type, Float16Type>(type.getElementType()))) {
+        return emitOpError(
+            fp32 ? "requires 32xf32 FIFO slots on the FP32 side"
+                 : "requires 64x!spyreop.df16 (or legacy 64xf16) FIFO slots "
+                   "on the DL16 side");
       }
       if (type.getSrc() != first.getSrc() ||
           type.getDest() != first.getDest()) {
@@ -202,8 +205,9 @@ LogicalResult NumericCastValueOp::verify() {
     auto tensor = dyn_cast<RankedTensorType>(type);
     return tensor && !tensor.getEncoding() && tensor.getRank() == 1 &&
            tensor.getDimSize(0) == (fp32 ? 32 : 64) &&
-           (fp32 ? tensor.getElementType().isF32()
-                 : tensor.getElementType().isF16());
+           (fp32
+                ? tensor.getElementType().isF32()
+                : isa<spyreop::DF16Type, Float16Type>(tensor.getElementType()));
   };
   for (Value input : getInputs())
     if (!valid(input.getType(), !widening))

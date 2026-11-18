@@ -16,7 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: dataflow-scheduler-opt -ktdflowering-to-dfir %s | FileCheck %s
+// RUN: dataflow-scheduler-opt -ktdflowering-to-dfir %s | FileCheck %s --implicit-check-not=spyreop.df16
 //
 // CHECK: vectorchain.cast
 // CHECK: indices = [0 : i32, 1 : i32, 2 : i32, 3 : i32], repetition = 8 : i32
@@ -24,7 +24,7 @@
 // CHECK: indices = [4 : i32, 5 : i32, 6 : i32, 7 : i32], repetition = 8 : i32
 // CHECK-NOT: ktdf_lowering.numeric_cast
 
-!input = !ktdf.fifo.slot<"MPE_ARRAY" -> "SFU", 64xf16>
+!input = !ktdf.fifo.slot<"MPE_ARRAY" -> "SFU", 64x!spyreop.df16>
 !output = !ktdf.fifo.slot<"SFU" -> "L1SU", 32xf32>
 
 module {
