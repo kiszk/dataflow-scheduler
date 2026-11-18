@@ -33,6 +33,7 @@
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinTypeInterfaces.h>
+#include <mlir/IR/Matchers.h>
 #include <mlir/IR/OpDefinition.h>
 #include <mlir/IR/OperationSupport.h>
 #include <mlir/IR/ValueRange.h>
@@ -41,6 +42,7 @@
 #include <mlir/Interfaces/ValueBoundsOpInterface.h>
 #include <mlir/Pass/Pass.h>
 
+#include <algorithm>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -49,8 +51,10 @@
 #include "dataflow-scheduler/Analysis/MemoryTrackerAnalysis.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
+#include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 
 #define PASS_NAME "address-assignment"
 #define DEBUG_TYPE PASS_NAME
@@ -330,9 +334,63 @@ struct AddressAssignmentPass
     auto& tracker = getAnalysis<MemoryTrackerAnalysis>();
     mlir::OpBuilder builder(&getContext());
 
-    // A program has the memories it allocates from to itself: what one puts
-    // there is discarded before the next runs, so each starts at address zero.
-    // Whatever sits outside the programs is a scope of its own.
+    // Caller-owned fixed scratchpad views survive across extracted programs.
+    // Protect their entire prefix in every program, including programs that do
+    // not access the view but run while its contents are live. Offsets/strides
+    // in these views count elements; the allocator counts bytes.
+    llvm::DenseMap<ResourceType, size_t> fixed_ends;
+    auto reserve_view = [&](auto view) -> mlir::WalkResult {
+      const auto space = llvm::dyn_cast<ResourceType>(view.getMemorySpace());
+      const auto& tree = tracker.getMemoryTree();
+      if (!space || !tree.isPerCoreScratchPadMemory(space))
+        return mlir::WalkResult::advance();
+      llvm::APInt address;
+      if (!mlir::matchPattern(view.getOffset(), mlir::m_ConstantInt(&address)))
+        return mlir::WalkResult::advance();  // Runtime address: caller-managed.
+      int64_t offset = address.getSExtValue();
+      auto bytes = tryGetSizeInBytes(view.getType().getElementType());
+      size_t end = offset >= 0 ? static_cast<size_t>(offset) : 0;
+      bool invalid = offset < 0 || !bytes;
+      for (auto [size, stride] :
+           llvm::zip_equal(view.getStaticSizes(), view.getStaticStrides())) {
+        size_t span;
+        if (size <= 0 || stride < 0 ||
+            __builtin_mul_overflow(size - 1, stride, &span) ||
+            __builtin_add_overflow(end, span, &end))
+          invalid = true;
+      }
+      if (invalid || __builtin_add_overflow(end, size_t{1}, &end) ||
+          __builtin_mul_overflow(end, *bytes, &end)) {
+        view.emitError(
+            "fixed scratchpad view requires a bounded nonnegative "
+            "address, shape and strides");
+        return mlir::WalkResult::interrupt();
+      }
+      auto node = tree.getNode(*tree.getNodeIdForMemory(space));
+      if (!node->capacity_in_bytes || end > *node->capacity_in_bytes) {
+        view.emitError("fixed scratchpad view exceeds memory capacity");
+        return mlir::WalkResult::interrupt();
+      }
+      auto& reserved_end = fixed_ends[node->memory_resource];
+      reserved_end = std::max(reserved_end, end);
+      return mlir::WalkResult::advance();
+    };
+    if (module
+            .walk([&](mlir::ktdp::ConstructMemoryViewOp view) {
+              return reserve_view(view);
+            })
+            .wasInterrupted() ||
+        module
+            .walk([&](mlir::ktdp_lowering::ConstructMemoryViewOp view) {
+              return reserve_view(view);
+            })
+            .wasInterrupted()) {
+      signalPassFailure();
+      return;
+    }
+
+    // Compiler scratch is reusable between programs. The caller-owned prefix
+    // above remains live. Whatever sits outside programs is a scope of its own.
     llvm::SmallVector<mlir::ModuleOp> scopes{module};
     llvm::append_range(scopes, module.getOps<mlir::ModuleOp>());
 
@@ -353,6 +411,19 @@ struct AddressAssignmentPass
         }
       }
       tracker.reset(llvm::to_vector(reusable));
+
+      for (auto space : reusable) {
+        auto node = tracker.getMemoryTree().getNode(space);
+        size_t end = fixed_ends.lookup(node->memory_resource);
+        size_t next = tracker.getNextAvailableAddress(space);
+        if (end <= next) continue;
+        auto reserved = tracker.allocate(space, end - next);
+        if (!reserved) {
+          scope.emitError() << llvm::toString(reserved.takeError());
+          signalPassFailure();
+          return;
+        }
+      }
 
       for (auto alloc : allocs) {
         if (failed(processAllocation(alloc, tracker, builder))) {

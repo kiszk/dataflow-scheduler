@@ -208,6 +208,20 @@ auto ktdfIsReductionKind(mlir::PatternRewriter& /*rewriter*/,
   return mlir::success();
 }
 
+// Target patterns choose the register bank for non-immediate float constants.
+auto ktdfNeedsConstantRegister(mlir::PatternRewriter&, mlir::PDLResultList&,
+                               llvm::ArrayRef<mlir::PDLValue> values)
+    -> mlir::LogicalResult {
+  auto op = mlir::dyn_cast<mlir::arith::ConstantOp>(
+      values[0].cast<mlir::Operation*>());
+  if (!op || op->hasAttr("ktdf_arch.maps_to")) return mlir::failure();
+  auto value = mlir::dyn_cast<mlir::FloatAttr>(op.getValue());
+  if (!value) return mlir::failure();
+  double number = value.getValueAsDouble();
+  return mlir::success(number != 0 && number != 1 && number != 2 &&
+                       number != 3);
+}
+
 // Constraint: ktdf.is_tensor_type(type)
 //
 // Expected `values` entries, one of them:
@@ -343,6 +357,8 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
                                         ktdfIsReductionKind);
     patterns.registerConstraintFunction("ktdf.inherits_mapping",
                                         ktdfInheritsMapping);
+    patterns.registerConstraintFunction("ktdf.needs_constant_register",
+                                        ktdfNeedsConstantRegister);
     patterns.registerConstraintFunction("ktdf.is_tensor_type",
                                         ktdfIsTensorType);
     patterns.registerConstraintFunction("linalg.is_contraction",

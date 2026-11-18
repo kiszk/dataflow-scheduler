@@ -74,11 +74,24 @@ static mlir::LogicalResult absorbIntoConsumer(
 
   // The generic that reads the tensor view. Anything else keeps the view alive,
   // and the caller leaves it in place.
+  if (as_tensor.use_empty()) {
+    to_tensor.erase();
+    return mlir::success();
+  }
   auto users = as_tensor.getUsers();
   auto generic_it = llvm::find_if(users, [](mlir::Operation* user) {
     return mlir::isa<mlir::linalg::GenericOp>(user);
   });
-  if (generic_it == users.end()) return mlir::success();
+  if (generic_it == users.end()) {
+    if (llvm::all_of(users, [](mlir::Operation* user) {
+          return mlir::isa<mlir::ktdf::WriteToFifoOp>(user);
+        })) {
+      mlir::OpBuilder builder(to_tensor);
+      return mlir::ktdf::convertTensorUsesToMemref(builder, as_tensor,
+                                                   to_tensor.getBuffer());
+    }
+    return mlir::success();
+  }
   auto generic_op = mlir::cast<mlir::linalg::GenericOp>(*generic_it);
 
   LDBG(1) << "absorbing " << to_tensor << " into " << generic_op;
@@ -112,6 +125,10 @@ static mlir::LogicalResult absorbIntoConsumer(
     if (input == as_tensor) continue;
     if (!mlir::isa<mlir::RankedTensorType>(input.getType())) continue;
 
+    if (auto view = input.getDefiningOp<mlir::bufferization::ToTensorOp>()) {
+      buffers[input] = view.getBuffer();
+      continue;
+    }
     auto read_op = input.getDefiningOp<mlir::ktdf::ReadFromFifoOp>();
     if (!read_op)
       return generic_op.emitError(

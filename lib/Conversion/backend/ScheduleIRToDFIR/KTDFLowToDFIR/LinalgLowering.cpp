@@ -397,6 +397,10 @@ struct LowerLinalgGenericPattern
               .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
                 return lowerSelectOp(op, rewriter);
               })
+              .Case<mlir::dataflow::OpaqueOp>([&](mlir::dataflow::OpaqueOp op) {
+                rewriter.moveOpBefore(op, generic_op);
+                return mlir::success();
+              })
               .Case<mlir::spyreop::Identity>([&](mlir::spyreop::Identity op) {
                 return lowerIdentity(op, rewriter, identity_map);
               })
@@ -649,12 +653,25 @@ struct LowerLinalgGenericPattern
       mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
       mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
       mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
-    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(lhs.getType());
+    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(
+        mlir::isa<mlir::ShapedType>(lhs.getType()) ? lhs.getType()
+                                                   : rhs.getType());
     if (!lhs_ty) {
       return llvm::failure();
     }
     auto vector_type = getFlattenedVectorType(lhs_ty);
     if (!vector_type) return mlir::failure();
+
+    for (mlir::Value* operand : {&lhs, &rhs}) {
+      if (mlir::isa<mlir::ShapedType>(operand->getType())) continue;
+      auto constant = operand->getDefiningOp<mlir::arith::ConstantOp>();
+      if (!constant || constant.getType() != vector_type.getElementType())
+        return rewriter.notifyMatchFailure(
+            op, "expected a vector or scalar constant");
+      *operand = mlir::arith::ConstantOp::create(
+          rewriter, op->getLoc(),
+          mlir::DenseElementsAttr::get(vector_type, constant.getValue()));
+    }
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
         rewriter, op->getLoc(), vector_type, lhs, rhs,
