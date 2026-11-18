@@ -18,6 +18,17 @@
 
 // RUN: dataflow-scheduler-opt -split-input-file -verify-diagnostics %s
 
+func.func @df16_roundtrip(%input: tensor<64x!spyreop.df16>) -> tensor<64x!spyreop.df16> {
+  %wide:2 = ktdf_lowering.numeric_cast_value ins(%input : tensor<64x!spyreop.df16>)
+    outs(tensor<32xf32>, tensor<32xf32>) {kind = "dl16tofp32"}
+  %out = ktdf_lowering.numeric_cast_value ins(%wide#0, %wide#1 : tensor<32xf32>, tensor<32xf32>)
+    outs(tensor<64x!spyreop.df16>) {kind = "fp32todl16"}
+  return %out : tensor<64x!spyreop.df16>
+}
+
+// -----
+
+// Existing KTDFLow inputs may still use the legacy DFIR storage carrier.
 func.func @widen(%input: tensor<64xf16>) {
   %out:2 = ktdf_lowering.numeric_cast_value ins(%input : tensor<64xf16>)
     outs(tensor<32xf32>, tensor<32xf32>) {kind = "dl16tofp32"}

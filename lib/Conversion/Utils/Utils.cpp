@@ -24,6 +24,7 @@
 #include <optional>
 #include <utility>
 
+#include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
 #include "dataflow-scheduler/Dialect/Dataflow/Dataflow.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
@@ -84,8 +85,8 @@ std::optional<int64_t> fittingGranularityElements(
   const size_t word_size = load_feature.getWordSize(space);
   if (word_size == 0) return std::nullopt;
 
-  const size_t elem_bytes =
-      (static_cast<size_t>(elem_type.getIntOrFloatBitWidth()) + 7) / 8;
+  const size_t elem_bytes = tryGetSizeInBytes(elem_type).value_or(0);
+  if (!elem_bytes) return std::nullopt;
   // Words one element occupies, always >= 1, and from that the smallest load
   // that still covers every source element.
   const size_t elem_words = (elem_bytes + word_size - 1) / word_size;

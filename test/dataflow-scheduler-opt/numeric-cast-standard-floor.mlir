@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // RUN: dataflow-scheduler-opt %s -kEmitDFIR --split-input-file --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=access_tile_order --implicit-check-not=ktdf.pipeline --implicit-check-not=spyreop.numeric_cast
 
-// Floor has a target compute recipe. Check all four placements around a cast
+// FP32 floor and a DL16 exp template cover all four placements around a cast
 // with Standard external memory and scratch-separated packet computations.
-// CHECK-LABEL: func.func @dl16_floor_then_widen(
-// CHECK-DAG: vectorchain.floor {{.*}}vector<64xf16>
+// CHECK-LABEL: func.func @dl16_exp_then_widen(
+// CHECK-DAG: dataflow.opaque {{.*}}func_name = "fake_df16_exp"
 // CHECK-DAG: vectorchain.cast
 // CHECK-DAG: agen.vector_load {{.*}}vector<4xf32>
 // CHECK: dataflow.sync_send
@@ -24,12 +24,12 @@ ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
     (k mod 2) * 16 + (e floordiv 8) * 4 + e mod 4
 )>
 
-func.func @dl16_floor_then_widen(%src_addr: index, %dst_addr: index) attributes {grid = [1]} {
+func.func @dl16_exp_then_widen(%src_addr: index, %dst_addr: index) attributes {grid = [1]} {
   %src = ktdp.construct_memory_view %src_addr,
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain,
     memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64xf16>
+  } : memref<3x2x64x!spyreop.df16>
   %dst = ktdp.construct_memory_view %dst_addr,
       sizes: [6, 2, 32], strides: [64, 32, 1] {
     coordinate_set = #fp32_domain,
@@ -39,13 +39,21 @@ func.func @dl16_floor_then_widen(%src_addr: index, %dst_addr: index) attributes 
   %input_tile = ktdp.construct_access_tile %src[0, 0, 0] {
     access_tile_set = #dl16_domain,
     access_tile_order = #identity
-  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
+  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
   %input = ktdp.load %input_tile
-      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64xf16>
+      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64x!spyreop.df16>
 
-  %before0 = math.floor %input : tensor<3x2x64xf16>
+  %before0_init = tensor.empty() : tensor<3x2x64x!spyreop.df16>
+  %before0 = linalg.generic {
+    indexing_maps = [#identity, #identity],
+    iterator_types = ["parallel", "parallel", "parallel"]
+  } ins(%input : tensor<3x2x64x!spyreop.df16>) outs(%before0_init : tensor<3x2x64x!spyreop.df16>) {
+  ^bb0(%before0_value: !spyreop.df16, %before0_unused: !spyreop.df16):
+    %before0_exp = spyreop.exp %before0_value : !spyreop.df16
+    linalg.yield %before0_exp : !spyreop.df16
+  } -> tensor<3x2x64x!spyreop.df16>
   %staggered = spyreop.numeric_cast %before0 {kind = "dl16tofp32"}
-      : tensor<3x2x64xf16> -> tensor<6x2x32xf32>
+      : tensor<3x2x64x!spyreop.df16> -> tensor<6x2x32xf32>
 
   %output_tile = ktdp.construct_access_tile %dst[0, 0, 0] {
     access_tile_set = #fp32_domain,
@@ -84,7 +92,7 @@ func.func @widen_then_fp32_floor(%src_addr: index, %dst_addr: index) attributes 
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain,
     memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64xf16>
+  } : memref<3x2x64x!spyreop.df16>
   %dst = ktdp.construct_memory_view %dst_addr,
       sizes: [6, 2, 32], strides: [64, 32, 1] {
     coordinate_set = #fp32_domain,
@@ -94,12 +102,12 @@ func.func @widen_then_fp32_floor(%src_addr: index, %dst_addr: index) attributes 
   %input_tile = ktdp.construct_access_tile %src[0, 0, 0] {
     access_tile_set = #dl16_domain,
     access_tile_order = #identity
-  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
+  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
   %input = ktdp.load %input_tile
-      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64xf16>
+      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64x!spyreop.df16>
 
   %staggered = spyreop.numeric_cast %input {kind = "dl16tofp32"}
-      : tensor<3x2x64xf16> -> tensor<6x2x32xf32>
+      : tensor<3x2x64x!spyreop.df16> -> tensor<6x2x32xf32>
 
   %after0 = math.floor %staggered : tensor<6x2x32xf32>
 
@@ -145,7 +153,7 @@ func.func @fp32_floor_then_narrow(%src_addr: index, %dst_addr: index) attributes
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain,
     memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64xf16>
+  } : memref<3x2x64x!spyreop.df16>
 
   %input_tile = ktdp.construct_access_tile %src[0, 0, 0] {
     access_tile_set = #fp32_domain,
@@ -156,21 +164,21 @@ func.func @fp32_floor_then_narrow(%src_addr: index, %dst_addr: index) attributes
 
   %before0 = math.floor %staggered : tensor<6x2x32xf32>
   %converted = spyreop.numeric_cast %before0 {kind = "fp32todl16"}
-      : tensor<6x2x32xf32> -> tensor<3x2x64xf16>
+      : tensor<6x2x32xf32> -> tensor<3x2x64x!spyreop.df16>
 
   %output_tile = ktdp.construct_access_tile %dst[0, 0, 0] {
     access_tile_set = #dl16_domain,
     access_tile_order = #identity
-  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
+  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
   ktdp.store %converted, %output_tile
-      : tensor<3x2x64xf16>, !ktdp.access_tile<3x2x64xindex>
+      : tensor<3x2x64x!spyreop.df16>, !ktdp.access_tile<3x2x64xindex>
   return
 }
 
 // -----
 
-// CHECK-LABEL: func.func @narrow_then_dl16_floor(
-// CHECK-DAG: vectorchain.floor {{.*}}vector<64xf16>
+// CHECK-LABEL: func.func @narrow_then_dl16_exp(
+// CHECK-DAG: dataflow.opaque {{.*}}func_name = "fake_df16_exp"
 // CHECK-DAG: vectorchain.cast
 // CHECK-DAG: agen.vector_load {{.*}}vector<4xf32>
 // CHECK: dataflow.sync_send
@@ -190,7 +198,7 @@ ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
     (k mod 2) * 16 + (e floordiv 8) * 4 + e mod 4
 )>
 
-func.func @narrow_then_dl16_floor(%src_addr: index, %dst_addr: index) attributes {grid = [1]} {
+func.func @narrow_then_dl16_exp(%src_addr: index, %dst_addr: index) attributes {grid = [1]} {
   %src = ktdp.construct_memory_view %src_addr,
       sizes: [6, 2, 32], strides: [64, 32, 1] {
     coordinate_set = #fp32_domain,
@@ -200,7 +208,7 @@ func.func @narrow_then_dl16_floor(%src_addr: index, %dst_addr: index) attributes
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain,
     memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64xf16>
+  } : memref<3x2x64x!spyreop.df16>
 
   %input_tile = ktdp.construct_access_tile %src[0, 0, 0] {
     access_tile_set = #fp32_domain,
@@ -210,15 +218,23 @@ func.func @narrow_then_dl16_floor(%src_addr: index, %dst_addr: index) attributes
       : !ktdp.access_tile<6x2x32xindex> -> tensor<6x2x32xf32>
 
   %converted = spyreop.numeric_cast %staggered {kind = "fp32todl16"}
-      : tensor<6x2x32xf32> -> tensor<3x2x64xf16>
+      : tensor<6x2x32xf32> -> tensor<3x2x64x!spyreop.df16>
 
-  %after0 = math.floor %converted : tensor<3x2x64xf16>
+  %after0_init = tensor.empty() : tensor<3x2x64x!spyreop.df16>
+  %after0 = linalg.generic {
+    indexing_maps = [#identity, #identity],
+    iterator_types = ["parallel", "parallel", "parallel"]
+  } ins(%converted : tensor<3x2x64x!spyreop.df16>) outs(%after0_init : tensor<3x2x64x!spyreop.df16>) {
+  ^bb0(%after0_value: !spyreop.df16, %after0_unused: !spyreop.df16):
+    %after0_exp = spyreop.exp %after0_value : !spyreop.df16
+    linalg.yield %after0_exp : !spyreop.df16
+  } -> tensor<3x2x64x!spyreop.df16>
 
   %output_tile = ktdp.construct_access_tile %dst[0, 0, 0] {
     access_tile_set = #dl16_domain,
     access_tile_order = #identity
-  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
+  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
   ktdp.store %after0, %output_tile
-      : tensor<3x2x64xf16>, !ktdp.access_tile<3x2x64xindex>
+      : tensor<3x2x64x!spyreop.df16>, !ktdp.access_tile<3x2x64xindex>
   return
 }

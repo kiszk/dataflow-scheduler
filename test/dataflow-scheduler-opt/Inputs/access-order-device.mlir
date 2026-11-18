@@ -137,4 +137,37 @@ ktdf_arch.device @sample_device attributes {
     }
   }
 
+  // Test-only template: exercise a DF16 intrinsic and its register transfers.
+  // The opaque is checked structurally; it is not a hardware exp recipe.
+  patterns ["pre_scheduling"] {
+    pdl.pattern : benefit(1) {
+      %df16 = type : !spyreop.df16
+      %in = operand : %df16
+      %exp = operation "spyreop.exp" (%in : !pdl.value) -> (%df16 : !pdl.type)
+      rewrite {
+        %reg = type : memref<!spyreop.df16, "SFU_REG">
+        %no_dyn_operands = attribute = array<i32: 0, 0>
+        %in_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %in_reg = result 0 of %in_op
+        %in_store = operation "memref.store"
+          (%in, %in_reg : !pdl.value, !pdl.value)
+        %out_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %out_reg = result 0 of %out_op
+        %template = attribute = "fake_df16_exp"
+        %register_names = attribute = ["in0", "out0"]
+        %segments = attribute = array<i32: 1, 1>
+        %opaque_op = operation "ktdf.opaque"
+          (%in_reg, %out_reg : !pdl.value, !pdl.value)
+          {"template_name" = %template, "func_name" = %template,
+           "dataflow_scheduler.register_names" = %register_names,
+           "operandSegmentSizes" = %segments}
+        %load = operation "memref.load" (%out_reg : !pdl.value)
+          -> (%df16 : !pdl.type)
+        %result = result 0 of %load
+        replace %exp with (%result : !pdl.value)
+      }
+    }
+  }
 }

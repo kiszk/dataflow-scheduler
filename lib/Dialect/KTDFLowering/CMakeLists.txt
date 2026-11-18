@@ -13,6 +13,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLoweringDialect
     DataflowSchedulerKTDFLoweringIncGen
 
   LINK_LIBS PUBLIC
+    KTIR::SpyreOpDialect
     DataflowSchedulerDialects::KTDFDialect
 
   LINK_MLIR_LIBS

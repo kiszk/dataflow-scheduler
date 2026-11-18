@@ -43,9 +43,11 @@
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -164,6 +166,18 @@ struct KTDFLowToDFIRPass
     module_op.walk([&](mlir::func::FuncOp func) { funcs.push_back(func); });
     for (auto func : funcs) {
       LDBG(1) << "Running " << PASS_NAME << " on " << func.getName();
+
+      // DFIR uses f16 as its native SEN169 storage carrier. Keep df16 through
+      // scheduling, then lower its representation here. numeric_cast_value
+      // still selects native FCVT; this is not an IEEE numerical conversion.
+      mlir::AttrTypeReplacer storage_types;
+      storage_types.addReplacement(
+          [](mlir::spyreop::DF16Type type) -> mlir::Type {
+            return mlir::Float16Type::get(type.getContext());
+          });
+      storage_types.recursivelyReplaceElementsIn(func, /*replaceAttrs=*/true,
+                                                 /*replaceLocs=*/false,
+                                                 /*replaceTypes=*/true);
 
       auto split = partitionPreludeAndWork(func);
       if (split.work_ops.empty()) {

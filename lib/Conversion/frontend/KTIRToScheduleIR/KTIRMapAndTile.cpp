@@ -108,7 +108,7 @@ struct KTIRNumericCastTilingPass
 
 struct PacketUnary {
   mlir::Operation* op;
-  mlir::Operation* scalar;
+  llvm::SmallVector<mlir::Operation*> scalars;
 };
 
 std::optional<PacketUnary> packetUnary(mlir::Operation* op,
@@ -117,7 +117,7 @@ std::optional<PacketUnary> packetUnary(mlir::Operation* op,
       (single_use && !op->getResult(0).hasOneUse()))
     return std::nullopt;
   if (mlir::isa<mlir::arith::NegFOp, mlir::math::FloorOp>(op))
-    return PacketUnary{op, op};
+    return PacketUnary{op, {op}};
   auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(op);
   if (!generic || generic.getNumDpsInputs() > 1 ||
       generic.getNumDpsInits() != 1 || generic.getRegion().empty() ||
@@ -130,17 +130,25 @@ std::optional<PacketUnary> packetUnary(mlir::Operation* op,
       }))
     return std::nullopt;
   auto& body = generic.getRegion().front();
-  if (body.getNumArguments() != 1 + generic.getNumDpsInputs() ||
-      !llvm::hasSingleElement(body.without_terminator()))
+  if (body.getNumArguments() != 1 + generic.getNumDpsInputs())
     return std::nullopt;
-  auto* scalar = &body.front();
+  // Fusion may put several unary intrinsics in one generic. Keep the same
+  // single-input, same-type chain contract after that transformation.
+  PacketUnary unary{op, {}};
+  mlir::Value value = body.getArgument(0);
+  for (auto& scalar : body.without_terminator()) {
+    if (scalar.getNumOperands() != 1 || scalar.getNumResults() != 1 ||
+        scalar.getNumRegions() || !mlir::isMemoryEffectFree(&scalar) ||
+        scalar.getOperand(0) != value ||
+        scalar.getResult(0).getType() != value.getType())
+      return std::nullopt;
+    unary.scalars.push_back(&scalar);
+    value = scalar.getResult(0);
+  }
   auto yield = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
-  if (scalar->getNumOperands() != 1 || scalar->getNumResults() != 1 ||
-      scalar->getNumRegions() || !mlir::isMemoryEffectFree(scalar) ||
-      scalar->getOperand(0) != body.getArgument(0) || !yield ||
-      yield.getOperand(0) != scalar->getResult(0))
+  if (unary.scalars.empty() || !yield || yield.getOperand(0) != value)
     return std::nullopt;
-  return PacketUnary{op, scalar};
+  return unary;
 }
 
 mlir::Value packetUnaryInput(const PacketUnary& unary) {
@@ -165,14 +173,16 @@ mlir::Value applyPacketUnaries(mlir::OpBuilder& builder, mlir::Location loc,
         llvm::ArrayRef{mlir::utils::IteratorType::parallel},
         [&](mlir::OpBuilder& body_builder, mlir::Location body_loc,
             mlir::ValueRange args) {
-          mlir::OperationState state(body_loc,
-                                     unary.scalar->getName().getStringRef());
-          state.addOperands(args.front());
-          state.addTypes(type.getElementType());
-          state.addAttributes(unary.scalar->getAttrDictionary().getValue());
-          auto* scalar = body_builder.create(state);
-          mlir::linalg::YieldOp::create(body_builder, body_loc,
-                                        scalar->getResult(0));
+          mlir::Value result = args.front();
+          for (auto* scalar : unary.scalars) {
+            mlir::OperationState state(body_loc,
+                                       scalar->getName().getStringRef());
+            state.addOperands(result);
+            state.addTypes(type.getElementType());
+            state.addAttributes(scalar->getAttrDictionary().getValue());
+            result = body_builder.create(state)->getResult(0);
+          }
+          mlir::linalg::YieldOp::create(body_builder, body_loc, result);
         });
     value = generic.getResult(0);
   }
@@ -243,12 +253,10 @@ auto tileNumericCast(mlir::IRRewriter& rewriter,
   if (!compute || !compute.getFeature<mlir::ktdf_arch::feature::SIMD>())
     return cast_op.emitError("numeric cast requires a SIMD compute unit");
 
-  auto packet_type = mlir::RankedTensorType::get(
-      {widening ? 64 : 32},
-      widening ? rewriter.getF16Type() : rewriter.getF32Type());
+  auto packet_type = mlir::RankedTensorType::get({widening ? 64 : 32},
+                                                 input_type.getElementType());
   auto result_packet_type = mlir::RankedTensorType::get(
-      {widening ? 32 : 64},
-      widening ? rewriter.getF32Type() : rewriter.getF16Type());
+      {widening ? 32 : 64}, output_type.getElementType());
   llvm::SmallVector<mlir::OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
   llvm::SmallVector<mlir::Value> batch_coords(packet_axis, zero);
   auto packet_slice = [&](mlir::Value packet, mlir::Value row, int64_t lanes) {
@@ -610,10 +618,9 @@ auto mapToCompute(mlir::linalg::LinalgOp op, mlir::ktdf_arch::Mapping& mapping,
   LDBG() << "  compute: " << mlir::OpWithFlags(compute, kSkipRegions);
 
   // Determine the desired vector width on the compute resource.
-  const auto simd_feature =
-      compute.getFeature<mlir::ktdf_arch::feature::SIMD>();
-  const auto vector_length =
-      std::max(simd_feature.getLanes(element_type), int64_t{1});
+  const auto vector_length = getVectorLanes(
+      element_type,
+      mlir::cast<mlir::ktdf_arch::ExecutionUnitOp>(compute.getOperation()));
 
   // Annotate the vector width as the throttle for this operation.
   setThrottle(op, vector_length);

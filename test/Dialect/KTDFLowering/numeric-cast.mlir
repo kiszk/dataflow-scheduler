@@ -18,6 +18,16 @@
 
 // RUN: dataflow-scheduler-opt -split-input-file -verify-diagnostics %s
 
+!input = !ktdf.fifo.slot<"producer" -> "compute", 64x!spyreop.df16>
+!output = !ktdf.fifo.slot<"compute" -> "consumer", 32xf32>
+func.func @df16_widen(%input: !input, %out0: !output, %out1: !output) {
+  ktdf_lowering.numeric_cast ins(%input : !input)
+    outs(%out0, %out1 : !output, !output) {kind = "dl16tofp32"}
+  return
+}
+
+// -----
+
 // f16 is the native format's storage carrier. Each FP32 packet holds 32 lanes.
 !input16 = !ktdf.fifo.slot<"producer" -> "compute", 64xf16>
 !input32 = !ktdf.fifo.slot<"producer" -> "compute", 32xf32>
@@ -78,7 +88,7 @@ func.func @missing_input_packet(%input: !input, %output: !output) {
 !output = !ktdf.fifo.slot<"compute" -> "consumer", 32xf32>
 
 func.func @short_native_input(%input: !input, %out0: !output, %out1: !output) {
-  // expected-error @below {{requires 64xf16 FIFO slots on the DL16 side}}
+  // expected-error @below {{requires 64x!spyreop.df16 (or legacy 64xf16) FIFO slots on the DL16 side}}
   ktdf_lowering.numeric_cast ins(%input : !input)
     outs(%out0, %out1 : !output, !output) {kind = "dl16tofp32"}
   return
@@ -90,7 +100,7 @@ func.func @short_native_input(%input: !input, %out0: !output, %out1: !output) {
 !output = !ktdf.fifo.slot<"compute" -> "consumer", 64xbf16>
 
 func.func @wrong_native_carrier(%in0: !input, %in1: !input, %output: !output) {
-  // expected-error @below {{requires 64xf16 FIFO slots on the DL16 side}}
+  // expected-error @below {{requires 64x!spyreop.df16 (or legacy 64xf16) FIFO slots on the DL16 side}}
   ktdf_lowering.numeric_cast ins(%in0, %in1 : !input, !input)
     outs(%output : !output) {kind = "fp32todl16"}
   return

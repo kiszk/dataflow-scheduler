@@ -132,11 +132,12 @@ def KTDFLowering_NumericCastOp : KTDFLowering_Op<"numeric_cast", [
   let description = [{
     The `ktdf_lowering.numeric_cast` operation consumes input FIFO slots and
     writes output FIFO slots in operand order. It converts one 64-element
-    native stick, using `f16` as the storage carrier for SEN169/DL16. The
+    native SEN169/DL16 stick with element type `!spyreop.df16`. Legacy
+    `f16` storage carriers remain accepted by this lowering dialect. The
     `kind` selects native numeric conversion, not an IEEE f16 conversion.
 
-    `dl16tofp32` consumes one `64xf16` slot and writes two `32xf32` slots.
-    `fp32todl16` consumes two `32xf32` slots and writes one `64xf16` slot.
+    `dl16tofp32` consumes one `64x!spyreop.df16` slot and writes two `32xf32` slots.
+    `fp32todl16` consumes two `32xf32` slots and writes one `64x!spyreop.df16` slot.
     For packet p, group q and lane r, the staggered FP32 arrangement is:
 
     ```text
@@ -167,6 +168,12 @@ def KTDFLowering_NumericCastOp : KTDFLowering_Op<"numeric_cast", [
 
 def KTDFLowering_NumericCastValueOp : KTDFLowering_Op<"numeric_cast_value", [Pure]> {
   let summary = "Convert native DL16 and staggered FP32 tensor packets";
+  let description = [{
+    DL16 packets use `tensor<64x!spyreop.df16>` during scheduling. The DFIR
+    backend lowers this to its legacy `f16` storage carrier while emitting
+    the native conversion recipe. This op also accepts that carrier for
+    compatibility with existing KTDFLow inputs.
+  }];
   let arguments = (ins Variadic<AnyRankedTensor>:$inputs, StrAttr:$kind);
   let results = (outs Variadic<AnyRankedTensor>:$outputs);
   let assemblyFormat = [{

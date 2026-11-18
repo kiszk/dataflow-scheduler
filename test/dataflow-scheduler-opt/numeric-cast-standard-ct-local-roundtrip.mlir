@@ -32,11 +32,11 @@ func.func @standard_ct_local_roundtrip(
   %src = ktdp.construct_memory_view %src_addr,
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain, memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64xf16>
+  } : memref<3x2x64x!spyreop.df16>
   %dst = ktdp.construct_memory_view %dst_addr,
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain, memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64xf16>
+  } : memref<3x2x64x!spyreop.df16>
   %tmp = ktdp.construct_memory_view %tmp_offset,
       sizes: [6, 2, 32], strides: [64, 32, 1] {
     coordinate_set = #fp32_domain, memory_space = #ktdp.memory_space<ct_local>
@@ -44,11 +44,11 @@ func.func @standard_ct_local_roundtrip(
 
   %input_tile = ktdp.construct_access_tile %src[0, 0, 0] {
     access_tile_set = #dl16_domain, access_tile_order = #identity
-  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
+  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
   %input = ktdp.load %input_tile
-      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64xf16>
+      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64x!spyreop.df16>
   %staggered = spyreop.numeric_cast %input {kind = "dl16tofp32"}
-      : tensor<3x2x64xf16> -> tensor<6x2x32xf32>
+      : tensor<3x2x64x!spyreop.df16> -> tensor<6x2x32xf32>
   %tmp_store = ktdp.construct_access_tile %tmp[0, 0, 0] {
     access_tile_set = #fp32_domain, access_tile_order = #cast_order
   } : memref<6x2x32xf32> -> !ktdp.access_tile<6x2x32xindex>
@@ -61,11 +61,11 @@ func.func @standard_ct_local_roundtrip(
   %reloaded = ktdp.load %tmp_load
       : !ktdp.access_tile<6x2x32xindex> -> tensor<6x2x32xf32>
   %narrow = spyreop.numeric_cast %reloaded {kind = "fp32todl16"}
-      : tensor<6x2x32xf32> -> tensor<3x2x64xf16>
+      : tensor<6x2x32xf32> -> tensor<3x2x64x!spyreop.df16>
   %output_tile = ktdp.construct_access_tile %dst[0, 0, 0] {
     access_tile_set = #dl16_domain, access_tile_order = #identity
-  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
+  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
   ktdp.store %narrow, %output_tile
-      : tensor<3x2x64xf16>, !ktdp.access_tile<3x2x64xindex>
+      : tensor<3x2x64x!spyreop.df16>, !ktdp.access_tile<3x2x64xindex>
   return
 }
