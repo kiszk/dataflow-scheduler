@@ -2,8 +2,17 @@
 // RUN: dataflow-scheduler-opt %s --split-input-file -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=spyreop.numeric_cast --implicit-check-not=linalg.generic --implicit-check-not=ktdf_lowering.numeric_cast
 // RUN: dataflow-scheduler-opt %s --split-input-file --fuse-linalg --ktir-numeric-cast-tiling | FileCheck %s --check-prefix=TILE
 // Scalar casts use the generic maps for Standard memory in both directions.
-// FP32 exp uses a test template; floor uses the ordinary math lowering.
+// FP32 exp uses a twelve-register test template in a sixteen-register file;
+// floor uses the ordinary math lowering. Each packet must be sent before the
+// next exp overwrites the reused output register.
+// RUN: dataflow-scheduler-opt %s --split-input-file -kEmitDFIR --split-dfir-output-dir=%t-regs | FileCheck %s --check-prefix=REG
+// RUN: not dataflow-scheduler-opt %s --split-input-file -disable-reuse-registers -kEmitDFIR --split-dfir-output-dir=%t-no-reuse 2>&1 | FileCheck %s --check-prefix=CAPACITY
+// CAPACITY: exceeds "SFU_REG" capacity
 
+// REG-LABEL: func.func @standard_dl16_to_standard_fp32(
+// REG: func_name = "fake_f32_exp", parameter_dictionary = {{.*}}, read_only_register_dictionary = [[RO:{[^}]+}]], read_write_register_dictionary = [[RW:{[^}]+}]]
+// REG: dataflow.send
+// REG: func_name = "fake_f32_exp", parameter_dictionary = {{.*}}, read_only_register_dictionary = [[RO]], read_write_register_dictionary = [[RW]]
 // CHECK-LABEL: func.func @standard_dl16_to_standard_fp32(
 // CHECK-DAG: vectorchain.cast
 // CHECK-DAG: vectorchain.floor {{.*}}vector<64xf16>
@@ -21,11 +30,17 @@ ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
     (k >= 0, 5 - k >= 0, r >= 0, 1 - r >= 0, e >= 0, 31 - e >= 0)>
 #identity = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 
-// Standard DL16 coordinates -> Standard FP32 coordinates.
+// Standard DL16 iteration coordinates -> Staggered FP32 coordinates.
 // g: 64-element group (0..2); r: row (0..1); l: DL16 lane (0..63).
-// Split each group's lanes across two consecutive 32-element packets.
-#dl16_to_standard_fp32 = affine_map<(g, r, l) -> (
-    g * 2 + l floordiv 32, r, l mod 32)>
+// Each group of eight DL16 lanes contributes four lanes to each packet.
+#dl16_to_staggered_fp32 = affine_map<(g, r, l) -> (
+    g * 2 + (l mod 8) floordiv 4, r, (l floordiv 8) * 4 + l mod 4)>
+
+// Standard FP32 coordinates -> Staggered FP32 coordinates.
+#cast_order = affine_map<(d0, d1, d2) -> (
+    (d0 floordiv 2) * 2 + (d2 mod 8) floordiv 4,
+    d1,
+    (d0 mod 2) * 16 + (d2 floordiv 8) * 4 + d2 mod 4)>
 
 func.func @standard_dl16_to_standard_fp32(
     %src_addr: index, %dst_addr: index) attributes {grid = [1]} {
@@ -53,15 +68,25 @@ func.func @standard_dl16_to_standard_fp32(
     %floor = math.floor %value : f16
     linalg.yield %floor : f16
   } -> tensor<3x2x64xf16>
-  // standard[2*g + l floordiv 32,r,l mod 32] = cast(rounded[g,r,l]).
+  // staggered[S(g,r,l)] = cast(rounded[g,r,l]).
   %init = tensor.empty() : tensor<6x2x32xf32>
-  %standard = linalg.generic {
-    indexing_maps = [#identity, #dl16_to_standard_fp32],
+  %staggered = linalg.generic {
+    indexing_maps = [#identity, #dl16_to_staggered_fp32],
     iterator_types = ["parallel", "parallel", "parallel"]
   } ins(%rounded : tensor<3x2x64xf16>) outs(%init : tensor<6x2x32xf32>) {
   ^bb0(%value: f16, %unused: f32):
     %cast = spyreop.numeric_cast %value {kind = "dl16tofp32"} : f16 -> f32
     linalg.yield %cast : f32
+  } -> tensor<6x2x32xf32>
+
+  %relayout_init = tensor.empty() : tensor<6x2x32xf32>
+  %standard = linalg.generic {
+    indexing_maps = [#cast_order, #identity],
+    iterator_types = ["parallel", "parallel", "parallel"]
+  } ins(%staggered : tensor<6x2x32xf32>) outs(%relayout_init : tensor<6x2x32xf32>) {
+  ^bb0(%value: f32, %unused: f32):
+    %copy = spyreop.identity %value : f32
+    linalg.yield %copy : f32
   } -> tensor<6x2x32xf32>
 
   %exp_init = tensor.empty() : tensor<6x2x32xf32>
@@ -84,6 +109,10 @@ func.func @standard_dl16_to_standard_fp32(
 
 // -----
 
+// REG-LABEL: func.func @standard_fp32_to_standard_dl16(
+// REG: func_name = "fake_f32_exp", parameter_dictionary = {{.*}}, read_only_register_dictionary = [[RO:{[^}]+}]], read_write_register_dictionary = [[RW:{[^}]+}]]
+// REG: dataflow.send
+// REG: func_name = "fake_f32_exp", parameter_dictionary = {{.*}}, read_only_register_dictionary = [[RO]], read_write_register_dictionary = [[RW]]
 // CHECK-LABEL: func.func @standard_fp32_to_standard_dl16(
 // CHECK-DAG: vectorchain.cast
 // CHECK-DAG: vectorchain.floor {{.*}}vector<64xf16>
@@ -101,11 +130,17 @@ ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
     (k >= 0, 5 - k >= 0, r >= 0, 1 - r >= 0, e >= 0, 31 - e >= 0)>
 #identity = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 
-// Standard DL16 coordinates -> Standard FP32 coordinates.
+// Standard DL16 iteration coordinates -> Staggered FP32 coordinates.
 // g: 64-element group (0..2); r: row (0..1); l: DL16 lane (0..63).
-// The cast uses this map on its input to read the corresponding FP32 element.
-#dl16_to_standard_fp32 = affine_map<(g, r, l) -> (
-    g * 2 + l floordiv 32, r, l mod 32)>
+// The cast uses this map on its Staggered FP32 input.
+#dl16_to_staggered_fp32 = affine_map<(g, r, l) -> (
+    g * 2 + (l mod 8) floordiv 4, r, (l floordiv 8) * 4 + l mod 4)>
+
+// Standard FP32 coordinates -> Staggered FP32 coordinates.
+#cast_order = affine_map<(d0, d1, d2) -> (
+    (d0 floordiv 2) * 2 + (d2 mod 8) floordiv 4,
+    d1,
+    (d0 mod 2) * 16 + (d2 floordiv 8) * 4 + d2 mod 4)>
 
 func.func @standard_fp32_to_standard_dl16(
     %src_addr: index, %dst_addr: index) attributes {grid = [1]} {
@@ -134,12 +169,22 @@ func.func @standard_fp32_to_standard_dl16(
     linalg.yield %exp : f32
   } -> tensor<6x2x32xf32>
 
-  // dl16[g,r,l] = cast(exponential[2*g + l floordiv 32,r,l mod 32]).
+  %relayout_init = tensor.empty() : tensor<6x2x32xf32>
+  %staggered = linalg.generic {
+    indexing_maps = [#identity, #cast_order],
+    iterator_types = ["parallel", "parallel", "parallel"]
+  } ins(%exponential : tensor<6x2x32xf32>) outs(%relayout_init : tensor<6x2x32xf32>) {
+  ^bb0(%value: f32, %unused: f32):
+    %copy = spyreop.identity %value : f32
+    linalg.yield %copy : f32
+  } -> tensor<6x2x32xf32>
+
+  // dl16[g,r,l] = cast(staggered[S(g,r,l)]).
   %init = tensor.empty() : tensor<3x2x64xf16>
   %dl16 = linalg.generic {
-    indexing_maps = [#dl16_to_standard_fp32, #identity],
+    indexing_maps = [#dl16_to_staggered_fp32, #identity],
     iterator_types = ["parallel", "parallel", "parallel"]
-  } ins(%exponential : tensor<6x2x32xf32>) outs(%init : tensor<3x2x64xf16>) {
+  } ins(%staggered : tensor<6x2x32xf32>) outs(%init : tensor<3x2x64xf16>) {
   ^bb0(%value: f32, %unused: f16):
     %cast = spyreop.numeric_cast %value {kind = "fp32todl16"} : f32 -> f16
     linalg.yield %cast : f16

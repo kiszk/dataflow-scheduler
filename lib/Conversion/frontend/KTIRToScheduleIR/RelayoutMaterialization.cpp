@@ -79,7 +79,7 @@ spyreop::NumericCast scheduler::getNumericCast(Operation* op) {
   return casts.empty() ? spyreop::NumericCast{} : *casts.begin();
 }
 
-FailureOr<bool> scheduler::getNumericCastLayout(linalg::GenericOp generic) {
+LogicalResult scheduler::verifyNumericCastGeneric(linalg::GenericOp generic) {
   auto conversion = getNumericCast(generic);
   if (!conversion || !generic.hasPureTensorSemantics() ||
       generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1 ||
@@ -128,19 +128,14 @@ FailureOr<bool> scheduler::getNumericCastLayout(linalg::GenericOp generic) {
   auto identity = AffineMap::getMultiDimIdentityMap(rank, ctx);
   auto g = getAffineDimExpr(packet_axis, ctx);
   auto l = getAffineDimExpr(rank - 1, ctx);
-  for (bool standard : {false, true}) {
-    SmallVector<AffineExpr> coords(identity.getResults());
-    coords[packet_axis] =
-        g * 2 + (standard ? l.floorDiv(32) : (l % 8).floorDiv(4));
-    coords.back() = standard ? l % 32 : l.floorDiv(8) * 4 + l % 4;
-    auto fp32 = AffineMap::get(rank, 0, coords, ctx);
-    SmallVector<AffineMap> maps = widen
-                                      ? SmallVector<AffineMap>{identity, fp32}
+  SmallVector<AffineExpr> coords(identity.getResults());
+  coords[packet_axis] = g * 2 + (l % 8).floorDiv(4);
+  coords.back() = l.floorDiv(8) * 4 + l % 4;
+  auto fp32 = AffineMap::get(rank, 0, coords, ctx);
+  SmallVector<AffineMap> maps = widen ? SmallVector<AffineMap>{identity, fp32}
                                       : SmallVector<AffineMap>{fp32, identity};
-    if (sameIndexingMaps(generic.getIndexingMapsArray(), maps,
-                         native.getShape()))
-      return standard;
-  }
+  if (sameIndexingMaps(generic.getIndexingMapsArray(), maps, native.getShape()))
+    return success();
   generic.emitError("no numeric cast packet recipe for these indexing_maps");
   return failure();
 }

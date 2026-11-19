@@ -31,8 +31,8 @@
 namespace scheduler {
 // Inspect the scalar body; the generic owns the tensor shapes and maps.
 mlir::spyreop::NumericCast getNumericCast(mlir::Operation* op);
-// Validate the native packet domain and return whether FP32 is Standard.
-mlir::FailureOr<bool> getNumericCastLayout(mlir::linalg::GenericOp generic);
+// Validate the native packet domain and the explicit cast indexing maps.
+mlir::LogicalResult verifyNumericCastGeneric(mlir::linalg::GenericOp generic);
 
 // A matched recipe is a bijection over the complete static tensor domain.
 // true: Standard -> Staggered; false: Staggered -> Standard.

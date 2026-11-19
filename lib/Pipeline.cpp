@@ -148,7 +148,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // With the consumers in their final form, write each FIFO's slots in the
   // order the consumer uses them, as the FIFO delivers them in that order.
   pm.addPass(createOrderFifoSlotsByUsePass());
-
+  pm.addPass(createReuseRegistersPass());
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD
   // pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));

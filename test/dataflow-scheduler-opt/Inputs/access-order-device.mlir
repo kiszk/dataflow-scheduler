@@ -174,7 +174,40 @@ ktdf_arch.device @sample_device attributes {
       %in = operand : %f32
       %exp = operation "spyreop.exp" (%in : !pdl.value) -> (%f32 : !pdl.type)
       rewrite {
+        // Match the real FP32 exp register pressure: six constants, input,
+        // output and four scratch registers. No hardware template is invoked.
         %reg = type : memref<f32, "SFU_REG">
+        %register_mapping = attribute = "SFU_REG"
+        %c0_value = attribute = 1.0 : f32
+        %c0_op = operation "arith.constant"
+          {"value" = %c0_value, "ktdf_arch.maps_to" = %register_mapping}
+          -> (%f32 : !pdl.type)
+        %c0 = result 0 of %c0_op
+        %c1_value = attribute = 2.0 : f32
+        %c1_op = operation "arith.constant"
+          {"value" = %c1_value, "ktdf_arch.maps_to" = %register_mapping}
+          -> (%f32 : !pdl.type)
+        %c1 = result 0 of %c1_op
+        %c2_value = attribute = 3.0 : f32
+        %c2_op = operation "arith.constant"
+          {"value" = %c2_value, "ktdf_arch.maps_to" = %register_mapping}
+          -> (%f32 : !pdl.type)
+        %c2 = result 0 of %c2_op
+        %c3_value = attribute = 4.0 : f32
+        %c3_op = operation "arith.constant"
+          {"value" = %c3_value, "ktdf_arch.maps_to" = %register_mapping}
+          -> (%f32 : !pdl.type)
+        %c3 = result 0 of %c3_op
+        %c4_value = attribute = 5.0 : f32
+        %c4_op = operation "arith.constant"
+          {"value" = %c4_value, "ktdf_arch.maps_to" = %register_mapping}
+          -> (%f32 : !pdl.type)
+        %c4 = result 0 of %c4_op
+        %c5_value = attribute = 6.0 : f32
+        %c5_op = operation "arith.constant"
+          {"value" = %c5_value, "ktdf_arch.maps_to" = %register_mapping}
+          -> (%f32 : !pdl.type)
+        %c5 = result 0 of %c5_op
         %no_dyn_operands = attribute = array<i32: 0, 0>
         %in_op = operation "memref.alloca"
           {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
@@ -184,11 +217,25 @@ ktdf_arch.device @sample_device attributes {
         %out_op = operation "memref.alloca"
           {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
         %out_reg = result 0 of %out_op
+        %t0_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %t0 = result 0 of %t0_op
+        %t1_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %t1 = result 0 of %t1_op
+        %t2_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %t2 = result 0 of %t2_op
+        %t3_op = operation "memref.alloca"
+          {"operandSegmentSizes" = %no_dyn_operands} -> (%reg : !pdl.type)
+        %t3 = result 0 of %t3_op
         %template = attribute = "fake_f32_exp"
-        %register_names = attribute = ["in0", "out0"]
-        %segments = attribute = array<i32: 1, 1>
+        %register_names = attribute = ["c0", "c1", "c2", "c3", "c4", "c5", "in0", "out0", "t0", "t1", "t2", "t3"]
+        %segments = attribute = array<i32: 7, 5>
         %opaque_op = operation "ktdf.opaque"
-          (%in_reg, %out_reg : !pdl.value, !pdl.value)
+          (%c0, %c1, %c2, %c3, %c4, %c5, %in_reg, %out_reg, %t0, %t1, %t2, %t3 :
+           !pdl.value, !pdl.value, !pdl.value, !pdl.value, !pdl.value, !pdl.value,
+           !pdl.value, !pdl.value, !pdl.value, !pdl.value, !pdl.value, !pdl.value)
           {"template_name" = %template, "func_name" = %template,
            "dataflow_scheduler.register_names" = %register_names,
            "operandSegmentSizes" = %segments}
