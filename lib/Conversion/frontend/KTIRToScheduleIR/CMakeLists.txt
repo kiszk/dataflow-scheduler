@@ -1,5 +1,5 @@
 add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
-    AccessOrderMaterialization.cpp
+    RelayoutMaterialization.cpp
     ComputeGroupExtraction.cpp
     FuseLinalg.cpp
     IndirectComputeGroupSplit.cpp

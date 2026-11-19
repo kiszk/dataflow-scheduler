@@ -57,9 +57,10 @@ void scheduler::buildKTIRFrontendPipeline(
     nested.addPass(mlir::createConvertElementwiseToLinalgPass());
     nested.addPass(mlir::createLinalgMorphOpsPass(
         {.categoryToGeneric = true, .namedToGeneric = true}));
+    // Form native packets before simplification drops physical unit axes.
+    nested.addPass(createKTIRNumericCastTilingPass());
     nested.addPass(createSimplifyLinalgPass());
     nested.addPass(createFuseLinalgPass());
-    nested.addPass(createKTIRNumericCastTilingPass());
     nested.addPass(createKTIRMapAndTilePass());
     nested.addPass(createKTIRBufferizePass());
     nested.addPass(createKTIRPipelinePass());

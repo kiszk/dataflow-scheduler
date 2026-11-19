@@ -37,7 +37,7 @@
 // CHECK: %[[STORE_MAP:.*]] = uniform.def_immutable_mapping([%[[STORE]] -> %[[L1]]])
 // CHECK: %[[STORE_MEM:.*]] = uniform.query_map(map:%[[STORE_MAP]], key:%[[STORE_KEY]])
 // CHECK: %[[STORE_VIEW:.*]] = dataflow.get_logical_memory_view %[[STORE_MEM]], {{.*}}layout_map = #[[STANDARD]]{{.*}}memref<6x2x32xf32>
-// CHECK: agen.vector_store {{.*}}, %[[STORE_VIEW]][{{.*}}] {{.*}}memref<6x2x32xf32>, vector<4xf32>
+// CHECK: agen.vector_store {{.*}}, %[[STORE_VIEW]][{{.*}}] {{.*}}memref<6x2x32xf32>, vector<32xf32>
 // CHECK-LABEL: func.func @local_schedule_1_body()
 // CHECK-DAG: %[[TWO:.*]] = arith.constant 2 : index
 // CHECK-DAG: %[[SIX:.*]] = arith.constant 6 : index
@@ -66,7 +66,7 @@ ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
 #output_domain = affine_set<(r, o) :
     (r >= 0, 1 - r >= 0, o >= 0, 31 - o >= 0)>
 #identity = affine_map<(k, r, e) -> (k, r, e)>
-// Standard memory coordinates -> Staggered cast-result coordinates.
+// Standard tensor coordinates -> Staggered cast-result coordinates.
 #cast_order = affine_map<(k, r, e) -> (
     (k floordiv 2) * 2 + (e mod 8) floordiv 4,
     r, (k mod 2) * 16 + (e floordiv 8) * 4 + e mod 4)>
@@ -76,7 +76,7 @@ func.func @dl16_to_fp32_row_sum_ct_local(
   %src = ktdp.construct_memory_view %src_addr,
       sizes: [3, 2, 64], strides: [128, 64, 1] {
     coordinate_set = #dl16_domain, memory_space = #ktdp.memory_space<global>
-  } : memref<3x2x64x!spyreop.df16>
+  } : memref<3x2x64xf16>
   %dst = ktdp.construct_memory_view %dst_addr,
       sizes: [2, 32], strides: [32, 1] {
     coordinate_set = #output_domain, memory_space = #ktdp.memory_space<global>
@@ -87,20 +87,39 @@ func.func @dl16_to_fp32_row_sum_ct_local(
   } : memref<6x2x32xf32>
 
   %input_tile = ktdp.construct_access_tile %src[0, 0, 0] {
-    access_tile_set = #dl16_domain, access_tile_order = #identity
-  } : memref<3x2x64x!spyreop.df16> -> !ktdp.access_tile<3x2x64xindex>
+    access_tile_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+    access_tile_set = #dl16_domain
+  } : memref<3x2x64xf16> -> !ktdp.access_tile<3x2x64xindex>
   %input = ktdp.load %input_tile
-      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64x!spyreop.df16>
-  %staggered = spyreop.numeric_cast %input {kind = "dl16tofp32"}
-      : tensor<3x2x64x!spyreop.df16> -> tensor<6x2x32xf32>
+      : !ktdp.access_tile<3x2x64xindex> -> tensor<3x2x64xf16>
+  %cast_init_1 = tensor.empty() : tensor<6x2x32xf32>
+  %staggered = linalg.generic {
+    indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+                     affine_map<(d0, d1, d2) -> (d0 * 2 + (d2 mod 8) floordiv 4, d1, (d2 floordiv 8) * 4 + d2 mod 4)>],
+    iterator_types = ["parallel", "parallel", "parallel"]
+  } ins(%input : tensor<3x2x64xf16>) outs(%cast_init_1 : tensor<6x2x32xf32>) {
+  ^bb0(%value: f16, %unused: f32):
+    %cast = spyreop.numeric_cast %value {kind = "dl16tofp32"} : f16 -> f32
+    linalg.yield %cast : f32
+  } -> tensor<6x2x32xf32>
   %tmp_store = ktdp.construct_access_tile %tmp[0, 0, 0] {
-    access_tile_set = #fp32_domain, access_tile_order = #cast_order
+    access_tile_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+    access_tile_set = #fp32_domain
   } : memref<6x2x32xf32> -> !ktdp.access_tile<6x2x32xindex>
-  ktdp.store %staggered, %tmp_store
+  %relayout_init_1 = tensor.empty() : tensor<6x2x32xf32>
+  %standard_store_1 = linalg.generic {indexing_maps = [#cast_order, #identity],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%staggered : tensor<6x2x32xf32>) outs(%relayout_init_1 : tensor<6x2x32xf32>) {
+    ^bb0(%value: f32, %unused: f32):
+      %copy = spyreop.identity %value : f32
+      linalg.yield %copy : f32
+  } -> tensor<6x2x32xf32>
+  ktdp.store %standard_store_1, %tmp_store
       : tensor<6x2x32xf32>, !ktdp.access_tile<6x2x32xindex>
 
   %tmp_load = ktdp.construct_access_tile %tmp[0, 0, 0] {
-    access_tile_set = #fp32_domain, access_tile_order = #identity
+    access_tile_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+    access_tile_set = #fp32_domain
   } : memref<6x2x32xf32> -> !ktdp.access_tile<6x2x32xindex>
   %standard = ktdp.load %tmp_load
       : !ktdp.access_tile<6x2x32xindex> -> tensor<6x2x32xf32>
