@@ -86,6 +86,7 @@
 // CHECK-NEXT:   )
 // CHECK-NEXT:   custom-linalg-bufferization
 // CHECK-NEXT:   order-fifo-slots-by-use
+// CHECK-NEXT:   reuse-registers
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
 // CHECK-NEXT:   loop-iv-affine-mul-strength-reduction

@@ -251,12 +251,8 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
                      mlir::ktdf_arch::Mapping& mapping) -> mlir::LogicalResult {
   auto generic = mlir::cast<mlir::linalg::GenericOp>(root);
   auto cast_op = getNumericCast(root);
-  bool standard = false;
-  if (cast_op) {
-    auto layout = getNumericCastLayout(generic);
-    if (failed(layout)) return mlir::failure();
-    standard = *layout;
-  }
+  if (cast_op && failed(verifyNumericCastGeneric(generic)))
+    return mlir::failure();
   auto root_input = generic.getDpsInputs()[0];
   auto input_type = mlir::cast<mlir::RankedTensorType>(root_input.getType());
   auto output_type =
@@ -359,8 +355,6 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
       inputs.push_back(slice(builder, input, second, row, packet_type));
     }
     inputs = applyPacketTransforms(builder, loc, std::move(inputs), before);
-    if (cast_op && standard && !widening)
-      inputs = relayoutPackets(builder, loc, std::move(inputs), true);
     llvm::SmallVector<mlir::Value> outputs;
     if (cast_op) {
       mlir::OperationState state(loc, "ktdf_lowering.numeric_cast_value");
@@ -376,8 +370,6 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
       outputs =
           applyPacketTransforms(builder, loc, std::move(inputs), {{root, {}}});
     }
-    if (cast_op && standard && widening)
-      outputs = relayoutPackets(builder, loc, std::move(outputs), false);
     outputs = applyPacketTransforms(builder, loc, std::move(outputs), after);
     if (outputs.size() == 2) {
       output = insert(builder, outputs[0], output, first, row);
