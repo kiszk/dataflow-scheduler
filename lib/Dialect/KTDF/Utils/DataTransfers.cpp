@@ -845,6 +845,12 @@ struct LowerStoreFromLoad
       return rewriter.notifyMatchFailure(store, "does not load from memory");
     }
 
+    // Access tiles still need bufferization before they can be transfer
+    // endpoints.
+    if (!mlir::isa<MemRef>(load.getSource()) ||
+        !mlir::isa<MemRef>(store.getDest()))
+      return rewriter.notifyMatchFailure(store, "not bufferized");
+
     const auto load_access = createTransferAccess(rewriter, getSlice(load));
     const auto store_access = createTransferAccess(rewriter, getSlice(store));
     if (failed(load_access) || failed(store_access)) {

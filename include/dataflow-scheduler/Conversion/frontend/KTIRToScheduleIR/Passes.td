@@ -51,6 +51,7 @@ def KTIRLegalityCheckPass : Pass<"ktir-legality-check", "mlir::ModuleOp"> {
 def KTIRNumericCastTilingPass : Pass<"ktir-numeric-cast-tiling", "mlir::func::FuncOp"> {
   let summary = "Tile physical numeric casts into native sticks and FP32 packets";
   let dependentDialects = [
+    "mlir::ktdp::KtdpDialect",
     "mlir::arith::ArithDialect",
     "mlir::ktdf_lowering::KTDFLoweringDialect",
     "mlir::linalg::LinalgDialect",

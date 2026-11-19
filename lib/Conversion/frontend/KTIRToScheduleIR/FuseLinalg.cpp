@@ -37,6 +37,7 @@
 
 #include <utility>
 
+#include "RelayoutMaterialization.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
@@ -272,7 +273,10 @@ struct FuseLinalgPass : public impl::FuseLinalgPassBase<FuseLinalgPass> {
     patterns.add<FuseElementwiseOps>(
         patterns.getContext(), [&](mlir::OpOperand* through) -> bool {
           auto* const producer = through->get().getDefiningOp();
-          return candidates.contains(producer);
+          return candidates.contains(producer) && !getNumericCast(producer) &&
+                 !getNumericCast(through->getOwner()) &&
+                 !getPacketRelayoutDirection(producer) &&
+                 !getPacketRelayoutDirection(through->getOwner());
         });
 
     // Fuse as many of the candidates as possible.

@@ -43,7 +43,7 @@
 
 #include <limits>
 
-#include "AccessOrderMaterialization.h"
+#include "RelayoutMaterialization.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
@@ -1124,7 +1124,7 @@ void KTIRBufferizePass::runOnOperation() {
   }
 
   mlir::ktdf_arch::Mapping mapping(default_device.getRef());
-  if (failed(materializeAccessOrders(func, mapping, mem_space_map)))
+  if (failed(materializeRelayouts(func, mapping, mem_space_map)))
     return signalPassFailure();
 
   // Replacing an access tile by a memref drops its order. Only do so after

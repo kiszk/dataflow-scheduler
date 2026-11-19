@@ -52,10 +52,19 @@ module {
     %6 = arith.addi %arg0, %c2949120_2 : index
     %c0_3 = arith.constant 0 : index
     %7 = arith.addi %arg0, %c0_3 : index
-    %8 = ktdp.construct_memory_view %arg1, sizes: [2, 45, 1, 64], strides: [2880, 64, 64, 1] {coordinate_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 44 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>} : memref<2x45x1x64x!spyreop.df16>
-    %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0, %c0] {access_tile_order = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, access_tile_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 44 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 63 >= 0)>} : memref<2x45x1x64x!spyreop.df16> -> !ktdp.access_tile<2x45x1x64xindex>
-    %10 = ktdp.load %9 : <2x45x1x64xindex> -> tensor<2x45x1x64x!spyreop.df16>
-    %11 = spyreop.numeric_cast %10 {kind = "dl16tofp32"} : tensor<2x45x1x64x!spyreop.df16> -> tensor<2x90x1x32xf32>
+    %8 = ktdp.construct_memory_view %arg1, sizes: [2, 45, 1, 64], strides: [2880, 64, 64, 1] {coordinate_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 44 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>} : memref<2x45x1x64xf16>
+    %9 = ktdp.construct_access_tile %8[%c0, %c0, %c0, %c0] {access_tile_order = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, access_tile_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 44 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 63 >= 0)>} : memref<2x45x1x64xf16> -> !ktdp.access_tile<2x45x1x64xindex>
+    %10 = ktdp.load %9 : <2x45x1x64xindex> -> tensor<2x45x1x64xf16>
+    %cast_init_1 = tensor.empty() : tensor<2x90x1x32xf32>
+    %11 = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>,
+                       affine_map<(d0, d1, d2, d3) -> (d0, d1 * 2 + (d3 mod 8) floordiv 4, d2, (d3 floordiv 8) * 4 + d3 mod 4)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+    } ins(%10 : tensor<2x45x1x64xf16>) outs(%cast_init_1 : tensor<2x90x1x32xf32>) {
+    ^bb0(%value: f16, %unused: f32):
+      %cast = spyreop.numeric_cast %value {kind = "dl16tofp32"} : f16 -> f32
+      linalg.yield %cast : f32
+    } -> tensor<2x90x1x32xf32>
     %12 = ktdp.construct_memory_view %0, sizes: [2, 90, 1, 32], strides: [2880, 32, 32, 1] {coordinate_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 89 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 31 >= 0)>, memory_space = #ktdp.memory_space<global>} : memref<2x90x1x32xf32>
     %13 = ktdp.construct_access_tile %12[%c0, %c0, %c0, %c0] {access_tile_order = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, access_tile_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 89 >= 0, d2 >= 0, -d2 >= 0, d3 >= 0, -d3 + 31 >= 0)>} : memref<2x90x1x32xf32> -> !ktdp.access_tile<2x90x1x32xindex>
     ktdp.store %11, %13 : tensor<2x90x1x32xf32>, <2x90x1x32xindex>
