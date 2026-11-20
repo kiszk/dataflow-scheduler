@@ -36,6 +36,22 @@
 
 namespace scheduler {
 
+/// Return the unique compute-kind exemplar, or null if missing or ambiguous.
+/// ResourceKinds::getDefaultCompute() does not safely handle missing kinds.
+inline auto getUniqueComputeUnit(const mlir::ktdf_arch::ResourceKinds& kinds)
+    -> mlir::ktdf_arch::ExecutionUnitOp {
+  mlir::ktdf_arch::ExecutionUnitOp compute;
+  for (const auto& kind : kinds) {
+    auto unit = mlir::dyn_cast<mlir::ktdf_arch::ExecutionUnitOp>(
+        kind.getExemplar().getOperation());
+    if (!unit || !unit.getFeature<mlir::ktdf_arch::feature::Compute>())
+      continue;
+    if (compute) return nullptr;
+    compute = unit;
+  }
+  return compute;
+}
+
 /// Extract the resource type from a unit SSA value.  Accepts either:
 ///   - a direct `dataflow.get_unit` result, or
 ///   - a `uniform.query_map` result (follows query_map →

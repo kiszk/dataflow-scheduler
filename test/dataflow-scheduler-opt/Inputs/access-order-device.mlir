@@ -248,6 +248,33 @@ ktdf_arch.device @sample_device attributes {
   }
 
   patterns ["post_scheduling"] {
+    // MAX: select the opaque template by accumulator precision.
+    pdl.pattern : benefit(1) {
+      %in  = operand
+      %acc = operand
+      %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
+      apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
+      %expected_kind = attribute = "max"
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind : !pdl.operation, !pdl.attribute)
+
+      rewrite {
+        %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
+        %template = attribute = "simdreduction_minmax"
+        %func_name = apply_native_rewrite "ktdf.template_for_precision"(%generic, %template : !pdl.operation, !pdl.attribute) : !pdl.attribute
+        %reg_names = attribute = ["t0", "t0"]
+        %params    = attribute = {x1 = "0", x2 = "8", "unroll" = "1"}
+        %segments  = attribute = array<i32: 1, 1>
+        %opaque_op = operation "ktdf.opaque"
+          (%in, %acc_src : !pdl.value, !pdl.value)
+          {"template_name"                     = %func_name,
+           "func_name"                         = %func_name,
+           "dataflow_scheduler.register_names" = %reg_names,
+           "parameter_dictionary"              = %params,
+           "operandSegmentSizes"               = %segments}
+        replace %generic with %opaque_op
+      }
+    }
+
     // SUM: select the opaque template by accumulator precision.
     pdl.pattern : benefit(1) {
       %in  = operand

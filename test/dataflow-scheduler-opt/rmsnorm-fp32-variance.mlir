@@ -9,6 +9,8 @@
 // Two rows fit sample_device; real-device coverage uses the original 128 rows.
 // HBM pool offsets are in bytes, as emitted by torch-spyre.
 
+// SUM uses the sample device's existing dtype-independent test op.
+
 // CHECK-LABEL: func.func @rmsnorm_variance
 // CHECK: call @local_schedule_0
 // CHECK: call @local_schedule_4

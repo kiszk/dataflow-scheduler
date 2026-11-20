@@ -11,6 +11,8 @@
 // Intermediates use fixed ct_local element offsets. They must survive
 // scheduler scratch allocations and the sum -> scale -> add boundaries.
 
+// SUM uses the sample device's existing dtype-independent test op.
+
 // CHECK-LABEL: func.func @rmsnorm_variance_ct_local
 // CHECK: call @local_schedule_0
 // CHECK: call @local_schedule_4

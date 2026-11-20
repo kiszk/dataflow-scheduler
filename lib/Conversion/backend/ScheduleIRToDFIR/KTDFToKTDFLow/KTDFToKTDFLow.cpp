@@ -124,9 +124,11 @@ static mlir::LogicalResult insertPhaseCompletionSignals(
     llvm::SmallSetVector<mlir::Operation*, 4> writers;
     llvm::SmallSetVector<mlir::Operation*, 4> readers;
   };
-  auto result = func.walk([&](mlir::ktdf::PipelineOp pipeline) {
-    if (pipeline.getNumStages() < 2 ||
-        !llvm::all_of(pipeline.getStages(), has_pipeline))
+  auto result = func.walk([&](mlir::Operation* scope) {
+    auto pipeline = mlir::dyn_cast<mlir::ktdf::PipelineOp>(scope);
+    if (scope != func && !pipeline) return mlir::WalkResult::advance();
+    if (pipeline && (pipeline.getNumStages() < 2 ||
+                     !llvm::all_of(pipeline.getStages(), has_pipeline)))
       return mlir::WalkResult::advance();
     llvm::MapVector<mlir::Value, BufferUsers> buffers;
     auto record = [&](mlir::Value buffer, mlir::Operation* stage, bool write) {
@@ -136,7 +138,7 @@ static mlir::LogicalResult insertPhaseCompletionSignals(
         (write ? users.writers : users.readers).insert(stage);
       }
     };
-    auto leaves = pipeline.walk([&](mlir::ktdf::StageOp stage) {
+    auto leaves = scope->walk([&](mlir::ktdf::StageOp stage) {
       if (has_pipeline(stage)) return mlir::WalkResult::advance();
       auto found = stage_to_units.mapping.find(stage);
       if (found == stage_to_units.mapping.end() || found->second.empty()) {
@@ -155,14 +157,41 @@ static mlir::LogicalResult insertPhaseCompletionSignals(
     });
     if (leaves.wasInterrupted()) return mlir::WalkResult::interrupt();
 
-    mlir::OpBuilder builder(pipeline.getContext());
-    builder.setInsertionPointToEnd(pipeline.getBody());
-    llvm::SmallVector<llvm::SmallVector<mlir::Value>> emitted;
+    mlir::OpBuilder builder(scope->getContext());
+    struct Barrier {
+      mlir::Operation* anchor;
+      llvm::SmallVector<mlir::Value> units;
+    };
+    llvm::SmallVector<Barrier> emitted;
     // MapVector and SetVector preserve a common order in every unit program,
     // so overlapping pairwise barriers cannot wait on each other cyclically.
     for (auto& [buffer, users] : buffers) {
       for (auto* writer : users.writers) {
         for (auto* reader : users.readers) {
+          llvm::SmallVector<mlir::Operation*, 2> anchors;
+          if (pipeline) {
+            anchors.push_back(pipeline);
+          } else {
+            // Broadcast promotion can place the writer in a sibling pipeline
+            // before the reader's loop. Those pipelines share no token DAG.
+            // Synchronize at their common sequential scope, once before the
+            // reader loop and once after it, before the next overwrite.
+            mlir::Operation* first = writer;
+            mlir::Operation* last = nullptr;
+            for (; first && first != func; first = first->getParentOp()) {
+              last = first->getBlock()->findAncestorOpInBlock(*reader);
+              if (last) break;
+            }
+            if (!last || first == last ||
+                !mlir::isa<mlir::scf::ForOp, mlir::func::FuncOp>(
+                    first->getParentOp()))
+              continue;
+            // Dependencies inside a common pipeline are handled by its DAG
+            // and phase-completion barriers, not by sequential source order.
+            if (first->getParentOfType<mlir::ktdf::PipelineOp>()) continue;
+            if (last->isBeforeInBlock(first)) std::swap(first, last);
+            anchors = {first, last};
+          }
           llvm::SmallSetVector<mlir::Value, 8> units;
           llvm::SmallSetVector<scheduler::ResourceType, 2> kinds;
           for (auto* stage : {writer, reader}) {
@@ -178,16 +207,23 @@ static mlir::LogicalResult insertPhaseCompletionSignals(
           }
           // A unit's own program already orders its reads and next writes.
           if (kinds.size() < 2) continue;
-          if (llvm::any_of(emitted, [&](const auto& previous) {
-                return previous.size() == units.size() &&
-                       llvm::all_of(previous, [&](mlir::Value unit) {
-                         return units.contains(unit);
-                       });
-              }))
-            continue;
-          emitted.push_back(llvm::to_vector(units.getArrayRef()));
-          mlir::ktdf_lowering::SignalOp::create(builder, pipeline.getLoc(),
-                                                units.getArrayRef());
+          for (auto* anchor : anchors) {
+            if (llvm::any_of(emitted, [&](const Barrier& previous) {
+                  return previous.anchor == anchor &&
+                         previous.units.size() == units.size() &&
+                         llvm::all_of(previous.units, [&](mlir::Value unit) {
+                           return units.contains(unit);
+                         });
+                }))
+              continue;
+            emitted.push_back({anchor, llvm::to_vector(units.getArrayRef())});
+            if (pipeline)
+              builder.setInsertionPointToEnd(pipeline.getBody());
+            else
+              builder.setInsertionPointAfter(anchor);
+            mlir::ktdf_lowering::SignalOp::create(builder, scope->getLoc(),
+                                                  units.getArrayRef());
+          }
         }
       }
     }
