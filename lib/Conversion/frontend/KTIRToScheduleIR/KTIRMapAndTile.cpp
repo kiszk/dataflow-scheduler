@@ -52,6 +52,7 @@
 
 #include "RelayoutMaterialization.h"
 #include "Utils.h"
+#include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -294,16 +295,7 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
   auto row_count = mlir::arith::ConstantIndexOp::create(rewriter, loc, rows);
   auto init = mlir::tensor::EmptyOp::create(rewriter, loc, output_type,
                                             mlir::ValueRange{});
-  mlir::ktdf_arch::ExecutionUnitOp default_compute;
-  for (const auto& kind : mapping.byKind()) {
-    auto unit = mlir::dyn_cast<mlir::ktdf_arch::ExecutionUnitOp>(
-        kind.getExemplar().getOperation());
-    if (!unit || !unit.getFeature<mlir::ktdf_arch::feature::Compute>())
-      continue;
-    if (default_compute)
-      return root->emitError("numeric cast requires one default compute kind");
-    default_compute = unit;
-  }
+  auto default_compute = getUniqueComputeUnit(mapping.byKind());
   if (!default_compute)
     return root->emitError("numeric cast requires one default compute kind");
   auto compute = mapping.getOrMap<mlir::ktdf_arch::ExecutionUnitOp>(
@@ -379,7 +371,10 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
   };
   int cores = 1;
   auto func = root->getParentOfType<mlir::func::FuncOp>();
-  if (func->hasAttr("grid") && failed(extractGridSize(func, cores)))
+  // A frontend may supply per-core tensors and explicit core-dependent memory
+  // offsets. Its work must not be partitioned a second time by this tiling.
+  if (!root->hasAttr("dataflow_scheduler.work_divided") &&
+      func->hasAttr("grid") && failed(extractGridSize(func, cores)))
     return mlir::failure();
   // Reuse the row/chunk partition for each leading batch coordinate. Keep
   // each head/middle/tail segment as a separate nest, so the ordinary store
@@ -402,34 +397,38 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
     };
     return visit(visit, builder, 0, initial);
   };
+  auto row_loop = [&](mlir::OpBuilder& b, mlir::Value chunk, mlir::Value lb,
+                      mlir::Value ub, mlir::Value output) {
+    return mlir::scf::ForOp::create(
+               b, loc, lb, ub, one, mlir::ValueRange{output},
+               [&](mlir::OpBuilder& rb, mlir::Location, mlir::Value row,
+                   mlir::ValueRange carried) {
+                 mlir::scf::YieldOp::create(
+                     rb, loc, cast_row(rb, chunk, row, carried.front()));
+               })
+        .getResult(0);
+  };
+  auto chunk_loop = [&](mlir::OpBuilder& b, mlir::Value lb, mlir::Value ub,
+                        mlir::Value output) {
+    return mlir::scf::ForOp::create(
+               b, loc, lb, ub, one, mlir::ValueRange{output},
+               [&](mlir::OpBuilder& cb, mlir::Location, mlir::Value chunk,
+                   mlir::ValueRange carried) {
+                 auto result = rank == 2
+                                   ? cast_row(cb, chunk, zero, carried.front())
+                                   : row_loop(cb, chunk, zero, row_count,
+                                              carried.front());
+                 mlir::scf::YieldOp::create(cb, loc, result);
+               })
+        .getResult(0);
+  };
   mlir::Value result;
   auto& builder = rewriter;
   if (cores == 1) {
-    result = batches(
-        builder, init, [&](mlir::OpBuilder& builder, mlir::Value batch_init) {
-          auto loop = mlir::scf::ForOp::create(
-              builder, loc, zero, chunks, one, mlir::ValueRange{batch_init},
-              [&](mlir::OpBuilder& builder, mlir::Location, mlir::Value chunk,
-                  mlir::ValueRange carried) {
-                if (rank == 2) {
-                  mlir::scf::YieldOp::create(
-                      builder, loc,
-                      cast_row(builder, chunk, zero, carried.front()));
-                  return;
-                }
-                auto row_loop = mlir::scf::ForOp::create(
-                    builder, loc, zero, row_count, one, carried,
-                    [&](mlir::OpBuilder& row_builder, mlir::Location,
-                        mlir::Value row, mlir::ValueRange row_carried) {
-                      mlir::scf::YieldOp::create(
-                          row_builder, loc,
-                          cast_row(row_builder, chunk, row,
-                                   row_carried.front()));
-                    });
-                mlir::scf::YieldOp::create(builder, loc, row_loop.getResult(0));
-              });
-          return loop.getResult(0);
-        });
+    result = batches(builder, init,
+                     [&](mlir::OpBuilder& builder, mlir::Value batch_init) {
+                       return chunk_loop(builder, zero, chunks, batch_init);
+                     });
   } else {
     // Own complete 64-element groups, including both packets and every phase.
     // Only the core-uniform bounds use floor/mod. Address-generator loops keep
@@ -447,26 +446,8 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
     auto end = mlir::arith::DivUIOp::create(
         builder, loc, mlir::arith::MulIOp::create(builder, loc, next, groups),
         count);
-    auto row_loop = [&](mlir::OpBuilder& b, mlir::Value chunk, mlir::Value lb,
-                        mlir::Value ub, mlir::Value output) {
-      return mlir::scf::ForOp::create(
-                 b, loc, lb, ub, one, mlir::ValueRange{output},
-                 [&](mlir::OpBuilder& rb, mlir::Location, mlir::Value row,
-                     mlir::ValueRange carried) {
-                   mlir::scf::YieldOp::create(
-                       rb, loc, cast_row(rb, chunk, row, carried.front()));
-                 })
-          .getResult(0);
-    };
     if (rank == 2) {
-      result = mlir::scf::ForOp::create(
-                   builder, loc, begin, end, one, mlir::ValueRange{init},
-                   [&](mlir::OpBuilder& b, mlir::Location, mlir::Value chunk,
-                       mlir::ValueRange carried) {
-                     mlir::scf::YieldOp::create(
-                         b, loc, cast_row(b, chunk, zero, carried.front()));
-                   })
-                   .getResult(0);
+      result = chunk_loop(builder, begin, end, init);
     } else {
       auto first = mlir::arith::DivUIOp::create(builder, loc, begin, row_count);
       auto last = mlir::arith::DivUIOp::create(builder, loc, end, row_count);
@@ -483,21 +464,11 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
         return row_loop(b, first, first_row, first_end, out);
       });
       auto middle_begin = mlir::arith::AddIOp::create(builder, loc, first, one);
-      result = batches(
-          builder, result,
-          [&](mlir::OpBuilder& batch_builder, mlir::Value out) {
-            return mlir::scf::ForOp::create(
-                       batch_builder, loc, middle_begin, last, one,
-                       mlir::ValueRange{out},
-                       [&](mlir::OpBuilder& b, mlir::Location,
-                           mlir::Value chunk, mlir::ValueRange carried) {
-                         mlir::scf::YieldOp::create(
-                             b, loc,
-                             row_loop(b, chunk, zero, row_count,
-                                      carried.front()));
-                       })
-                .getResult(0);
-          });
+      result =
+          batches(builder, result,
+                  [&](mlir::OpBuilder& batch_builder, mlir::Value out) {
+                    return chunk_loop(batch_builder, middle_begin, last, out);
+                  });
       auto has_tail = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::ugt, last, first);
       auto tail_end =
@@ -620,30 +591,21 @@ void KTIRNumericCastTilingPass::runOnOperation() {
     // chain is effectful and a store cannot sink across its loop nest.
     rewriter.moveOpBefore(op, uses.front()->getOwner());
   }
-  // Each generic owns the device shapes and indexing maps of its scalar cast.
-  while (true) {
-    auto generics = func.getOps<mlir::linalg::GenericOp>();
-    auto it = llvm::find_if(generics,
-                            [](auto op) { return bool(getNumericCast(op)); });
-    if (it == generics.end()) break;
-    if (failed(tileNumericCast(rewriter, *it, mapping))) {
-      signalPassFailure();
-      return;
+  auto tile_all = [&](auto matches) -> mlir::LogicalResult {
+    while (true) {
+      auto generics = func.getOps<mlir::linalg::GenericOp>();
+      auto it = llvm::find_if(generics, matches);
+      if (it == generics.end()) return mlir::success();
+      if (failed(tileNumericCast(rewriter, *it, mapping)))
+        return mlir::failure();
     }
-  }
-  // Relayouts separated from a cast by memory, or used on their own, use
-  // exactly the same group ownership and batch/row tiling.
-  while (true) {
-    auto generics = func.getOps<mlir::linalg::GenericOp>();
-    auto it = llvm::find_if(generics, [](auto generic) {
-      return getPacketRelayoutDirection(generic).has_value();
-    });
-    if (it == generics.end()) break;
-    if (failed(tileNumericCast(rewriter, *it, mapping))) {
-      signalPassFailure();
-      return;
-    }
-  }
+  };
+  // Tile casts first so they can absorb adjacent transforms. Remaining
+  // relayouts use the same group ownership and batch/row tiling.
+  if (failed(tile_all([](auto op) { return bool(getNumericCast(op)); })) ||
+      failed(tile_all(
+          [](auto op) { return getPacketRelayoutDirection(op).has_value(); })))
+    signalPassFailure();
 }
 
 /// Given a shape and a target vector_length, compute per-dimension tile sizes

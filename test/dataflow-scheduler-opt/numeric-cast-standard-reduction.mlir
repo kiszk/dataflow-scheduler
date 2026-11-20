@@ -46,11 +46,7 @@
 // CHECK: %[[ACC:.*]] = agen.vector_load {{.*}}vector<32xf32>
 // CHECK: %[[SUM:.*]] = vectorchain.binary %[[INPUT]], %[[ACC]] {binary_op = #vectorchain<binary_operator add>{{.*}} : vector<32xf32>, vector<32xf32>, vector<32xf32>
 // CHECK-NEXT: agen.vector_store %[[SUM]], {{.*}}vector<32xf32>
-// CHECK: vectorchain.shuffle {{.*}}indices = [1 : i32, 0 : i32, 3 : i32, 3 : i32], repetition = 8 : i32
-// CHECK: vectorchain.multiply_and_accumulate {{.*}}vector<32xf32>
-// CHECK: vectorchain.shuffle {{.*}}indices = [2 : i32, 0 : i32, 1 : i32, 3 : i32], repetition = 8 : i32
-// CHECK: vectorchain.multiply_and_accumulate {{.*}}vector<32xf32>
-// CHECK: vectorchain.scan_with_gap {{.*}}gap = 8 : index, reduction_op = #vectorchain<binary_operator add>{{.*}}vector<32xf32>, vector<32xf32>
+// CHECK: dataflow.opaque {{.*}}func_name = "simdreduction_sum_fp32"{{.*}}parameter_dictionary = {unroll = "1"}
 // CHECK: memref<6x2x32xf32>
 // CHECK: memref<2x32xf32>
 

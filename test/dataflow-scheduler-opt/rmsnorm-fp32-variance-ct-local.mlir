@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// RUN: dataflow-scheduler-opt %s -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=spyreop.numeric_cast --implicit-check-not=bufferization.to_tensor
+// RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=spyreop.numeric_cast --implicit-check-not=bufferization.to_tensor
 
 // The variance prefix of GPT-OSS RMSNorm, bf16 [1,2,3072], on one core:
 // DL16 -> Staggered FP32, square, mean over 3072 elements, and epsilon add.
@@ -11,6 +11,8 @@
 // Intermediates use fixed ct_local element offsets. They must survive
 // scheduler scratch allocations and the sum -> scale -> add boundaries.
 
+// SUM uses the sample device test op; sum-opaque.mlir covers opaque lowering.
+
 // CHECK-LABEL: func.func @rmsnorm_variance_ct_local
 // CHECK: call @local_schedule_0
 // CHECK: call @local_schedule_4
@@ -21,7 +23,7 @@
 // CHECK: vectorchain.binary
 // CHECK-SAME: binary_operator mul
 // CHECK-LABEL: func.func @local_schedule_2_body
-// CHECK: vectorchain.scan_with_gap
+// CHECK: "test.simd_reduction_sum_fp32"
 // CHECK-LABEL: func.func @local_schedule_3_body
 // CHECK: %[[STATS_BASE:.*]] = arith.constant 12288 : index
 // CHECK: vectorchain.constant_bitstream {value = [0x39aaaaab]}

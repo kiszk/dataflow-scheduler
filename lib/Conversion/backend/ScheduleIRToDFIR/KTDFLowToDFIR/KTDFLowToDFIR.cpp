@@ -25,6 +25,7 @@
 #include <mlir/Transforms/RegionUtils.h>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
+#include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LogicalMemoryViewBuilder.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/OperationLowerings.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/PreludeWorkPartition.h"
@@ -140,14 +141,7 @@ struct KTDFLowToDFIRPass
     // The lowerings ask the mapping which resource runs an op, so they can size
     // vectors and address memory the way that resource does.
     mlir::ktdf_arch::Mapping mapping(default_device.getRef());
-    // getDefaultCompute assumes a unique kind exists; validate before any
-    // lowering queries that default.
-    auto compute_count = llvm::count_if(mapping.byKind(), [](const auto& kind) {
-      mlir::ktdf_arch::Resource resource = kind.getExemplar();
-      return mlir::isa<mlir::ktdf_arch::ExecutionUnitOp>(resource) &&
-             resource.getFeature<mlir::ktdf_arch::feature::Compute>();
-    });
-    if (compute_count != 1) {
+    if (!getUniqueComputeUnit(mapping.byKind())) {
       mapping.getDevice().getDeclaration().emitError(
           "no (unambiguous) default compute resource");
       signalPassFailure();

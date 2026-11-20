@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// RUN: dataflow-scheduler-opt %s -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=spyreop.numeric_cast --implicit-check-not=bufferization.to_tensor
+// RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=spyreop.numeric_cast --implicit-check-not=bufferization.to_tensor
 
 // The variance prefix of GPT-OSS RMSNorm, bf16 [1,2,2880], on one core:
 // DL16 -> Staggered FP32, square, mean over 2880 elements, and epsilon add.
@@ -8,6 +8,8 @@
 // and the epsilon scalar both require full-stick FP32 broadcast before add.
 // Two rows fit sample_device; real-device coverage uses the original 128 rows.
 // HBM pool offsets are in bytes, as emitted by torch-spyre.
+
+// SUM uses the sample device test op; sum-opaque.mlir covers opaque lowering.
 
 // CHECK-LABEL: func.func @rmsnorm_variance
 // CHECK: call @local_schedule_0
@@ -19,7 +21,7 @@
 // CHECK: vectorchain.binary
 // CHECK-SAME: binary_operator mul
 // CHECK-LABEL: func.func @local_schedule_2_body
-// CHECK: vectorchain.scan_with_gap
+// CHECK: "test.simd_reduction_sum_fp32"
 // CHECK-LABEL: func.func @local_schedule_3_body
 // CHECK: vectorchain.constant_bitstream {value = [0x39b60b61]}
 // CHECK: vectorchain.binary

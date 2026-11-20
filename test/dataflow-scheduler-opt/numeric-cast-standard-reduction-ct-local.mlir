@@ -47,9 +47,7 @@
 // CHECK: scf.for {{.*}} to %[[SIX]]
 // CHECK: dataflow.receive {{.*}}vector<32xf32>
 // CHECK: vectorchain.binary {{.*}}binary_op = #vectorchain<binary_operator add>{{.*}}vector<32xf32>
-// CHECK: vectorchain.multiply_and_accumulate {{.*}}vector<32xf32>
-// CHECK: vectorchain.multiply_and_accumulate {{.*}}vector<32xf32>
-// CHECK: vectorchain.scan_with_gap {{.*}}gap = 8 : index, reduction_op = #vectorchain<binary_operator add>{{.*}}vector<32xf32>
+// CHECK: dataflow.opaque {{.*}}func_name = "simdreduction_sum_fp32"{{.*}}parameter_dictionary = {unroll = "1"}
 // CHECK: dataflow.program_unit iter_arg : %[[LOAD_KEY:.*]] -> (%[[LOAD]])
 // CHECK: %[[LOAD_MAP:.*]] = uniform.def_immutable_mapping([%[[LOAD]] -> %[[L1]]])
 // CHECK: %[[LOAD_MEM:.*]] = uniform.query_map(map:%[[LOAD_MAP]], key:%[[LOAD_KEY]])

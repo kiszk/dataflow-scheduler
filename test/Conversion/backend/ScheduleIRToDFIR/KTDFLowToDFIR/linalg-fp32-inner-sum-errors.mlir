@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // RUN: not dataflow-scheduler-opt %s --split-input-file -ktdflowering-to-dfir 2>&1 | FileCheck %s
 
-// Reject unsupported lane counts rather than emitting an elementwise op.
-// CHECK: error: unsupported inner reduction: expected a 32-lane f32 sum
+// Without a matching device pattern, no inner reduction may fall through to
+// elementwise lowering, even if the scalar body is otherwise supported.
+// A partial register cannot use the full-register SUM template.
+// CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
 ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
@@ -28,7 +30,7 @@ func.func @inner_sum() attributes {grid = [1]} {
 // -----
 
 // A subview at a nonzero lane is not the reduction destination.
-// CHECK: error: unsupported inner reduction: expected a 32-lane f32 sum
+// CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
 ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
@@ -54,7 +56,7 @@ func.func @inner_sum() attributes {grid = [1]} {
 // -----
 
 // An unsupported reduction must not become an elementwise multiply.
-// CHECK: error: unsupported inner reduction: expected a 32-lane f32 sum
+// CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
 ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
@@ -79,8 +81,8 @@ func.func @inner_sum() attributes {grid = [1]} {
 
 // -----
 
-// Load-only units cannot execute the reduction recipe.
-// CHECK: error: f32 inner sum requires a compute unit with 32 SIMD lanes and 4 sub-SIMD lanes
+// A reduction left on a load-only unit must also be rejected.
+// CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
 ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {

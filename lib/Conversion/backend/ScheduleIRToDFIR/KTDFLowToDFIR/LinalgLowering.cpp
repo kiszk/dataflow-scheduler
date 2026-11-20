@@ -292,81 +292,78 @@ struct LowerLinalgGenericPattern
  private:
   mlir::ktdf_arch::Mapping& mapping_;
 
-  // MapReductionPartials leaves the lane reduction as a generic that writes
-  // the head of its input register. It must not become an elementwise add.
-  mlir::LogicalResult lowerInnerSum(mlir::linalg::GenericOp op,
+  // The FP16 opaque min/max template has FP16-only neighbor forwarding and
+  // REDUCE instructions. Use the existing VectorChain recipe for FP32 MAX.
+  mlir::LogicalResult lowerInnerMax(mlir::linalg::GenericOp op,
                                     mlir::PatternRewriter& rewriter) const {
     using namespace mlir;
     if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1)
-      return op.emitError("inner reduction requires one input and output");
+      return op.emitError("FP32 inner max requires one input and output");
     Value input = op.getInputs().front();
     auto type = dyn_cast<MemRefType>(input.getType());
-    auto subview = op.getOutputs().front().getDefiningOp<memref::SubViewOp>();
-    Block& body = op.getRegion().front();
-    auto add = dyn_cast<arith::AddFOp>(body.front());
+    auto head = op.getOutputs().front().getDefiningOp<memref::SubViewOp>();
+    auto& body = op.getRegion().front();
+    auto max = dyn_cast<arith::MaximumFOp>(body.front());
     auto yield = cast<linalg::YieldOp>(body.getTerminator());
     if (!type || !type.hasStaticShape() || !type.getElementType().isF32() ||
-        type.getNumElements() != 32 || type.getShape().back() != 32 ||
-        !subview || subview.getSource() != input ||
-        !subview.getType().hasStaticShape() ||
-        subview.getType().getNumElements() != 1 ||
-        llvm::any_of(subview.getStaticOffsets(),
+        type.getNumElements() != 32 || type.getShape().back() != 32 || !head ||
+        head.getSource() != input || !head.getType().hasStaticShape() ||
+        head.getType().getNumElements() != 1 ||
+        llvm::any_of(head.getStaticOffsets(),
                      [](int64_t n) { return n != 0; }) ||
-        llvm::any_of(subview.getStaticStrides(),
+        llvm::any_of(head.getStaticStrides(),
                      [](int64_t n) { return n != 1; }) ||
-        !llvm::hasSingleElement(body.without_terminator()) || !add ||
-        add.getLhs() != body.getArgument(0) ||
-        add.getRhs() != body.getArgument(1) ||
-        yield.getOperand(0) != add.getResult())
+        !llvm::hasSingleElement(body.without_terminator()) || !max ||
+        !((max.getLhs() == body.getArgument(0) &&
+           max.getRhs() == body.getArgument(1)) ||
+          (max.getRhs() == body.getArgument(0) &&
+           max.getLhs() == body.getArgument(1))) ||
+        yield.getOperand(0) != max.getResult())
       return op.emitError(
-          "unsupported inner reduction: expected a 32-lane f32 sum into "
-          "the input register's head subview");
-
+          "FP32 inner max requires a 32-lane input and its "
+          "zero-offset head subview as output");
     auto program = op->getParentOfType<dataflow::ProgramUnitOp>();
     auto unit = program ? mapping_.resolve<ktdf_arch::ExecutionUnitOp>(program)
                         : ktdf_arch::ExecutionUnitOp();
     auto simd = unit ? unit.getFeature<ktdf_arch::feature::SIMD>()
                      : ktdf_arch::feature::SIMD();
     if (!unit || !unit.getFeature<ktdf_arch::feature::Compute>() || !simd ||
-        simd.getLanes(rewriter.getF32Type()) != 32 ||
-        simd.getSubSimdLanes(rewriter.getF32Type()) != 4)
+        simd.getLanes(type.getElementType()) != 32 ||
+        simd.getSubSimdLanes(type.getElementType()) != 4)
       return op.emitError(
-          "f32 inner sum requires a compute unit with 32 SIMD lanes and "
-          "4 sub-SIMD lanes");
+          "FP32 inner max requires 32 SIMD lanes and "
+          "4 sub-SIMD lanes on the compute unit");
 
-    Location loc = op.getLoc();
-    auto vector = VectorType::get({32}, rewriter.getF32Type());
-    auto ones = arith::ConstantOp::create(
-        rewriter, loc,
-        DenseElementsAttr::get(vector, rewriter.getF32FloatAttr(1.0)));
+    auto vector = VectorType::get({32}, type.getElementType());
     auto identity = rewriter.getDimIdentityMap();
-    // Neighbor forwarding first sums pairs, then puts each four-lane group's
-    // sum in its head. The two forwarding modes use MAC ports 0 and 2.
-    const int32_t neighbor_indices[][4] = {{1, 0, 3, 3}, {2, 0, 1, 3}};
-    for (auto [step, indices] : llvm::enumerate(neighbor_indices)) {
-      Value value = scheduler::emitVectorLoad(rewriter, loc, vector, input);
+    const int32_t neighbors[][4] = {{1, 0, 3, 3}, {2, 0, 1, 3}};
+    for (auto [step, indices] : llvm::enumerate(neighbors)) {
+      auto value =
+          scheduler::emitVectorLoad(rewriter, op.getLoc(), vector, input);
       auto neighbor = vectorchain::ShuffleOp::create(
-          rewriter, loc, vector, value, ValueRange{}, ValueRange{}, nullptr,
-          nullptr, rewriter.getI32ArrayAttr(indices), 8);
-      // The target tracks operand reuse by load operation. The forwarded and
-      // ordinary ports need distinct loads even though they read one register.
-      Value plain = scheduler::emitVectorLoad(rewriter, loc, vector, input);
-      auto sum = vectorchain::MultiplyAndAccumulateOp::create(
-          rewriter, loc, vector, step == 0 ? neighbor.getResult() : plain,
-          ones.getResult(), step == 0 ? plain : neighbor.getResult(), nullptr,
-          nullptr, identity);
-      scheduler::emitVectorStore(rewriter, loc, sum.getResult(), input);
+          rewriter, op.getLoc(), vector, value, ValueRange{}, ValueRange{},
+          nullptr, nullptr, rewriter.getI32ArrayAttr(indices), 8);
+      // Separate loads preserve the ordinary and neighbor-forwarded ports.
+      auto plain =
+          scheduler::emitVectorLoad(rewriter, op.getLoc(), vector, input);
+      auto partial = vectorchain::BinaryOp::create(
+          rewriter, op.getLoc(), vector,
+          step == 0 ? neighbor.getResult() : plain,
+          step == 0 ? plain : neighbor.getResult(), nullptr, nullptr,
+          vectorchain::VectorChainBinaryOperator::max, identity);
+      scheduler::emitVectorStore(rewriter, op.getLoc(), partial.getResult(),
+                                 input);
     }
-    Value partial = scheduler::emitVectorLoad(rewriter, loc, vector, input);
-    // Match the target's REDUCE recipe: combine the eight sub-SIMD groups.
-    // Only lane 0 is the logical result; the rest is whole-stick padding.
-    auto sum = vectorchain::ScanWithGapOp::create(
-        rewriter, loc, vector, partial, nullptr,
-        vectorchain::VectorChainBinaryOperator::add, llvm::APInt(64, 8),
+    auto partial =
+        scheduler::emitVectorLoad(rewriter, op.getLoc(), vector, input);
+    auto reduced = vectorchain::ScanWithGapOp::create(
+        rewriter, op.getLoc(), vector, partial, nullptr,
+        vectorchain::VectorChainBinaryOperator::max, llvm::APInt(64, 8),
         vectorchain::VectorChainScanOpEvalOrders::left_to_right);
-    scheduler::emitVectorStore(rewriter, loc, sum.getResult(), input);
+    scheduler::emitVectorStore(rewriter, op.getLoc(), reduced.getResult(),
+                               input);
     rewriter.eraseOp(op);
-    if (subview->use_empty()) rewriter.eraseOp(subview);
+    if (head->use_empty()) rewriter.eraseOp(head);
     return success();
   }
 
@@ -384,8 +381,16 @@ struct LowerLinalgGenericPattern
         auto lane = mlir::dyn_cast<mlir::AffineDimExpr>(
             map.getResult(map.getNumResults() - 1));
         if (lane && generic_op.getIteratorTypesArray()[lane.getPosition()] ==
-                        mlir::utils::IteratorType::reduction)
-          return lowerInnerSum(generic_op, rewriter);
+                        mlir::utils::IteratorType::reduction) {
+          auto type = mlir::cast<mlir::ShapedType>(
+              generic_op.getInputs().front().getType());
+          if (type.getElementType().isF32() &&
+              mlir::isa<mlir::arith::MaximumFOp>(generic_op.getBody()->front()))
+            return lowerInnerMax(generic_op, rewriter);
+          return generic_op.emitError(
+              "inner reduction must be lowered by device patterns before "
+              "DataflowIR conversion");
+        }
       }
     }
 

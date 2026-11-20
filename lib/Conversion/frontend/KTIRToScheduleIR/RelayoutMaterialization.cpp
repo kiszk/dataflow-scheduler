@@ -30,6 +30,7 @@
 #include <mlir/Dialect/Utils/StaticValueUtils.h>
 #include <mlir/IR/PatternMatch.h>
 
+#include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/PipelineBuilder.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
@@ -661,19 +662,12 @@ LogicalResult scheduler::materializeRelayouts(func::FuncOp func,
       func.getContext(), ktdp::MemorySpaceKind::ct_local, -1));
   IRRewriter rw(func);
   if (!requests.empty()) {
-    Attribute compute;
-    for (const auto& kind : mapping.byKind()) {
-      auto unit = dyn_cast<ktdf_arch::ExecutionUnitOp>(
-          kind.getExemplar().getOperation());
-      if (unit && unit.getFeature<ktdf_arch::feature::Compute>()) {
-        if (compute)
-          return func.emitError("relayout requires one default compute kind");
-        compute = unit.getKind();
-      }
-    }
-    if (!compute) return func.emitError("relayout requires a compute route");
+    auto compute = getUniqueComputeUnit(mapping.byKind());
+    if (!compute)
+      return func.emitError("relayout requires one default compute kind");
     for (auto [generic, direction] : requests)
-      if (failed(materialize(generic, direction, rw, local, compute, spaces)))
+      if (failed(materialize(generic, direction, rw, local, compute.getKind(),
+                             spaces)))
         return failure();
   }
   return isolatePacketComputes(func, rw, local);

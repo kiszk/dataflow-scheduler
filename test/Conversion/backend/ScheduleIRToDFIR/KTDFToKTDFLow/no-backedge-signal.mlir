@@ -1,5 +1,7 @@
 // RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdf-to-ktdflowering)"  -allow-unregistered-dialect %s | FileCheck %s
 
+// The independent broadcast preload needs entry/completion barriers for its
+// readers. No loop-carried backedge signal is needed inside the tiled pipeline.
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1) -> (d0 * 2 + d1)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d2, d3, d4)>
@@ -87,6 +89,7 @@
 // CHECK-NEXT:           ktdf.data_transfer from %[[CAST_1]]{{\[}}%[[CONSTANT_19]], %[[CONSTANT_19]]] size [1, 64] to %[[UNREALIZED_CONVERSION_CAST_0]][0, 0] size [1, 64] : memref<1x64xf16, strided<[64, 1], offset: ?>, "DDR">, memref<1x64xf16, "L1">
 // CHECK-NEXT:         }
 // CHECK-NEXT:       }
+// CHECK-NEXT:       ktdf_lowering.signal %[[QUERY_MAP_0]], %[[QUERY_MAP_2]], %[[QUERY_MAP_3]]
 // CHECK-NEXT:       %[[CONSTANT_27:.*]] = arith.constant 128 : index
 // CHECK-NEXT:       %[[UNREALIZED_CONVERSION_CAST_1:.*]] = builtin.unrealized_conversion_cast %[[CONSTANT_27]] : index to memref<2x2x1x1x1x64xf16, "L1">
 // CHECK-NEXT:       %[[CAST_3:.*]] = memref.cast %[[UNREALIZED_CONVERSION_CAST_1]] : memref<2x2x1x1x1x64xf16, "L1"> to memref<?x?x1x1x1x64xf16, "L1">
@@ -165,6 +168,7 @@
 // CHECK-NEXT:           }
 // CHECK-NEXT:         }
 // CHECK-NEXT:       }
+// CHECK-NEXT:       ktdf_lowering.signal %[[QUERY_MAP_0]], %[[QUERY_MAP_2]], %[[QUERY_MAP_3]]
 // CHECK-NEXT:       return
 // CHECK-NEXT:     }
 // CHECK-NEXT:   }
