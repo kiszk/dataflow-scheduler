@@ -27,6 +27,8 @@
 #include <mlir/IR/Location.h>
 #include <mlir/IR/Operation.h>
 
+#include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
+
 using namespace scheduler;
 
 void scheduler::printLocation(llvm::raw_ostream& OS, mlir::Operation* op) {
@@ -46,12 +48,15 @@ auto scheduler::tryGetSizeInBits(mlir::Type type) -> std::optional<unsigned> {
   return llvm::TypeSwitch<mlir::Type, std::optional<unsigned>>(type)
       .Case([](mlir::IntegerType type) -> unsigned { return type.getWidth(); })
       .Case([](mlir::FloatType type) -> unsigned { return type.getWidth(); })
+      .Case([](mlir::spyreop::DF16Type) -> unsigned { return 16; })
       .Case([](mlir::VectorType type) -> std::optional<unsigned> {
         if (!type.hasStaticShape()) {
           return std::nullopt;
         }
 
-        return type.getNumElements() * type.getElementTypeBitWidth();
+        auto bits = tryGetSizeInBits(type.getElementType());
+        return bits ? std::optional<unsigned>(type.getNumElements() * *bits)
+                    : std::nullopt;
       })
       .Default(std::nullopt);
 }

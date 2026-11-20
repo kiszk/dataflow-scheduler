@@ -120,7 +120,9 @@ static bool matchAbsMaxOperands(mlir::arith::MaxNumFOp maxnum_op,
 /// Pattern to lower linalg.generic compute operations
 struct LowerLinalgGenericPattern
     : public mlir::OpRewritePattern<mlir::linalg::GenericOp> {
-  using OpRewritePattern::OpRewritePattern;
+  LowerLinalgGenericPattern(mlir::MLIRContext* context,
+                            mlir::ktdf_arch::Mapping& mapping)
+      : OpRewritePattern(context), mapping_(mapping) {}
 
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
@@ -136,8 +138,8 @@ struct LowerLinalgGenericPattern
 
     // ReductionLoopExposure and MapReductionPartials run before this pass and
     // rewrite every tensor-semantics linalg.generic with reduction dims into
-    // explicit scf.for loops, leaving only parallel iterators here. Nothing
-    // below lowers a reduction, and the elementwise path would take one for an
+    // explicit scf.for loops, leaving only parallel iterators here. The tensor
+    // path below would take a remaining reduction for an
     // elementwise op and give a wrong answer, so say so rather than assert it:
     // an assert is gone in a release build and the fall-through is silent.
     if (llvm::any_of(generic_op.getIteratorTypesArray(), [](auto iter_type) {
@@ -185,6 +187,12 @@ struct LowerLinalgGenericPattern
           mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
               .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
                 return lowerMulFOp(op, rewriter, identity_map);
+              })
+              .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, false);
+              })
+              .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
               })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
@@ -282,6 +290,83 @@ struct LowerLinalgGenericPattern
   }
 
  private:
+  mlir::ktdf_arch::Mapping& mapping_;
+
+  // The FP16 opaque min/max template has FP16-only neighbor forwarding and
+  // REDUCE instructions. Use the existing VectorChain recipe for FP32 MAX.
+  mlir::LogicalResult lowerInnerMax(mlir::linalg::GenericOp op,
+                                    mlir::PatternRewriter& rewriter) const {
+    using namespace mlir;
+    if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1)
+      return op.emitError("FP32 inner max requires one input and output");
+    Value input = op.getInputs().front();
+    auto type = dyn_cast<MemRefType>(input.getType());
+    auto head = op.getOutputs().front().getDefiningOp<memref::SubViewOp>();
+    auto& body = op.getRegion().front();
+    auto max = dyn_cast<arith::MaximumFOp>(body.front());
+    auto yield = cast<linalg::YieldOp>(body.getTerminator());
+    if (!type || !type.hasStaticShape() || !type.getElementType().isF32() ||
+        type.getNumElements() != 32 || type.getShape().back() != 32 || !head ||
+        head.getSource() != input || !head.getType().hasStaticShape() ||
+        head.getType().getNumElements() != 1 ||
+        llvm::any_of(head.getStaticOffsets(),
+                     [](int64_t n) { return n != 0; }) ||
+        llvm::any_of(head.getStaticStrides(),
+                     [](int64_t n) { return n != 1; }) ||
+        !llvm::hasSingleElement(body.without_terminator()) || !max ||
+        !((max.getLhs() == body.getArgument(0) &&
+           max.getRhs() == body.getArgument(1)) ||
+          (max.getRhs() == body.getArgument(0) &&
+           max.getLhs() == body.getArgument(1))) ||
+        yield.getOperand(0) != max.getResult())
+      return op.emitError(
+          "FP32 inner max requires a 32-lane input and its "
+          "zero-offset head subview as output");
+    auto program = op->getParentOfType<dataflow::ProgramUnitOp>();
+    auto unit = program ? mapping_.resolve<ktdf_arch::ExecutionUnitOp>(program)
+                        : ktdf_arch::ExecutionUnitOp();
+    auto simd = unit ? unit.getFeature<ktdf_arch::feature::SIMD>()
+                     : ktdf_arch::feature::SIMD();
+    if (!unit || !unit.getFeature<ktdf_arch::feature::Compute>() || !simd ||
+        simd.getLanes(type.getElementType()) != 32 ||
+        simd.getSubSimdLanes(type.getElementType()) != 4)
+      return op.emitError(
+          "FP32 inner max requires 32 SIMD lanes and "
+          "4 sub-SIMD lanes on the compute unit");
+
+    auto vector = VectorType::get({32}, type.getElementType());
+    auto identity = rewriter.getDimIdentityMap();
+    const int32_t neighbors[][4] = {{1, 0, 3, 3}, {2, 0, 1, 3}};
+    for (auto [step, indices] : llvm::enumerate(neighbors)) {
+      auto value =
+          scheduler::emitVectorLoad(rewriter, op.getLoc(), vector, input);
+      auto neighbor = vectorchain::ShuffleOp::create(
+          rewriter, op.getLoc(), vector, value, ValueRange{}, ValueRange{},
+          nullptr, nullptr, rewriter.getI32ArrayAttr(indices), 8);
+      // Separate loads preserve the ordinary and neighbor-forwarded ports.
+      auto plain =
+          scheduler::emitVectorLoad(rewriter, op.getLoc(), vector, input);
+      auto partial = vectorchain::BinaryOp::create(
+          rewriter, op.getLoc(), vector,
+          step == 0 ? neighbor.getResult() : plain,
+          step == 0 ? plain : neighbor.getResult(), nullptr, nullptr,
+          vectorchain::VectorChainBinaryOperator::max, identity);
+      scheduler::emitVectorStore(rewriter, op.getLoc(), partial.getResult(),
+                                 input);
+    }
+    auto partial =
+        scheduler::emitVectorLoad(rewriter, op.getLoc(), vector, input);
+    auto reduced = vectorchain::ScanWithGapOp::create(
+        rewriter, op.getLoc(), vector, partial, nullptr,
+        vectorchain::VectorChainBinaryOperator::max, llvm::APInt(64, 8),
+        vectorchain::VectorChainScanOpEvalOrders::left_to_right);
+    scheduler::emitVectorStore(rewriter, op.getLoc(), reduced.getResult(),
+                               input);
+    rewriter.eraseOp(op);
+    if (head->use_empty()) rewriter.eraseOp(head);
+    return success();
+  }
+
   // Lowers a linalg.generic with buffer semantics (memref init operand).
   // The resulting accumulated vector is written back to the output buffer via
   // agen.vector_store.
@@ -289,6 +374,25 @@ struct LowerLinalgGenericPattern
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const {
     mlir::Location loc = generic_op.getLoc();
+
+    if (!generic_op.getInputs().empty()) {
+      auto map = generic_op.getIndexingMapsArray().front();
+      if (map.getNumResults()) {
+        auto lane = mlir::dyn_cast<mlir::AffineDimExpr>(
+            map.getResult(map.getNumResults() - 1));
+        if (lane && generic_op.getIteratorTypesArray()[lane.getPosition()] ==
+                        mlir::utils::IteratorType::reduction) {
+          auto type = mlir::cast<mlir::ShapedType>(
+              generic_op.getInputs().front().getType());
+          if (type.getElementType().isF32() &&
+              mlir::isa<mlir::arith::MaximumFOp>(generic_op.getBody()->front()))
+            return lowerInnerMax(generic_op, rewriter);
+          return generic_op.emitError(
+              "inner reduction must be lowered by device patterns before "
+              "DataflowIR conversion");
+        }
+      }
+    }
 
     mlir::Block& body = generic_op.getRegion().front();
     auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
@@ -356,6 +460,12 @@ struct LowerLinalgGenericPattern
               .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
                 return lowerMulFOp(op, rewriter, identity_map);
               })
+              .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, false);
+              })
+              .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
+              })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
               })
@@ -384,6 +494,10 @@ struct LowerLinalgGenericPattern
               })
               .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
                 return lowerSelectOp(op, rewriter);
+              })
+              .Case<mlir::dataflow::OpaqueOp>([&](mlir::dataflow::OpaqueOp op) {
+                rewriter.moveOpBefore(op, generic_op);
+                return mlir::success();
               })
               .Case<mlir::spyreop::Identity>([&](mlir::spyreop::Identity op) {
                 return lowerIdentity(op, rewriter, identity_map);
@@ -615,18 +729,47 @@ struct LowerLinalgGenericPattern
     return mlir::success();
   }
 
+  mlir::LogicalResult lowerUnaryFOp(mlir::Operation* op, mlir::Value input,
+                                    mlir::PatternRewriter& rewriter,
+                                    bool floor) const {
+    auto type = mlir::dyn_cast<mlir::VectorType>(input.getType());
+    if (!type) return mlir::failure();
+    mlir::Value output =
+        floor ? mlir::vectorchain::FloorOp::create(rewriter, op->getLoc(), type,
+                                                   input, nullptr, nullptr)
+                    .getData()
+              : mlir::vectorchain::NegOp::create(rewriter, op->getLoc(), type,
+                                                 input, nullptr, nullptr)
+                    .getData();
+    rewriter.replaceOp(op, output);
+    return mlir::success();
+  }
+
   // Unified helper: lowers any two-operand arith float op to
   // vectorchain.binary with the given binary_kind.
   mlir::LogicalResult lowerBinaryFOp(
       mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
       mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
       mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
-    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(lhs.getType());
+    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(
+        mlir::isa<mlir::ShapedType>(lhs.getType()) ? lhs.getType()
+                                                   : rhs.getType());
     if (!lhs_ty) {
       return llvm::failure();
     }
     auto vector_type = getFlattenedVectorType(lhs_ty);
     if (!vector_type) return mlir::failure();
+
+    for (mlir::Value* operand : {&lhs, &rhs}) {
+      if (mlir::isa<mlir::ShapedType>(operand->getType())) continue;
+      auto constant = operand->getDefiningOp<mlir::arith::ConstantOp>();
+      if (!constant || constant.getType() != vector_type.getElementType())
+        return rewriter.notifyMatchFailure(
+            op, "expected a vector or scalar constant");
+      *operand = mlir::arith::ConstantOp::create(
+          rewriter, op->getLoc(),
+          mlir::DenseElementsAttr::get(vector_type, constant.getValue()));
+    }
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
         rewriter, op->getLoc(), vector_type, lhs, rhs,
@@ -802,7 +945,8 @@ struct LowerLinalgFillPattern
 }  // namespace
 
 void scheduler::populateLinalgLoweringPatterns(
-    mlir::RewritePatternSet& patterns, SymbolAllocator& symbols) {
-  patterns.add<LowerLinalgGenericPattern>(patterns.getContext());
+    mlir::RewritePatternSet& patterns, SymbolAllocator& symbols,
+    mlir::ktdf_arch::Mapping& mapping) {
+  patterns.add<LowerLinalgGenericPattern>(patterns.getContext(), mapping);
   patterns.add<LowerLinalgFillPattern>(patterns.getContext(), symbols);
 }

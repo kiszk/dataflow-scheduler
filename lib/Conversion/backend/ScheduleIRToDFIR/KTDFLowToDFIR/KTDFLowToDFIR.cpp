@@ -25,6 +25,7 @@
 #include <mlir/Transforms/RegionUtils.h>
 
 #include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
+#include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LogicalMemoryViewBuilder.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/OperationLowerings.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/PreludeWorkPartition.h"
@@ -43,8 +44,11 @@
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
+#include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -80,6 +84,44 @@ static void canonicalizeFunc(mlir::func::FuncOp func) {
   (void)mlir::applyPatternsGreedily(func, frozen);
 }
 
+// AGEN subscripts accept induction variables and constants. Resolve per-unit
+// coordinates before handing such accesses to the target backend. This also
+// lets ordinary canonicalization remove empty core partitions and fold their
+// bounds; it does not change the ownership or ordering of any transfer.
+static void specializeUniformAccesses(mlir::func::FuncOp func) {
+  bool needs_specialization = false;
+  func.walk([&](mlir::Operation* op) {
+    if (!mlir::isa<mlir::agen::VectorLoadOp, mlir::agen::VectorStoreOp,
+                   mlir::agen::CompositeLoadAndStoreOp>(op))
+      return;
+    for (mlir::Value operand : op->getOperands()) {
+      if (operand.getDefiningOp<mlir::uniform::QueryMapOp>())
+        needs_specialization = true;
+    }
+  });
+  if (!needs_specialization) return;
+  llvm::SmallVector<mlir::dataflow::ProgramUnitOp> programs;
+  func.walk([&](mlir::dataflow::ProgramUnitOp op) { programs.push_back(op); });
+  mlir::IRRewriter rewriter(func.getContext());
+  for (auto program : programs) {
+    rewriter.setInsertionPoint(program);
+    for (mlir::Value unit : program.getUnits()) {
+      auto copy =
+          mlir::cast<mlir::dataflow::ProgramUnitOp>(rewriter.clone(*program));
+      copy.getUnitsMutable().assign(mlir::ValueRange{unit});
+      copy.getRegion().front().getArgument(0).replaceAllUsesWith(unit);
+      copy.walk([&](mlir::uniform::QueryMapOp query) {
+        auto map = query.getMap()
+                       .getDefiningOp<mlir::uniform::DefImmutableMappingOp>();
+        if (map)
+          if (auto value = map.getValue(query.getKey()))
+            rewriter.replaceOp(query, *value);
+      });
+    }
+    rewriter.eraseOp(program);
+  }
+}
+
 struct KTDFLowToDFIRPass
     : public impl::KTDFLowToDFIRPassBase<KTDFLowToDFIRPass> {
   KTDFLowToDFIRPass(const SchedulerExtContext& scheduler_ctx)
@@ -99,7 +141,7 @@ struct KTDFLowToDFIRPass
     // The lowerings ask the mapping which resource runs an op, so they can size
     // vectors and address memory the way that resource does.
     mlir::ktdf_arch::Mapping mapping(default_device.getRef());
-    if (!mapping.byKind().getDefaultCompute()) {
+    if (!getUniqueComputeUnit(mapping.byKind())) {
       mapping.getDevice().getDeclaration().emitError(
           "no (unambiguous) default compute resource");
       signalPassFailure();
@@ -118,6 +160,18 @@ struct KTDFLowToDFIRPass
     module_op.walk([&](mlir::func::FuncOp func) { funcs.push_back(func); });
     for (auto func : funcs) {
       LDBG(1) << "Running " << PASS_NAME << " on " << func.getName();
+
+      // DFIR uses f16 as its native SEN169 storage carrier. Keep df16 through
+      // scheduling, then lower its representation here. numeric_cast_value
+      // still selects native FCVT; this is not an IEEE numerical conversion.
+      mlir::AttrTypeReplacer storage_types;
+      storage_types.addReplacement(
+          [](mlir::spyreop::DF16Type type) -> mlir::Type {
+            return mlir::Float16Type::get(type.getContext());
+          });
+      storage_types.recursivelyReplaceElementsIn(func, /*replaceAttrs=*/true,
+                                                 /*replaceLocs=*/false,
+                                                 /*replaceTypes=*/true);
 
       auto split = partitionPreludeAndWork(func);
       if (split.work_ops.empty()) {
@@ -167,6 +221,7 @@ struct KTDFLowToDFIRPass
       // emitted DFIR has no dead/duplicate/foldable leftovers (duplicate
       // folded constants from query-map collapse, addi(const,const), dead
       // NoMemoryEffect ops).
+      specializeUniformAccesses(func);
       canonicalizeFunc(func);
     }
   }

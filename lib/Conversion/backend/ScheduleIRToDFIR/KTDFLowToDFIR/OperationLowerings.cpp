@@ -27,6 +27,7 @@
 #include <llvm/ADT/StringExtras.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/BuiltinAttributes.h>
@@ -42,6 +43,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/BufferPhaseLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LinalgLowering.h"
+#include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/NumericCastLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/ParallelLowering.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/UniformInfra.h"
@@ -926,7 +928,8 @@ mlir::LogicalResult scheduler::runOperationLowerings(
     SymbolAllocator& symbols) {
   // Lower linalg.generic compute operations and FIFO operations
   mlir::RewritePatternSet patterns(func.getContext());
-  populateLinalgLoweringPatterns(patterns, symbols);
+  populateNumericCastLoweringPatterns(patterns, components, mapping);
+  populateLinalgLoweringPatterns(patterns, symbols, mapping);
   patterns.add<LowerMemRefCopyFromFifoPattern>(func.getContext());
   patterns.add<LowerReadFromFifoPattern>(func.getContext(), mapping.byKind(),
                                          components);
@@ -951,13 +954,14 @@ mlir::LogicalResult scheduler::runOperationLowerings(
     return mlir::failure();
   }
 
-  // After all lowering helpers have run, no ktdf or ktdf_lowering op should
-  // survive. Use an empty conversion with both dialects marked illegal so any
+  // After all lowering helpers have run, no ktdf, ktdf_lowering or generic op
+  // should survive. Use an empty conversion marking them illegal so any
   // survivor produces an explicit error rather than silently passing through.
   mlir::ConversionTarget target(*func.getContext());
   target.addIllegalDialect<mlir::ktdf::KTDFDialect,
                            mlir::ktdf_lowering::KTDFLoweringDialect,
                            mlir::ktdp_lowering::KTDPLoweringDialect>();
+  target.addIllegalOp<mlir::linalg::GenericOp>();
   target.markUnknownOpDynamicallyLegal([](mlir::Operation*) { return true; });
   if (mlir::failed(mlir::applyPartialConversion(
           func, target,

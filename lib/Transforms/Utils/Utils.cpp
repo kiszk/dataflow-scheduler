@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cassert>
 
+#include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -163,7 +164,11 @@ void scheduler::eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots) {
 
 int64_t scheduler::getVectorLanes(mlir::Type elem_type,
                                   mlir::ktdf_arch::ExecutionUnitOp compute) {
-  return std::max(
-      compute.getFeature<mlir::ktdf_arch::feature::SIMD>().getLanes(elem_type),
-      static_cast<int64_t>(1));
+  auto simd = compute.getFeature<mlir::ktdf_arch::feature::SIMD>();
+  int64_t lanes = simd.getLanes(elem_type);
+  // Existing devices describe the native 16-bit datapath under the DFIR f16
+  // carrier. This lookup sizes packets; it does not change the numeric type.
+  if (!lanes && mlir::isa<mlir::spyreop::DF16Type>(elem_type))
+    lanes = simd.getLanes(mlir::Float16Type::get(elem_type.getContext()));
+  return std::max(lanes, int64_t{1});
 }

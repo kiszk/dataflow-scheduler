@@ -214,6 +214,21 @@ ktdf_arch.device @sample_device {
   // allocated as a single element of the compute type -- how many lanes one
   // holds is the scheduler's to fill in.
   patterns ["pre_scheduling"] {
+    // A fractional FP32 scale needs a register; it is not a MAC immediate.
+    pdl.pattern : benefit(1) {
+      %f32 = type : f32
+      %value = attribute
+      %constant = operation "arith.constant" {"value" = %value}
+        -> (%f32 : !pdl.type)
+      apply_native_constraint "ktdf.needs_constant_register"(%constant : !pdl.operation)
+      rewrite {
+        %bank = attribute = "SFU_REG"
+        %mapped = operation "arith.constant"
+          {"value" = %value, "ktdf_arch.maps_to" = %bank} -> (%f32 : !pdl.type)
+        replace %constant with %mapped
+      }
+    }
+
     pdl.pattern : benefit(1) {
       %f16 = type : f16
       %in = operand : %f16
@@ -262,18 +277,57 @@ ktdf_arch.device @sample_device {
   }
 
   patterns ["post_scheduling"] {
-    // SUM  →  simdreduction_sum
+    // A sub-SIMD shuffle must finish in a register before arithmetic reads it.
+    pdl.pattern : benefit(1) {
+      %slot = operand
+      %type = type
+      %mode = attribute
+      %read = operation "ktdf.read_from_fifo" (%slot : !pdl.value)
+        {"splat" = %mode} -> (%type : !pdl.type)
+      apply_native_constraint "ktdf.is_tensor_type"(%type : !pdl.type)
+      rewrite {
+        %bank = attribute = "SFU_REG"
+        %reg_type = apply_native_rewrite "ktdf.memref_type_in_space"(%type, %bank : !pdl.type, !pdl.attribute) : !pdl.type
+        %alloc = operation "memref.alloc" -> (%reg_type : !pdl.type)
+        %reg = result 0 of %alloc
+        %input = apply_native_rewrite "ktdf.memref_read_from_fifo"(%read : !pdl.operation) : !pdl.value
+        %copy = operation "memref.copy" (%input, %reg : !pdl.value, !pdl.value)
+        %view = operation "bufferization.to_tensor" (%reg : !pdl.value) -> (%type : !pdl.type)
+        replace %read with %view
+      }
+    }
+
+    // FP16 SUM -> test.simd_reduction_sum
     pdl.pattern : benefit(1) {
       %in  = operand
       %acc = operand
       %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
       apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
       %expected_kind = attribute = "sum"
-      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind : !pdl.operation, !pdl.attribute)
+      %element_type = type : f16
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind, %element_type : !pdl.operation, !pdl.attribute, !pdl.type)
 
       rewrite {
         %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
         %new_op = operation "test.simd_reduction_sum"
+          (%in, %acc_src : !pdl.value, !pdl.value)
+        replace %generic with %new_op
+      }
+    }
+
+    // FP32 SUM -> test.simd_reduction_sum_fp32
+    pdl.pattern : benefit(1) {
+      %in  = operand
+      %acc = operand
+      %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
+      apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
+      %expected_kind = attribute = "sum"
+      %element_type = type : f32
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind, %element_type : !pdl.operation, !pdl.attribute, !pdl.type)
+
+      rewrite {
+        %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
+        %new_op = operation "test.simd_reduction_sum_fp32"
           (%in, %acc_src : !pdl.value, !pdl.value)
         replace %generic with %new_op
       }

@@ -130,8 +130,7 @@ static int64_t computeRequiredLoadElements(
   const size_t word_size = load_feature.getWordSize(memory_space);
   if (word_size == 0) return src_elements;
 
-  const size_t elem_bytes =
-      (static_cast<size_t>(elem_type.getIntOrFloatBitWidth()) + 7) / 8;
+  const size_t elem_bytes = scheduler::tryGetSizeInBytes(elem_type).value_or(0);
   if (elem_bytes == 0) return src_elements;
 
   // How many bus words are needed to cover all requested bytes?

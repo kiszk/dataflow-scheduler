@@ -53,6 +53,7 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
+#include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 
 using namespace scheduler;
@@ -255,6 +256,17 @@ auto scheduler::getThrottle(mlir::Operation* op) -> int64_t {
   return attr ? attr.getValue() : std::numeric_limits<int64_t>::max();
 };
 
+/// Native casts exchange one packet per SSA value. Their input and output
+/// packet sizes differ, so a single operation-wide limit is insufficient.
+[[nodiscard]] static auto getValueThrottle(mlir::Operation* op, mlir::Type type)
+    -> int64_t {
+  const auto limit = getThrottle(op);
+  if (mlir::isa<mlir::ktdf_lowering::NumericCastValueOp>(op))
+    return std::min(limit,
+                    mlir::cast<mlir::RankedTensorType>(type).getNumElements());
+  return limit;
+}
+
 /// Whether @p op only moves data and passes on the throttle around it.
 [[nodiscard]] static auto isThrottleTransparent(mlir::Operation* op) -> bool {
   return !op->hasAttr(kThrottleAttrName) &&
@@ -268,7 +280,7 @@ auto scheduler::getThrottle(mlir::OpResult result) -> int64_t {
   for (auto* user : result.getUsers()) {
     min = std::min(min, isThrottleTransparent(user)
                             ? getThrottle(user->getOpResult(0))
-                            : getThrottle(user));
+                            : getValueThrottle(user, result.getType()));
   }
   return min;
 };
@@ -281,7 +293,7 @@ auto scheduler::getThrottle(mlir::OpOperand& operand) -> int64_t {
 
   auto* const producer = result.getOwner();
   if (!isThrottleTransparent(producer)) {
-    return getThrottle(producer);
+    return getValueThrottle(producer, result.getType());
   }
 
   // An `insert_slice` combines its source and destination.
@@ -557,6 +569,9 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     }
     auto insert_slice = nest->insert_slice;
     auto outermost = nest->outermost;
+    const bool more_inserts =
+        nest->is_update &&
+        insert_slice.getDest().getDefiningOp<mlir::tensor::InsertSliceOp>();
 
     // Map the inserted slice onto the stored tensor.
     auto slice = getSlice(insert_slice);
@@ -604,7 +619,7 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
 
     // Reshape the tile, and add the hops back in, counting the store as one.
     rewriter.setInsertionPointAfter(insert_slice);
-    if (has_reshape) {
+    if (has_reshape || nest->is_update) {
       stored =
           reshapeTo(rewriter, store.getLoc(), stored, getSliceShape(slice));
     }
@@ -627,7 +642,24 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
 
     // The loop nest no longer produces the data, and remaining users must now
     // load it again from memory.
-    if (outermost && nest->is_update) {
+    if (outermost && nest->is_update && !more_inserts) {
+      // Partial updates retain the incoming tensor, including when the loop
+      // executes zero times. Preserve it before writing this nest's slices.
+      // If it is another update nest, the residual store is tiled in turn,
+      // retaining every preceding segment of a loop-result chain.
+      mlir::Value initial = outermost.getTiedLoopInit(nest->result)->get();
+      if (!initial.getDefiningOp<mlir::tensor::EmptyOp>()) {
+        rewriter.setInsertionPoint(outermost);
+        initial = reshapeTo(rewriter, store.getLoc(), initial,
+                            store.getDataTile().getType().getShape());
+        if (via) {
+          initial = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), initial,
+                                              via.getHops());
+        }
+        auto initial_store =
+            mlir::cast<mlir::ktdp::StoreOp>(rewriter.clone(*store));
+        initial_store.getDataTileMutable().assign(initial);
+      }
       rewriter.setInsertionPointAfter(outermost);
       auto reloaded = mlir::ktdp::LoadOp::create(rewriter, store.getLoc(),
                                                  store.getDataTile().getType(),
@@ -638,7 +670,9 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
               rewriter, store.getLoc(), reloaded,
               llvm::cast<mlir::ShapedType>(nest->result.getType()).getShape()));
     }
-    rewriter.eraseOp(store);
+    // Peel a chain one insertion at a time. The next rewrite sinks the
+    // preceding insertion before this store, preserving overlapping updates.
+    if (!more_inserts) rewriter.eraseOp(store);
     return llvm::success();
   }
 
@@ -690,7 +724,12 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     if (!nest.insert_slice) {
       return llvm::failure();
     }
-    nest.is_update = iter_arg && nest.insert_slice.getDest() == iter_arg;
+    mlir::Value dest = nest.insert_slice.getDest();
+    while (auto previous = dest.getDefiningOp<mlir::tensor::InsertSliceOp>()) {
+      if (!previous->hasOneUse()) break;
+      dest = previous.getDest();
+    }
+    nest.is_update = iter_arg && dest == iter_arg;
     return nest;
   }
 
@@ -805,6 +844,12 @@ struct LowerStoreFromLoad
     if (!load) {
       return rewriter.notifyMatchFailure(store, "does not load from memory");
     }
+
+    // Access tiles still need bufferization before they can be transfer
+    // endpoints.
+    if (!mlir::isa<MemRef>(load.getSource()) ||
+        !mlir::isa<MemRef>(store.getDest()))
+      return rewriter.notifyMatchFailure(store, "not bufferized");
 
     const auto load_access = createTransferAccess(rewriter, getSlice(load));
     const auto store_access = createTransferAccess(rewriter, getSlice(store));

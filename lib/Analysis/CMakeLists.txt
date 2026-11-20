@@ -20,6 +20,7 @@ add_dataflow_scheduler_library(DataflowSchedulerAnalysis
     DataflowSchedulerDialects::KTDFArchAnalysis
     DataflowScheduler::ArchViews
     KTIR::KtdpDialect
+    KTIR::SpyreOpDialect
 
   LINK_MLIR_LIBS
     MLIRAnalysis

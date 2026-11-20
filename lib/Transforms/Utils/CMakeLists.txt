@@ -11,6 +11,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransformUtils
 
   LINK_LIBS PUBLIC
     KTIR::KtdpDialect
+    KTIR::SpyreOpDialect
     DataflowScheduler::Analysis
     DataflowScheduler::KTDPLoweringDialect
     DataflowSchedulerDialects::DataflowDialect

@@ -29,6 +29,7 @@
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   convert-elementwise-to-linalg,
 // CHECK-NEXT:   linalg-morph-ops{category-to-generic=true generic-to-named=false named-to-category=false named-to-generic=true},
+// CHECK-NEXT:   ktir-numeric-cast-tiling,
 // CHECK-NEXT:   simplify-linalg,
 // CHECK-NEXT:   fuse-linalg,
 // CHECK-NEXT:   ktir-map-and-tile,
@@ -85,6 +86,7 @@
 // CHECK-NEXT:   )
 // CHECK-NEXT:   custom-linalg-bufferization
 // CHECK-NEXT:   order-fifo-slots-by-use
+// CHECK-NEXT:   reuse-registers
 // CHECK-NEXT:   address-assignment
 // CHECK-NEXT:   normalize-grid-to-1d
 // CHECK-NEXT:   loop-iv-affine-mul-strength-reduction
