@@ -153,9 +153,9 @@ auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
   const mlir::Type element = accumulator.getElementType();
   llvm::StringRef precision;
   if (element.isF16()) {
-    precision = "fp16";
+    precision = "_fp16";
   } else if (element.isF32()) {
-    precision = "fp32";
+    precision = "_fp32";
   } else {
     return mlir::failure();
   }
@@ -163,9 +163,9 @@ auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
   mlir::Attribute names = values[1].cast<mlir::Attribute>();
   mlir::StringAttr name;
   if (auto table = llvm::dyn_cast<mlir::DictionaryAttr>(names)) {
-    name = table.getAs<mlir::StringAttr>(precision);
+    name = table.getAs<mlir::StringAttr>(precision.drop_front());
   } else if (auto base = llvm::dyn_cast<mlir::StringAttr>(names)) {
-    name = rewriter.getStringAttr(base.getValue() + "_" + precision);
+    name = rewriter.getStringAttr(base.getValue() + precision);
   }
   if (!name) return mlir::failure();
   results.push_back(name);
