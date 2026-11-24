@@ -46,6 +46,13 @@ mlir::AffineMap canonicalizeMapAndIndices(
     mlir::AffineMap map, llvm::SmallVectorImpl<mlir::Value>& indices) {
   if (!map) return map;
   mlir::affine::canonicalizeMapAndOperands(&map, &indices);
+  // Keep the dims-only DataTransfer contract after affine canonicalization.
+  auto inputs = mlir::AffineMap::getMultiDimIdentityMap(map.getNumInputs(),
+                                                        map.getContext())
+                    .getResults();
+  map = map.replaceDimsAndSymbols(inputs.take_front(map.getNumDims()),
+                                  inputs.drop_front(map.getNumDims()),
+                                  map.getNumInputs(), 0);
   return map;
 }
 
@@ -677,9 +684,7 @@ void PathExpansionMaterializer::adaptStageBodyWithTransfers(
     }
   }
 
-  for (mlir::Operation& op : *orig_body) {
-    if (op.hasTrait<mlir::OpTrait::IsTerminator>()) continue;
-
+  auto adapt = [&](auto&& self, mlir::Operation& op) -> void {
     // Try to adapt based on operation type
     bool adapted = false;
     if (auto transfer_op = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(&op)) {
@@ -705,10 +710,31 @@ void PathExpansionMaterializer::adaptStageBodyWithTransfers(
     }
 
     // If not adapted, clone as-is
-    if (!adapted) {
+    if (adapted) return;
+    if (op.getNumRegions() == 0) {
       builder_.clone(op, value_map_);
+      return;
     }
-  }
+    // Planned endpoints can live in loops. Clone their control structure but
+    // apply the same transfer substitutions inside every region.
+    auto* cloned = builder_.cloneWithoutRegions(op, value_map_);
+    mlir::OpBuilder::InsertionGuard guard(builder_);
+    for (auto [source, dest] :
+         llvm::zip(op.getRegions(), cloned->getRegions())) {
+      for (auto& block : source) {
+        auto* copy = new mlir::Block();
+        dest.push_back(copy);
+        value_map_.map(&block, copy);
+        for (auto arg : block.getArguments())
+          value_map_.map(arg, copy->addArgument(arg.getType(), arg.getLoc()));
+      }
+      for (auto& block : source) {
+        builder_.setInsertionPointToEnd(value_map_.lookup(&block));
+        for (auto& child : block) self(self, child);
+      }
+    }
+  };
+  for (mlir::Operation& op : *orig_body) adapt(adapt, op);
 }
 
 void PathExpansionMaterializer::synthesizeTransferStage(

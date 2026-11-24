@@ -9,7 +9,7 @@
 // computes in is named in the dictionary and nothing else.
 
 // RUN: dataflow-scheduler-opt %s -pass-pipeline="builtin.module( \
-// RUN:   func.func(ktdfarch-apply-patterns{groups=pre_scheduling}), \
+// RUN:   func.func(apply-device-patterns{groups=pre_scheduling}), \
 // RUN:   materialize-registers, \
 // RUN:   address-assignment, \
 // RUN:   ktdflowering-to-dfir)" | FileCheck %s

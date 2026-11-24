@@ -48,6 +48,24 @@ def KTIRLegalityCheckPass : Pass<"ktir-legality-check", "mlir::ModuleOp"> {
   ];
 }
 
+def KTIRNumericCastTilingPass : Pass<"ktir-numeric-cast-tiling", "mlir::func::FuncOp"> {
+  let summary = "Tile physical numeric casts into native sticks and FP32 packets";
+  let description = [{
+    A cast generic with the `dataflow_scheduler.work_divided` unit attribute
+    already describes a per-core tensor. Tile its entire local domain on each
+    core, retaining the frontend's explicit memory offsets. Otherwise, divide
+    the tensor across the function's grid before tiling it into packets.
+  }];
+  let dependentDialects = [
+    "mlir::ktdp::KtdpDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::ktdf_lowering::KTDFLoweringDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::tensor::TensorDialect"
+  ];
+}
+
 def KTIRMapAndTilePass : Pass<"ktir-map-and-tile", "mlir::func::FuncOp"> {
   let summary = "Maps and tiles KTIR programs";
   let description = [{

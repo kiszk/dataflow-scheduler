@@ -8,15 +8,14 @@
 // sized to the tile it covers, and the scalar store and load the body did
 // become lane zero of the register they were on.
 //
-// Substituting on its own leaves the opaque printed generically: the device is
-// what asks for it, and nothing in that run loads its dialect. This pass names
-// it among its own, so the second run prints it as itself.
+// The scheduler pattern pass supplies the native constraints used by the
+// sample device and loads the dialects its replacements require.
 
 // RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect \
-// RUN:   -ktdfarch-apply-patterns=groups=pre_scheduling \
+// RUN:   -apply-device-patterns=groups=pre_scheduling \
 // RUN:   | FileCheck %s --check-prefix=SUBST
 // RUN: dataflow-scheduler-opt %s \
-// RUN:   -ktdfarch-apply-patterns=groups=pre_scheduling -materialize-registers \
+// RUN:   -apply-device-patterns=groups=pre_scheduling -materialize-registers \
 // RUN:   | FileCheck %s
 
 // The substitution on its own leaves the registers in the body, one element
@@ -29,7 +28,7 @@
 // SUBST-NEXT:   memref.store %[[X]], %[[IN]][] : memref<f16, "SFU_REG">
 // SUBST-NEXT:   %[[OUT:.*]] = memref.alloca() : memref<f16, "SFU_REG">
 // SUBST-NEXT:   %[[T0:.*]] = memref.alloca() : memref<f16, "SFU_REG">
-// SUBST-NEXT:   "ktdf.opaque"(%[[C0]], %[[IN]], %[[OUT]], %[[T0]])
+// SUBST-NEXT:   ktdf.opaque
 // SUBST:        %[[E:.*]] = memref.load %[[OUT]][] : memref<f16, "SFU_REG">
 // SUBST-NEXT:   linalg.yield %[[E]] : f16
 

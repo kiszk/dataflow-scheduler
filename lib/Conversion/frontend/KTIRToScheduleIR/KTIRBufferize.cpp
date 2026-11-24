@@ -43,6 +43,7 @@
 
 #include <limits>
 
+#include "RelayoutMaterialization.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
@@ -483,8 +484,27 @@ struct LowerTiledLoad : mlir::OpRewritePattern<mlir::ktdp_lowering::LoadOp> {
       mlir::Value offset = computeReinterpretCastOffset(rewriter, load.getLoc(),
                                                         *indices, strides);
       llvm::ArrayRef<int64_t> tile_shape = tile_op.getType().getShape();
+      llvm::SmallVector<int64_t> view_shape(tile_shape.begin(),
+                                            tile_shape.end());
+      const bool repeats_source = llvm::any_of(
+          llvm::zip(load.getStaticSizes(), load.getStaticStrides()),
+          [](auto size_and_stride) {
+            auto [size, stride] = size_and_stride;
+            return size > 1 && stride == 0;
+          });
+      // Preserve the readable extent along a physically contiguous dimension.
+      const auto view_type = memory_view.getType();
+      if (repeats_source && (view_type.getElementType().isF32() ||
+                             view_type.getElementType().isInteger(32))) {
+        for (size_t dim = 0; dim < view_shape.size(); ++dim) {
+          if (view_shape[dim] == 1 && view_type.getDimSize(dim) > 1 &&
+              mlir::isZeroInteger((*indices)[dim]) && strides[dim] == 1) {
+            view_shape[dim] = view_type.getDimSize(dim);
+          }
+        }
+      }
       source = buildBaseView(rewriter, load.getLoc(), memory_view, offset,
-                             tile_shape, mem_space_map_,
+                             view_shape, mem_space_map_,
                              /*emit_space_cast=*/!is_iab_fill_path);
     } else {
       source = is_iab_fill_path
@@ -1106,6 +1126,7 @@ void KTIRBufferizePass::runOnOperation() {
   }
 
   mlir::func::FuncOp func = getOperation();
+
   // Obtain the default device and start a mapping.
   auto& default_device = getAnalysis<mlir::ktdf_arch::DefaultDevice>();
   if (!default_device) {
@@ -1120,6 +1141,23 @@ void KTIRBufferizePass::runOnOperation() {
       map) {
     mem_space_map.insert_range(map);
   }
+
+  mlir::ktdf_arch::Mapping mapping(default_device.getRef());
+  if (failed(materializeRelayouts(func, mapping, mem_space_map)))
+    return signalPassFailure();
+
+  // Replacing an access tile by a memref drops its order. Only do so after
+  // the element permutation has been materialized as data movement.
+  auto unresolved = func.walk([](mlir::ktdp::ConstructAccessTilesOp tile) {
+    if (!tile->use_empty() && !tile.getAccessTileOrder().isIdentity()) {
+      tile.emitOpError(
+          "access_tile_order must be materialized before bufferization; "
+          "no target data-movement recipe has been selected");
+      return mlir::WalkResult::interrupt();
+    }
+    return mlir::WalkResult::advance();
+  });
+  if (unresolved.wasInterrupted()) return signalPassFailure();
 
   mlir::RewritePatternSet patterns(&getContext());
   patterns.add<LowerLoad, LowerStore>(patterns.getContext(), mem_space_map);

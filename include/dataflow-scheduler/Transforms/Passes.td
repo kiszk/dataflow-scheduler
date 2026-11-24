@@ -726,6 +726,18 @@ def FoldFifoRelayStagesPass
   ];
 }
 
+def ReuseRegistersPass : Pass<"reuse-registers", "mlir::ModuleOp"> {
+  let summary = "Reuse template registers after their packet has been sent";
+  let description = [{
+    Send completed packets before computing the next packet, preserving FIFO
+    order. Share identical read-only template constants and equally sized
+    scratch allocations whose complete compute-and-send intervals are ordered.
+    Unknown aliases, escaping results, and concurrent stages are left alone.
+    Run after scheduling and bufferization, before address assignment.
+  }];
+  let dependentDialects = ["mlir::memref::MemRefDialect"];
+}
+
 def OrderFifoSlotsByUsePass
     : Pass<"order-fifo-slots-by-use", "mlir::ModuleOp"> {
   let summary = "Write and read the slots of a FIFO in the order they are used";

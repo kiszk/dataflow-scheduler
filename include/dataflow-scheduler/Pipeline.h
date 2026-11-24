@@ -35,6 +35,7 @@ struct SchedulerExtContext;
 
 /// Builds the KTIR frontend stage: checks the incoming KTIR is legal and
 /// converts it into an initial Schedule IR (KTDF) pipeline.
+/// Numeric casts keep their physical tensors until the backend.
 ///
 /// Passes come from `Conversion/frontend/KTIRToScheduleIR`.
 void buildKTIRFrontendPipeline(
@@ -45,6 +46,7 @@ void buildKTIRFrontendPipeline(
 /// IR in place — routing data movement, tiling, coarsening, double buffering,
 /// cross-instance parallelization, tile size selection, address assignment and
 /// grid normalization.
+/// Numeric casts use these transforms after their packetized stages are built.
 ///
 /// Both the input and the output of this stage are Schedule IR (KTDF). Passes
 /// come from `Transforms` and `Dialect/KTDF/Transforms`.
@@ -54,6 +56,7 @@ void buildSchedulerOptimizationPipeline(
 
 /// Builds the DFIR backend stage: lowers the optimized Schedule IR through
 /// KTDFLow into Dataflow IR (DFIR).
+/// Numeric casts lower directly through their verified packet recipe.
 ///
 /// Passes come from `Conversion/backend/ScheduleIRToDFIR`. Note that this does
 /// not emit the DFIR output; callers that want the resulting DFIR written out

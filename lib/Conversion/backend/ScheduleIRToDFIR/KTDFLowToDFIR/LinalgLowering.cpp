@@ -136,8 +136,8 @@ struct LowerLinalgGenericPattern
 
     // ReductionLoopExposure and MapReductionPartials run before this pass and
     // rewrite every tensor-semantics linalg.generic with reduction dims into
-    // explicit scf.for loops, leaving only parallel iterators here. Nothing
-    // below lowers a reduction, and the elementwise path would take one for an
+    // explicit scf.for loops, leaving only parallel iterators here. The tensor
+    // path below would take a remaining reduction for an
     // elementwise op and give a wrong answer, so say so rather than assert it:
     // an assert is gone in a release build and the fall-through is silent.
     if (llvm::any_of(generic_op.getIteratorTypesArray(), [](auto iter_type) {
@@ -185,6 +185,12 @@ struct LowerLinalgGenericPattern
           mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
               .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
                 return lowerMulFOp(op, rewriter, identity_map);
+              })
+              .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, false);
+              })
+              .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
               })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
@@ -290,6 +296,20 @@ struct LowerLinalgGenericPattern
       mlir::PatternRewriter& rewriter) const {
     mlir::Location loc = generic_op.getLoc();
 
+    if (!generic_op.getInputs().empty()) {
+      auto map = generic_op.getIndexingMapsArray().front();
+      if (map.getNumResults()) {
+        auto lane = mlir::dyn_cast<mlir::AffineDimExpr>(
+            map.getResult(map.getNumResults() - 1));
+        if (lane && generic_op.getIteratorTypesArray()[lane.getPosition()] ==
+                        mlir::utils::IteratorType::reduction) {
+          return generic_op.emitError(
+              "inner reduction must be lowered by device patterns before "
+              "DataflowIR conversion");
+        }
+      }
+    }
+
     mlir::Block& body = generic_op.getRegion().front();
     auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
     const unsigned accumulators = generic_op.getNumDpsInits();
@@ -356,6 +376,12 @@ struct LowerLinalgGenericPattern
               .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
                 return lowerMulFOp(op, rewriter, identity_map);
               })
+              .Case<mlir::arith::NegFOp>([&](mlir::arith::NegFOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, false);
+              })
+              .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
+                return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
+              })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
               })
@@ -384,6 +410,10 @@ struct LowerLinalgGenericPattern
               })
               .Case<mlir::arith::SelectOp>([&](mlir::arith::SelectOp op) {
                 return lowerSelectOp(op, rewriter);
+              })
+              .Case<mlir::dataflow::OpaqueOp>([&](mlir::dataflow::OpaqueOp op) {
+                rewriter.moveOpBefore(op, generic_op);
+                return mlir::success();
               })
               .Case<mlir::spyreop::Identity>([&](mlir::spyreop::Identity op) {
                 return lowerIdentity(op, rewriter, identity_map);
@@ -615,18 +645,47 @@ struct LowerLinalgGenericPattern
     return mlir::success();
   }
 
+  mlir::LogicalResult lowerUnaryFOp(mlir::Operation* op, mlir::Value input,
+                                    mlir::PatternRewriter& rewriter,
+                                    bool floor) const {
+    auto type = mlir::dyn_cast<mlir::VectorType>(input.getType());
+    if (!type) return mlir::failure();
+    mlir::Value output =
+        floor ? mlir::vectorchain::FloorOp::create(rewriter, op->getLoc(), type,
+                                                   input, nullptr, nullptr)
+                    .getData()
+              : mlir::vectorchain::NegOp::create(rewriter, op->getLoc(), type,
+                                                 input, nullptr, nullptr)
+                    .getData();
+    rewriter.replaceOp(op, output);
+    return mlir::success();
+  }
+
   // Unified helper: lowers any two-operand arith float op to
   // vectorchain.binary with the given binary_kind.
   mlir::LogicalResult lowerBinaryFOp(
       mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
       mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
       mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
-    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(lhs.getType());
+    const auto lhs_ty = llvm::dyn_cast<mlir::ShapedType>(
+        mlir::isa<mlir::ShapedType>(lhs.getType()) ? lhs.getType()
+                                                   : rhs.getType());
     if (!lhs_ty) {
       return llvm::failure();
     }
     auto vector_type = getFlattenedVectorType(lhs_ty);
     if (!vector_type) return mlir::failure();
+
+    for (mlir::Value* operand : {&lhs, &rhs}) {
+      if (mlir::isa<mlir::ShapedType>(operand->getType())) continue;
+      auto constant = operand->getDefiningOp<mlir::arith::ConstantOp>();
+      if (!constant || constant.getType() != vector_type.getElementType())
+        return rewriter.notifyMatchFailure(
+            op, "expected a vector or scalar constant");
+      *operand = mlir::arith::ConstantOp::create(
+          rewriter, op->getLoc(),
+          mlir::DenseElementsAttr::get(vector_type, constant.getValue()));
+    }
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
         rewriter, op->getLoc(), vector_type, lhs, rhs,

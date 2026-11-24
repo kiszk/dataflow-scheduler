@@ -78,6 +78,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "RelayoutMaterialization.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
@@ -215,11 +216,14 @@ void ComputeGroupExtractionPass::unionAccessTilesFromAncestors(
 }
 
 bool ComputeGroupExtractionPass::verifyComputeOpUses(mlir::Operation* op) {
+  // Packet tiling specializes cast branches per use and validates aliasing.
+  if (getNumericCast(op)) return true;
   bool has_store_use = false;
   bool has_compute_use = false;
 
   for (mlir::Value result : op->getResults()) {
     for (mlir::Operation* user : result.getUsers()) {
+      if (getNumericCast(user)) continue;
       if (mlir::isa<mlir::ktdp::StoreOp>(user)) {
         has_store_use = true;
       } else if (llvm::isa_and_present<mlir::linalg::LinalgDialect>(
@@ -507,7 +511,8 @@ void ComputeGroupExtractionPass::processBlockForExtraction(
     // group.
     // Reason: Otherwise, if control flow operations were to be extracted,
     // we might end up with nested func calls.
-    if (block_op.getNumRegions() > 0) {
+    if (block_op.getNumRegions() > 0 &&
+        !mlir::isa<mlir::linalg::LinalgOp>(block_op)) {
       // Save current compute group if any
       if (current_class_leader && first_load_op && last_store_op) {
         groups_to_extract_.push_back({first_load_op, last_store_op});

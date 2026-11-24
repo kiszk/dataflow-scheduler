@@ -196,6 +196,21 @@ void StageCoarseningPass::identifyTransformCandidates(
 
     // Find all pipelines in this function
     func_op.walk([&](ktdf::PipelineOp pipeline) {
+      // An existing hierarchy can express ordered phases that reuse scratch
+      // and execution units within each enclosing loop iteration. Distributing
+      // that loop into the phases changes their order across iterations, and
+      // this pass's buffer expansion only accounts for leaf-stage handoffs.
+      // Keep that boundary intact; leaf pipelines inside or alongside it can
+      // still be coarsened without moving a loop across the phase boundary.
+      if (pipeline
+              .walk([&](ktdf::PipelineOp nested) {
+                return nested == pipeline ? WalkResult::advance()
+                                          : WalkResult::interrupt();
+              })
+              .wasInterrupted()) {
+        LDBG(1) << "  Keeping existing nested pipeline boundary";
+        return;
+      }
       LDBG(1) << "  Found pipeline, checking for loop nest above it...";
 
       // Walk up the parent chain to find perfectly nested loops

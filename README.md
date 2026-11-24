@@ -101,11 +101,16 @@ The following CMake variables can be configured:
 | `LLVM_EXTERNAL_LIT` <br/>*(optional)* | `STRING` | Path to a `lit` executable, required for testing. |
 | `DataflowScheduler_ENABLE_PYTHON_BINDINGS` <br/>*(default: `OFF`)* | `BOOL` | Whether to build the Python bindings. |
 | `DataflowScheduler_BUILD_TOOLS` <br/>*(default: `ON`)* | `BOOL` | Whether to build the tool executables. |
+| `DataflowScheduler_KTIR_SOURCE_DIR` <br/>*(default: `external/ktir-mlir-frontend`)* | `PATH` | KTIR frontend source checkout to build; use an absolute path to integrate local frontend changes without modifying the submodule. |
 | `MLIR_LINK_MLIR_DYLIB` <br/>*(optional)* | `BOOL` | Whether to link against a shared MLIR library. |
 
 ### **Linking against shared LLVM/MLIR**
 
 This project supports linking against a version of LLVM/MLIR that was build using the `LLVM_BUILD_LLVM_DYLIB` etc. flags. Since MLIR does not export the `MLIR_LINK_MLIR_DYLIB` flag, it is inferred from the presence of the `MLIR` library target when it is not specified at configure time. When linking against shared MLIR, CMake will set up an RPATH to your MLIR install destination.
+
+### DL16 numeric casts
+
+`spyreop.numeric_cast` uses `!spyreop.df16` for SEN169/DL16 and `f32` for IEEE FP32. The scheduler preserves `!spyreop.df16` through KTDF and KTDFLow, including memory views, FIFO slots, and register storage. KTDFLow-to-DFIR lowering maps it to DFIR's existing `f16` storage carrier and emits the native conversion recipe. This representation change does not convert SEN169 data to IEEE f16. Existing device descriptions can continue to name the native 16-bit SIMD width with `f16`; an explicit `!spyreop.df16` lane entry takes precedence when sizing scheduler tiles. IEEE-only `arith` and `math` operations cannot take `!spyreop.df16`; use supported SpyreOp intrinsics for DL16 arithmetic.
 
 ## Usage
 

@@ -14,6 +14,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFUtils
     DataflowSchedulerDialects::KTDFArchDialect
     DataflowSchedulerDialects::KTDFDialect
     DataflowScheduler::KTDPLoweringDialect
+    DataflowScheduler::KTDFLoweringDialect
     DataflowSchedulerDialects::UniformDialect
 
   LINK_MLIR_LIBS
