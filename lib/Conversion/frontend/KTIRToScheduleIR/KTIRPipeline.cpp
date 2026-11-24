@@ -343,7 +343,13 @@ void KTIRPipelinePass::runOnOperation() {
     if (!stage.getBody()->getOps<mlir::ktdp_lowering::StoreOp>().empty())
       phases.push_back(stage);
   });
-  for (auto loop : func.getOps<mlir::scf::ForOp>()) {
+  llvm::SmallVector<mlir::scf::ForOp> loops;
+  func.walk([&](mlir::scf::ForOp loop) {
+    if (loop->getParentOp() == func ||
+        mlir::isa<mlir::ktdf::StageOp>(loop->getParentOp()))
+      loops.push_back(loop);
+  });
+  for (auto loop : loops) {
     auto* block = findInnermost(loop).getBody();
     if (!block->getOps<mlir::ktdf::PipelineOp>().empty()) continue;
     rewriter.setInsertionPointToEnd(block);

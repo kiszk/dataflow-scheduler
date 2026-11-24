@@ -62,6 +62,10 @@ namespace {
                 mlir::linalg::YieldOp>(op)) {
     return true;
   }
+  if (auto cast = mlir::dyn_cast<mlir::arith::SIToFPOp>(op)) {
+    return cast.getIn().getType().isSignlessInteger(32) &&
+           cast.getType().isF32();
+  }
 
   // Accept a constant the body computes against: materialize-registers puts it
   // in the register its maps_to names, so it is a value read, not an operation.

@@ -27,6 +27,7 @@
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -96,44 +97,7 @@ static std::pair<AffineMap, llvm::SmallVector<Value>> rewriteMapOperands(
       operand = buildSubscriptApply(rewriter, subscript, transfer);
   }
 
-  affine::fullyComposeAffineMapAndOperands(&map, &new_operands);
-  llvm::SmallVector<Value> leaves;
-  auto index_expr = [&](auto&& self, Value value) -> AffineExpr {
-    if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
-      return getAffineConstantExpr(constant.value(), transfer.getContext());
-    if (auto add = value.getDefiningOp<arith::AddIOp>())
-      return self(self, add.getLhs()) + self(self, add.getRhs());
-    if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
-      if (auto constant = mul.getLhs().getDefiningOp<arith::ConstantIndexOp>())
-        return self(self, mul.getRhs()) * constant.value();
-      if (auto constant = mul.getRhs().getDefiningOp<arith::ConstantIndexOp>())
-        return self(self, mul.getLhs()) * constant.value();
-    }
-    auto it = llvm::find(leaves, value);
-    if (it != leaves.end())
-      return getAffineDimExpr(std::distance(leaves.begin(), it),
-                              transfer.getContext());
-    leaves.push_back(value);
-    return getAffineDimExpr(leaves.size() - 1, transfer.getContext());
-  };
-  llvm::SmallVector<AffineExpr> replacements;
-  for (auto operand : new_operands)
-    replacements.push_back(index_expr(index_expr, operand));
-  // Affine composition may promote core-uniform operands to symbols.
-  // DataTransfer maps carry all operands as dimensions, in dims/symbols order.
-  auto expressions = llvm::ArrayRef(replacements);
-  map = map.replaceDimsAndSymbols(expressions.take_front(map.getNumDims()),
-                                  expressions.drop_front(map.getNumDims()),
-                                  leaves.size(), 0);
-  new_operands = std::move(leaves);
-  affine::canonicalizeMapAndOperands(&map, &new_operands);
-  // Keep the dims-only DataTransfer contract after affine canonicalization.
-  auto inputs = mlir::AffineMap::getMultiDimIdentityMap(map.getNumInputs(),
-                                                        map.getContext())
-                    .getResults();
-  map = map.replaceDimsAndSymbols(inputs.take_front(map.getNumDims()),
-                                  inputs.drop_front(map.getNumDims()),
-                                  map.getNumInputs(), 0);
+  scheduler::composeIndexMap(map, new_operands);
   return {map, new_operands};
 }
 

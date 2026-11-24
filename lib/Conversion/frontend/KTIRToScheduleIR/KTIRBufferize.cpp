@@ -38,20 +38,25 @@
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/PatternMatch.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 #include <limits>
 
 #include "RelayoutMaterialization.h"
+#include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
+#include "dataflow-scheduler/Dialect/KTDF/Transforms/PipelineBuilder.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "dataflow-scheduler/Transforms/Utils/IndirectAccessTileNarrowing.h"
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 
 #define PASS_NAME "ktir-bufferize"
 #define DEBUG_TYPE PASS_NAME
@@ -1118,6 +1123,234 @@ struct KTIRBufferizePass
   void runOnOperation() override;
 };
 
+// Transpose words must be loaded/stored in local memory. HBM transfers retain
+// complete packets; staging the physical view also preserves the offsets of
+// every word access made by the tiled generic.
+mlir::LogicalResult stageTransposeMemory(mlir::func::FuncOp func,
+                                         const AttrMapping& spaces,
+                                         mlir::ktdf_arch::Mapping& mapping) {
+  auto* ctx = func.getContext();
+  auto global = spaces.map(mlir::ktdp::MemorySpaceAttr::get(
+      ctx, mlir::ktdp::MemorySpaceKind::global, -1));
+  auto local = spaces.map(mlir::ktdp::MemorySpaceAttr::get(
+      ctx, mlir::ktdp::MemorySpaceKind::ct_local, -1));
+  auto base = [](mlir::Value memory) {
+    while (auto cast = memory.getDefiningOp<mlir::memref::MemorySpaceCastOp>())
+      memory = cast.getSource();
+    return memory;
+  };
+  mlir::IRRewriter rw(func);
+  for (auto loop :
+       llvm::make_early_inc_range(func.getOps<mlir::scf::ForOp>())) {
+    bool transpose = false;
+    loop.walk([&](mlir::linalg::GenericOp generic) {
+      transpose |= getWordTransposeWidth(generic) != 0;
+    });
+    if (!transpose) continue;
+    llvm::SmallVector<mlir::ktdp_lowering::LoadOp> loads;
+    llvm::SmallVector<mlir::ktdp_lowering::StoreOp> stores;
+    loop.walk([&](mlir::ktdp_lowering::LoadOp load) {
+      if (getMemorySpace(load.getSource()) == global) loads.push_back(load);
+    });
+    loop.walk([&](mlir::ktdp_lowering::StoreOp store) {
+      if (getMemorySpace(store.getDest()) == global) stores.push_back(store);
+    });
+    if (loads.empty() && stores.empty()) continue;
+    // Bufferizing each word can create the same core-local slab view again.
+    // Hoist and coalesce its pure address computation, leaving tensor values
+    // inside their loop for PipelineBuilder to distribute to stages.
+    llvm::SmallVector<mlir::Operation*> invariant;
+    auto hoist_view = [&](auto&& self,
+                          mlir::Value value) -> mlir::FailureOr<mlir::Value> {
+      auto* def = value.getDefiningOp();
+      if (!def) {
+        return loop->isAncestor(value.getParentRegion()->getParentOp())
+                   ? mlir::FailureOr<mlir::Value>(mlir::failure())
+                   : value;
+      }
+      if (!loop->isAncestor(def)) return value;
+      if (!mlir::isPure(def) || def->getNumRegions() ||
+          def->getNumResults() != 1)
+        return mlir::failure();
+      for (auto& operand : def->getOpOperands()) {
+        auto replacement = self(self, operand.get());
+        if (failed(replacement)) return mlir::failure();
+        operand.set(*replacement);
+      }
+      for (auto* previous : invariant) {
+        if (mlir::OperationEquivalence::isEquivalentTo(
+                def, previous, mlir::OperationEquivalence::IgnoreLocations)) {
+          auto result = previous->getResult(0);
+          rw.replaceOp(def, result);
+          return result;
+        }
+      }
+      def->moveBefore(loop);
+      invariant.push_back(def);
+      return value;
+    };
+    for (auto load : loads) {
+      auto view = hoist_view(hoist_view, load.getSource());
+      if (failed(view))
+        return load.emitError(
+            "word staging requires a loop-invariant memory view");
+      load.getSourceMutable().assign(*view);
+    }
+    for (auto store : stores) {
+      auto view = hoist_view(hoist_view, store.getDest());
+      if (failed(view))
+        return store.emitError(
+            "word staging requires a loop-invariant memory view");
+      store.getDestMutable().assign(*view);
+    }
+    // Draining a whole view is only safe when the transpose fills that view.
+    // Partial destinations need a separate packet-preserving update recipe.
+    if (!stores.empty()) {
+      int64_t iterations = 1;
+      auto static_nest = loop.walk([&](mlir::scf::ForOp nested) {
+        auto lb = mlir::getConstantIntValue(nested.getLowerBound());
+        auto ub = mlir::getConstantIntValue(nested.getUpperBound());
+        auto step = mlir::getConstantIntValue(nested.getStep());
+        if (!lb || !ub || !step || *step <= 0 || *ub <= *lb)
+          return mlir::WalkResult::interrupt();
+        iterations *= (*ub - *lb + *step - 1) / *step;
+        return mlir::WalkResult::advance();
+      });
+      llvm::DenseMap<mlir::Value, int64_t> written;
+      for (auto store : stores)
+        written[base(store.getDest())] +=
+            store.getSource().getType().getNumElements();
+      for (auto [memory, elements] : written)
+        if (static_nest.wasInterrupted() ||
+            iterations * elements !=
+                mlir::cast<mlir::MemRefType>(memory.getType()).getNumElements())
+          return loop.emitError(
+              "transpose staging requires a complete destination view");
+    }
+    auto loc = loop.getLoc();
+    rw.setInsertionPoint(loop);
+    auto pipeline = mlir::ktdf::PipelineOp::create(rw, loc);
+    mlir::ktdf::PrivateBuilder priv(pipeline);
+    auto ready = loads.empty() ? mlir::Value{} : priv.createToken(loc);
+    auto done = stores.empty() ? mlir::Value{} : priv.createToken(loc);
+    rw.setInsertionPointToEnd(pipeline.getBody());
+    mlir::ktdf::StageOp pre, post;
+    if (ready)
+      pre = mlir::ktdf::StageOp::create(rw, loc, mlir::ValueRange{},
+                                        mlir::ValueRange{ready});
+    auto compute = mlir::ktdf::StageOp::create(
+        rw, loc, ready ? mlir::ValueRange{ready} : mlir::ValueRange{},
+        done ? mlir::ValueRange{done} : mlir::ValueRange{});
+    if (done)
+      post = mlir::ktdf::StageOp::create(rw, loc, mlir::ValueRange{done},
+                                         mlir::ValueRange{});
+    loop->moveBefore(compute.getBody(), compute.getBody()->end());
+    auto stage = [&](mlir::Value memory, mlir::ktdf::StageOp phase,
+                     bool input) -> mlir::FailureOr<mlir::Value> {
+      auto type = mlir::cast<mlir::MemRefType>(memory.getType());
+      auto compute = getUniqueComputeUnit(mapping.byKind());
+      if (!compute) return mlir::failure();
+      auto lanes = getVectorLanes(type.getElementType(), compute);
+      if (!type.hasStaticShape() || type.getRank() == 0 ||
+          type.getShape().back() % lanes != 0)
+        return mlir::failure();
+      auto origin = base(memory);
+      if (auto* def = origin.getDefiningOp(); def && loop->isAncestor(def))
+        return mlir::failure();
+      rw.setInsertionPoint(pipeline);
+      memory = mlir::memref::MemorySpaceCastOp::create(rw, loc, type, origin);
+      auto buffer = mlir::memref::AllocOp::create(
+          priv, loc,
+          mlir::MemRefType::get(type.getShape(), type.getElementType(),
+                                mlir::MemRefLayoutAttrInterface{}, local));
+      rw.setInsertionPointToEnd(phase.getBody());
+      auto zero = mlir::arith::ConstantIndexOp::create(rw, loc, 0);
+      auto one = mlir::arith::ConstantIndexOp::create(rw, loc, 1);
+      llvm::SmallVector<mlir::OpFoldResult> offsets(type.getRank(),
+                                                    zero.getResult());
+      llvm::SmallVector<mlir::OpFoldResult> sizes(type.getRank(),
+                                                  rw.getIndexAttr(1));
+      auto strides = sizes;
+      sizes.back() = rw.getIndexAttr(lanes);
+      llvm::SmallVector<mlir::Value> bounds;
+      for (unsigned dim = 0; dim < type.getRank(); ++dim)
+        bounds.push_back(mlir::arith::ConstantIndexOp::create(
+            rw, loc,
+            type.getDimSize(dim) / (dim + 1 == type.getRank() ? lanes : 1)));
+      auto copy = [&](auto&& self, mlir::OpBuilder& b, unsigned dim) -> void {
+        if (dim < type.getRank()) {
+          mlir::scf::ForOp::create(b, loc, zero, bounds[dim], one,
+                                   mlir::ValueRange{},
+                                   [&](mlir::OpBuilder& inner, mlir::Location,
+                                       mlir::Value iv, mlir::ValueRange) {
+                                     offsets[dim] = iv;
+                                     self(self, inner, dim + 1);
+                                     mlir::scf::YieldOp::create(inner, loc);
+                                   });
+          return;
+        }
+        offsets.back() =
+            mlir::affine::AffineApplyOp::create(
+                b, loc,
+                mlir::AffineMap::get(1, 0, b.getAffineDimExpr(0) * lanes),
+                mlir::ValueRange{mlir::cast<mlir::Value>(offsets.back())})
+                .getResult();
+        auto load = mlir::ktdp_lowering::LoadOp::create(
+            b, loc, input ? memory : buffer.getResult(), offsets, sizes,
+            strides, type.getElementType());
+        auto tensor_type = load.getType();
+        auto empty = mlir::tensor::EmptyOp::create(b, loc, tensor_type,
+                                                   mlir::ValueRange{});
+        auto id = b.getMultiDimIdentityMap(type.getRank());
+        auto identity = mlir::linalg::GenericOp::create(
+            b, loc, mlir::TypeRange{tensor_type}, mlir::ValueRange{load},
+            mlir::ValueRange{empty}, llvm::ArrayRef{id, id},
+            llvm::SmallVector<mlir::utils::IteratorType>(
+                type.getRank(), mlir::utils::IteratorType::parallel),
+            [&](mlir::OpBuilder& b, mlir::Location l, mlir::ValueRange args) {
+              auto value = mlir::spyreop::Identity::create(b, l, args[0]);
+              mlir::linalg::YieldOp::create(b, l, value.getResult());
+            });
+        identity->setAttr("ktdf_arch.maps_to", compute.getKind());
+        auto store = mlir::ktdp_lowering::StoreOp::create(
+            b, loc, identity.getResult(0), input ? buffer.getResult() : memory,
+            offsets, sizes, strides);
+        setThrottle(load, lanes);
+        setThrottle(identity, lanes);
+        setThrottle(store, lanes);
+      };
+      copy(copy, rw, 0);
+      return buffer.getResult();
+    };
+    llvm::DenseMap<mlir::Value, mlir::Value> input_buffers, output_buffers;
+    for (auto load : loads) {
+      auto source = load.getSource();
+      auto& buffer = input_buffers[base(source)];
+      if (!buffer) {
+        auto result = stage(source, pre, true);
+        if (failed(result))
+          return load.emitError(
+              "transpose staging requires complete SIMD packets");
+        buffer = *result;
+      }
+      load.getSourceMutable().assign(buffer);
+    }
+    for (auto store : stores) {
+      auto dest = store.getDest();
+      auto& buffer = output_buffers[base(dest)];
+      if (!buffer) {
+        auto result = stage(dest, post, false);
+        if (failed(result))
+          return store.emitError(
+              "transpose staging requires complete SIMD packets");
+        buffer = *result;
+      }
+      store.getDestMutable().assign(buffer);
+    }
+  }
+  return mlir::success();
+}
+
 }  // namespace
 
 void KTIRBufferizePass::runOnOperation() {
@@ -1177,4 +1410,6 @@ void KTIRBufferizePass::runOnOperation() {
     signalPassFailure();
     return;
   }
+  if (failed(stageTransposeMemory(func, mem_space_map, mapping)))
+    signalPassFailure();
 }

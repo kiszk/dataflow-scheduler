@@ -53,7 +53,9 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFLowToDFIR
     MLIRMemRefDialect
     MLIRPass
     MLIRSCFDialect
+    MLIRSCFUtils
     MLIRTensorDialect
     MLIRTransformUtils
     MLIRViewLikeInterface
+    MLIRVectorDialect
 )

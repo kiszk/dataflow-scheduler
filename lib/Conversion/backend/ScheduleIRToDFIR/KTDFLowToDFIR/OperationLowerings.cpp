@@ -29,6 +29,7 @@
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/OperationSupport.h>
@@ -960,6 +961,7 @@ mlir::LogicalResult scheduler::runOperationLowerings(
   target.addIllegalDialect<mlir::ktdf::KTDFDialect,
                            mlir::ktdf_lowering::KTDFLoweringDialect,
                            mlir::ktdp_lowering::KTDPLoweringDialect>();
+  target.addIllegalDialect<mlir::vector::VectorDialect>();
   target.markUnknownOpDynamicallyLegal([](mlir::Operation*) { return true; });
   if (mlir::failed(mlir::applyPartialConversion(
           func, target,

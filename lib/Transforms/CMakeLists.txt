@@ -67,6 +67,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     MLIRSCFDialect
     MLIRTensorDialect
     MLIRTensorTransforms
+    MLIRVectorDialect
     MLIRPass
     MLIRPresburger
     MLIRTransformUtils

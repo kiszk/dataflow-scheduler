@@ -42,14 +42,20 @@
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/Symbol/Symbol.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
+#include "dataflow-scheduler/Transforms/Utils/SCFTilingUtils.h"
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
@@ -82,6 +88,78 @@ static void canonicalizeFunc(mlir::func::FuncOp func) {
   mlir::FrozenRewritePatternSet frozen(std::move(patterns));
   // Default GreedyRewriteConfig enables region simplification (DCE).
   (void)mlir::applyPatternsGreedily(func, frozen);
+}
+
+// Loop normalization introduces index arithmetic. AGEN operands must be loop
+// IVs or constants, so reuse the index composition used by KTDF transfers.
+static void composeAgenIndexMaps(mlir::func::FuncOp func) {
+  auto compose = [](mlir::Operation* op, mlir::StringAttr name,
+                    mlir::AffineMap map, mlir::MutableOperandRange indices) {
+    auto values = indices.getAsOperandRange();
+    if (llvm::none_of(values, [](mlir::Value value) {
+          return mlir::isa_and_nonnull<mlir::arith::AddIOp, mlir::arith::MulIOp,
+                                       mlir::affine::AffineApplyOp>(
+              value.getDefiningOp());
+        }))
+      return;
+    llvm::SmallVector<mlir::Value> operands(values.begin(), values.end());
+    composeIndexMap(map, operands);
+    op->setAttr(name, mlir::AffineMapAttr::get(map));
+    indices.assign(operands);
+  };
+  func.walk([&](mlir::agen::VectorLoadOp op) {
+    compose(op, op.getAffineMapAttrName(), op.getAffineMap(),
+            op.getMapOperandsMutable());
+  });
+  func.walk([&](mlir::agen::VectorStoreOp op) {
+    compose(op, op.getAffineMapAttrName(), op.getAffineMap(),
+            op.getMapOperandsMutable());
+  });
+  func.walk([&](mlir::agen::CompositeLoadAndStoreOp op) {
+    compose(op, op.getSrcMapAttrName(), op.getSrcMap(),
+            op.getSrcMapOperandsMutable());
+    compose(op, op.getDstMapAttrName(), op.getDstMap(),
+            op.getDstMapOperandsMutable());
+  });
+}
+
+// Keep both buffers, but expose a complete ping-pong cycle to the address
+// generator. A loop-carried `sum - offset` is not an arithmetic progression:
+// treating it as a fixed address increment reads outside the buffers after
+// the second iteration. Unrolling two iterations cancels the recurrence;
+// ordinary SCF canonicalization also handles an odd final iteration. Normalize
+// the expanded loops again because the target requires a unit step.
+static mlir::LogicalResult expandAlternatingBufferOffsets(
+    mlir::func::FuncOp func) {
+  mlir::IRRewriter rewriter(func.getContext());
+  while (true) {
+    mlir::scf::ForOp alternating;
+    func.walk<mlir::WalkOrder::PostOrder>([&](mlir::scf::ForOp loop) {
+      if (!loop.getStaticTripCount()) return mlir::WalkResult::advance();
+      for (auto [arg, yielded] :
+           llvm::zip(loop.getRegionIterArgs(),
+                     loop.getBody()->getTerminator()->getOperands())) {
+        auto sub = yielded.getDefiningOp<mlir::arith::SubIOp>();
+        if (sub && sub.getRhs() == arg &&
+            mlir::matchPattern(sub.getLhs(), mlir::m_Constant())) {
+          alternating = loop;
+          return mlir::WalkResult::interrupt();
+        }
+      }
+      return mlir::WalkResult::advance();
+    });
+    if (!alternating) return mlir::success();
+    auto unrolled = mlir::loopUnrollByFactor(alternating, 2);
+    if (mlir::failed(unrolled))
+      return alternating.emitError(
+          "could not expand alternating buffer offsets");
+    llvm::SmallVector<mlir::scf::ForOp> loops;
+    if (unrolled->mainLoopOp) loops.push_back(*unrolled->mainLoopOp);
+    if (unrolled->epilogueLoopOp) loops.push_back(*unrolled->epilogueLoopOp);
+    normalizeSCFLoops(loops, rewriter);
+    composeAgenIndexMaps(func);
+    canonicalizeFunc(func);
+  }
 }
 
 // AGEN subscripts accept induction variables and constants. Resolve per-unit
@@ -223,6 +301,8 @@ struct KTDFLowToDFIRPass
       // NoMemoryEffect ops).
       specializeUniformAccesses(func);
       canonicalizeFunc(func);
+      if (mlir::failed(expandAlternatingBufferOffsets(func)))
+        return signalPassFailure();
     }
   }
 

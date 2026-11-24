@@ -24,6 +24,8 @@
 #include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/Tensor/IR/Tensor.h>
+#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Matchers.h>
@@ -31,6 +33,7 @@
 #include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/RegionUtils.h>
 
+#include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/Mapping.h"
@@ -48,6 +51,155 @@ using namespace mlir;
 
 namespace scheduler {
 namespace {
+
+/// Recognizes one complete, contiguous row of a square word tile.
+template <typename Slice>
+auto wordRow(Slice slice, int64_t width) -> std::optional<int64_t> {
+  auto offsets = slice.getStaticOffsets();
+  if (offsets.size() != 2 || offsets[0] < 0 || offsets[0] >= width ||
+      offsets[1] != 0 ||
+      slice.getStaticSizes() != ArrayRef<int64_t>{1, width} ||
+      slice.getStaticStrides() != ArrayRef<int64_t>{1, 1})
+    return std::nullopt;
+  return offsets[0];
+}
+
+/// Expands the word assembly, transpose and word extraction together. Only
+/// words cross FIFO boundaries; the square tensor exists inside this stage.
+auto materializeTranspose(linalg::GenericOp generic, int64_t width,
+                          ktdf_arch::Mapping& mapping, RewriterBase& rw)
+    -> LogicalResult {
+  auto type = cast<RankedTensorType>(generic.getResult(0).getType());
+  auto element = type.getElementType();
+  auto word_type = RankedTensorType::get({width}, element);
+  SmallVector<Value> inputs(width);
+  Value assembled = generic.getDpsInputs()[0];
+  SmallVector<Operation*> dead;
+  while (auto insert = assembled.getDefiningOp<tensor::InsertSliceOp>()) {
+    auto row = wordRow(insert, width);
+    if (!row || inputs[*row] || insert.getSourceType() != word_type)
+      return generic.emitError(
+          "transpose input must be assembled from complete words");
+    inputs[*row] = insert.getSource();
+    dead.push_back(insert);
+    assembled = insert.getDest();
+  }
+  if (!llvm::all_of(inputs, [](Value v) { return bool(v); }))
+    return generic.emitError(
+        "transpose input must be assembled from complete words");
+
+  SmallVector<std::pair<tensor::ExtractSliceOp, int64_t>> outputs;
+  for (auto* user : generic.getResult(0).getUsers()) {
+    auto slice = dyn_cast<tensor::ExtractSliceOp>(user);
+    auto row = slice ? wordRow(slice, width) : std::nullopt;
+    if (!row || slice.getType() != word_type)
+      return generic.emitError(
+          "transpose output must be consumed as complete words");
+    outputs.emplace_back(slice, *row);
+  }
+  auto compute = mapping.getOrMap<ktdf_arch::ExecutionUnitOp>(
+      generic, mapping.byKind().getDefaultCompute().getKind());
+  auto pipeline = generic->getParentOfType<ktdf::PipelineOp>();
+  auto simd = compute ? compute.getFeature<ktdf_arch::feature::SIMD>()
+                      : ktdf_arch::feature::SIMD{};
+  if (!pipeline || !simd || simd.getLanes(element) != width * 8 ||
+      simd.getSubSimdLanes(element) != width)
+    return generic.emitError(
+        "word transpose requires a mapped compute stage with 128-byte SIMD and "
+        "16-byte sub-SIMD lanes");
+  arch_view::GroupLocalMemory local(mapping.getDevice());
+  auto registers = local.getLocalMemoryKind(compute.getKind());
+  if (!registers)
+    return generic.emitError("word transpose requires compute-local registers");
+
+  auto loc = generic.getLoc();
+  const int64_t lanes = width * 8;
+  // Four rows ping-pong between two banks. Eight rows reuse a pair of
+  // temporaries, so the 16-bit recipe leaves six of the sixteen registers free.
+  const int64_t rows = width == 4 ? 8 : 10;
+  ktdf::PrivateBuilder priv(pipeline);
+  Value scratch = memref::AllocOp::create(
+      priv, loc,
+      MemRefType::get({rows, lanes}, element, MemRefLayoutAttrInterface{},
+                      registers));
+  rw.setInsertionPoint(generic);
+  auto vector_type = VectorType::get({lanes}, element);
+  auto word_vector = VectorType::get({width}, element);
+  Value zero = arith::ConstantIndexOp::create(rw, loc, 0);
+  Value zeros = arith::ConstantOp::create(
+      rw, loc, DenseElementsAttr::get(vector_type, rw.getZeroAttr(element)));
+  auto indices = [&](int64_t row) {
+    return SmallVector<Value>{arith::ConstantIndexOp::create(rw, loc, row),
+                              zero};
+  };
+  auto load = [&](int64_t row, VectorType vt) -> Value {
+    return vector::LoadOp::create(rw, loc, vt, scratch, indices(row));
+  };
+  auto store = [&](Value value, int64_t row) {
+    vector::StoreOp::create(rw, loc, value, scratch, indices(row));
+  };
+  // Consume words in the order of the scheduled FIFO reads. A receive is a
+  // hardware stream operand, so reordering its first use would reorder the
+  // arriving rows even though the SSA references still name the right words.
+  SmallVector<int64_t> input_order;
+  for (Operation& op : *generic->getBlock())
+    for (auto [row, input] : llvm::enumerate(inputs))
+      if (input.getDefiningOp() == &op) input_order.push_back(row);
+  for (auto [row, input] : llvm::enumerate(inputs))
+    if (!input.getDefiningOp() ||
+        input.getDefiningOp()->getBlock() != generic->getBlock())
+      input_order.push_back(row);
+  for (int64_t row : input_order) {
+    // MERGE instructions read whole registers. Define padding too, although
+    // their group-local masks cannot bring it into the first output word.
+    store(zeros, row);
+    auto word = vector::TransferReadOp::create(
+        rw, loc, word_vector, inputs[row], ValueRange{zero}, std::nullopt,
+        rw.getMultiDimIdentityMap(1), ArrayRef<bool>{true});
+    store(word, row);
+  }
+  for (int64_t distance = 1, bank = 0; distance < width; distance *= 2) {
+    const int64_t next_bank = width == 4 ? width - bank : 0;
+    for (int64_t row = 0; row < width; ++row) {
+      if (row & distance) continue;
+      // Each step exchanges one bit of the row and column coordinates.
+      // In vector.shuffle the second input starts at 'lanes', whereas pack
+      // will express the same indices within each word-sized group.
+      for (int64_t half = 0; half < 2; ++half) {
+        SmallVector<int64_t> mask;
+        for (int64_t group = 0; group < lanes; group += width)
+          for (int64_t column = 0; column < width; ++column)
+            mask.push_back(group + (column & ~distance) + half * distance +
+                           ((column & distance) ? lanes : 0));
+        Value left = load(bank + row, vector_type);
+        Value right = load(bank + row + distance, vector_type);
+        Value merged = vector::ShuffleOp::create(rw, loc, left, right, mask);
+        store(merged,
+              width == 4 ? next_bank + row + half * distance : width + half);
+      }
+      if (width == 8) {
+        // Both halves are ready before either input register is overwritten.
+        store(load(width, vector_type), row);
+        store(load(width + 1, vector_type), row + distance);
+      }
+    }
+    bank = next_bank;
+  }
+  SmallVector<Value> words(width);
+  for (int64_t row = 0; row < width; ++row) {
+    auto empty = tensor::EmptyOp::create(rw, loc, word_type, ValueRange{});
+    words[row] = vector::TransferWriteOp::create(
+                     rw, loc, load(row, word_vector), empty, ValueRange{zero},
+                     rw.getMultiDimIdentityMap(1), ArrayRef<bool>{true})
+                     .getResult();
+  }
+  for (auto [slice, row] : outputs) rw.replaceOp(slice, words[row]);
+  dead.push_back(generic.getDpsInits()[0].getDefiningOp());
+  rw.eraseOp(generic);
+  llvm::erase_if(dead, [](Operation* op) { return !op; });
+  eraseDeadAncestorOps(dead);
+  return success();
+}
 
 /// Gets the mapped constants the body of \p generic reads, in reading order.
 ///
@@ -330,15 +482,17 @@ struct MaterializeRegistersPass
     }
 
     IRRewriter rewriter(&getContext());
-    const auto result = getOperation()->walk([&](linalg::GenericOp generic) {
-      if (failed(materializeRegisters(generic, mapping, rewriter))) {
-        return WalkResult::interrupt();
+    // The transpose rewrite also erases sibling slices. Collect the generics
+    // first so a walk never advances through an erased sibling.
+    SmallVector<linalg::GenericOp> generics;
+    getOperation()->walk([&](linalg::GenericOp op) { generics.push_back(op); });
+    for (auto generic : generics) {
+      if (auto width = getWordTransposeWidth(generic)) {
+        if (failed(materializeTranspose(generic, width, mapping, rewriter)))
+          return signalPassFailure();
+      } else if (failed(materializeRegisters(generic, mapping, rewriter))) {
+        return signalPassFailure();
       }
-      return WalkResult::skip();
-    });
-
-    if (result.wasInterrupted()) {
-      signalPassFailure();
     }
   }
 };

@@ -25,8 +25,10 @@
 
 #include <llvm/ADT/SmallVector.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/IR/AffineMap.h>
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -76,9 +78,22 @@ mlir::scf::ForOp createForOpWithAdditionalIterArgs(mlir::scf::ForOp loop_op,
 /// last reader of.
 void eraseDeadAncestorOps(llvm::ArrayRef<mlir::Operation*> roots);
 
+/// Composes affine.apply and constant-scale index arithmetic into an access
+/// map. Other values remain operands; the resulting map has dimensions only.
+void composeIndexMap(mlir::AffineMap& map,
+                     llvm::SmallVectorImpl<mlir::Value>& operands);
+
 /// Number of vector lanes the compute resource provides for `elem_type`.
 int64_t getVectorLanes(mlir::Type elem_type,
                        mlir::ktdf_arch::ExecutionUnitOp compute);
+
+/// Whether the generic copies its input scalar, without changing its bits.
+bool isIdentityGeneric(mlir::linalg::GenericOp generic);
+
+/// Width of a square, word-sized Standard-layout transpose tile, or zero.
+/// The maps, rather than an op name or a scheduling attribute, carry the
+/// permutation. Supported words are eight f16 or four f32/i32 elements.
+int64_t getWordTransposeWidth(mlir::linalg::GenericOp generic);
 
 }  // namespace scheduler
 

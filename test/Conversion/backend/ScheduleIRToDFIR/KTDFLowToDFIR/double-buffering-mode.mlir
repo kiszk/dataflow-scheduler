@@ -1,42 +1,33 @@
-// RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" -allow-unregistered-dialect %s | FileCheck %s
+// RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" -allow-unregistered-dialect %s | FileCheck %s --implicit-check-not=iter_args --implicit-check-not=arith.subi
 
-// Tests verifying double-buffering mode dispatch:
-//   BufferFirst (L1LU) — subi placed at yield; iter_arg init = offset_0 (128)
-//   BufferLast  (MNILU) — subi placed at loop-body top; iter_arg init = offset_1 (98432)
+// Both BufferFirst (L1LU) and BufferLast (MNILU) consume buffer 0 first.
+// Expand a complete two-slot cycle before DFIR leaves the scheduler, so the
+// address generator does not treat the alternating offset as a linear step.
+// The two buffers and the nested loops remain; their address recurrence does not.
 
 // CHECK-LABEL: func.func private @mode_a
-// CHECK:         %[[C98560_A:.*]] = arith.constant 98560 : index
-// CHECK:         %[[C128_A:.*]] = arith.constant 128 : index
-// CHECK:         dataflow.program_unit iter_arg : {{.*}} -> ({{.*}}) : {
-// CHECK:           dataflow.program_unit iter_arg : {{.*}} -> ({{.*}}) : {
-// Mode A: outer iter_arg initialized to offset_0 (128).
-// CHECK:             scf.for {{.*}} iter_args(%[[OUTER_A:.*]] = %[[C128_A]]) -> (index)
-// Mode A: inner iter_arg cascaded from outer iter_arg.
-// CHECK:               scf.for {{.*}} iter_args(%[[INNER_A:.*]] = %[[OUTER_A]]) -> (index)
-// Mode A: get_logical_memory_view uses the iter_arg directly.
-// CHECK:                 dataflow.get_logical_memory_view {{.*}}, %[[INNER_A]] {{.*}}
-// Mode A: test.use consumes the view.
-// CHECK:                 "test.use"
-// Mode A: subi uses the precomputed constant (not an addi).
-// CHECK-NEXT:            %[[SUBI_A:.*]] = arith.subi %[[C98560_A]], %[[INNER_A]] : index
-// CHECK-NEXT:            scf.yield %[[SUBI_A]] : index
+// CHECK-DAG: %[[C128_A:.*]] = arith.constant 128 : index
+// CHECK-DAG: %[[C98432_A:.*]] = arith.constant 98432 : index
+// CHECK-DAG: %[[C32_A:.*]] = arith.constant 32 : index
+// CHECK-DAG: %[[C1_A:.*]] = arith.constant 1 : index
+// CHECK: scf.for
+// CHECK: scf.for {{.*}} to %[[C32_A]] step %[[C1_A]]
+// CHECK: %[[A0:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[C128_A]]
+// CHECK: "test.use"(%[[A0]])
+// CHECK: %[[A1:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[C98432_A]]
+// CHECK: "test.use"(%[[A1]])
 
 // CHECK-LABEL: func.func private @mode_b
-// CHECK:         %[[C98560_B:.*]] = arith.constant 98560 : index
-// CHECK:         %[[C98432_B:.*]] = arith.constant 98432 : index
-// CHECK:         dataflow.program_unit iter_arg : {{.*}} -> ({{.*}}) : {
-// CHECK:           dataflow.program_unit iter_arg : {{.*}} -> ({{.*}}) : {
-// Mode B: outer iter_arg initialized to offset_1 (98432).
-// CHECK:             scf.for {{.*}} iter_args(%[[OUTER_B:.*]] = %[[C98432_B]]) -> (index)
-// Mode B: inner iter_arg cascaded from outer iter_arg.
-// CHECK:               scf.for {{.*}} iter_args(%[[INNER_B:.*]] = %[[OUTER_B]]) -> (index)
-// Mode B: subi is the FIRST op in the inner loop body (loop-body top).
-// CHECK-NEXT:            %[[SUBI_B:.*]] = arith.subi %[[C98560_B]], %[[INNER_B]] : index
-// Mode B: get_logical_memory_view uses the subi result (not the iter_arg).
-// CHECK-NEXT:            dataflow.get_logical_memory_view {{.*}}, %[[SUBI_B]] {{.*}}
-// CHECK:                 "test.use"
-// Mode B: yield carries the subi result.
-// CHECK:                 scf.yield %[[SUBI_B]] : index
+// CHECK-DAG: %[[C128_B:.*]] = arith.constant 128 : index
+// CHECK-DAG: %[[C98432_B:.*]] = arith.constant 98432 : index
+// CHECK-DAG: %[[C32_B:.*]] = arith.constant 32 : index
+// CHECK-DAG: %[[C1_B:.*]] = arith.constant 1 : index
+// CHECK: scf.for
+// CHECK: scf.for {{.*}} to %[[C32_B]] step %[[C1_B]]
+// CHECK: %[[B0:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[C128_B]]
+// CHECK: "test.use"(%[[B0]])
+// CHECK: %[[B1:.*]] = dataflow.get_logical_memory_view {{.*}}, %[[C98432_B]]
+// CHECK: "test.use"(%[[B1]])
 
 module {
   ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")

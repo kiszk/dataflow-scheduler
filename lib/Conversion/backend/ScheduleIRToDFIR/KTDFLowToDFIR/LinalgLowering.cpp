@@ -27,6 +27,8 @@
 #include <mlir/IR/BuiltinTypeInterfaces.h>
 #include <mlir/IR/Matchers.h>
 
+#include <type_traits>
+
 #include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.h"
 #include "dataflow-scheduler/Dialect/Agen/Agen.h"
@@ -41,6 +43,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IntegerSet.h"
@@ -52,6 +55,154 @@
 using namespace scheduler;
 
 namespace {
+
+/// A full-word tensor/vector boundary becomes an identity once the FIFO read
+/// has become dataflow.receive. Do not erase a permutation, mask or offset.
+template <typename Transfer>
+bool isWholeVectorTransfer(Transfer op, mlir::ShapedType shaped,
+                           mlir::VectorType vector) {
+  return shaped && shaped.hasStaticShape() && shaped.getRank() == 1 &&
+         !vector.isScalable() && vector.getShape() == shaped.getShape() &&
+         vector.getElementType() == shaped.getElementType() && !op.getMask() &&
+         op.getPermutationMap().isIdentity() &&
+         llvm::all_of(op.getIndices(), [](mlir::Value index) {
+           return mlir::matchPattern(index, mlir::m_Zero());
+         });
+}
+
+struct LowerVectorTransferRead
+    : mlir::OpRewritePattern<mlir::vector::TransferReadOp> {
+  using OpRewritePattern::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(
+      mlir::vector::TransferReadOp op,
+      mlir::PatternRewriter& rw) const override {
+    auto input = mlir::dyn_cast<mlir::VectorType>(op.getBase().getType());
+    if (!input || !isWholeVectorTransfer(op, input, op.getVectorType()))
+      return mlir::failure();
+    rw.replaceOp(op, op.getBase());
+    return mlir::success();
+  }
+};
+
+struct LowerVectorTransferWrite
+    : mlir::OpRewritePattern<mlir::vector::TransferWriteOp> {
+  using OpRewritePattern::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(
+      mlir::vector::TransferWriteOp op,
+      mlir::PatternRewriter& rw) const override {
+    auto output =
+        mlir::dyn_cast<mlir::RankedTensorType>(op.getBase().getType());
+    if (!output || !isWholeVectorTransfer(op, output, op.getVectorType()))
+      return mlir::failure();
+    rw.replaceOp(op, op.getValueToStore());
+    return mlir::success();
+  }
+};
+
+/// Lower contiguous vector accesses without dropping their starting indices.
+template <typename Op>
+struct LowerVectorMemory : mlir::OpRewritePattern<Op> {
+  using mlir::OpRewritePattern<Op>::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(
+      Op op, mlir::PatternRewriter& rw) const override {
+    auto memref = mlir::cast<mlir::MemRefType>(op.getBase().getType());
+    auto vector = op.getVectorType();
+    llvm::SmallVector<int64_t> strides;
+    int64_t offset;
+    if (vector.getRank() != 1 || vector.isScalable() || memref.getRank() == 0 ||
+        mlir::failed(memref.getStridesAndOffset(strides, offset)) ||
+        strides.back() != 1)
+      return mlir::failure();
+    auto identity = rw.getMultiDimIdentityMap(memref.getRank());
+    llvm::SmallVector<int64_t> sizes(memref.getRank(), 1);
+    sizes.back() = vector.getNumElements();
+    auto set = buildIntegerSetFromSizes(rw.getContext(), sizes);
+    if constexpr (std::is_same_v<Op, mlir::vector::LoadOp>) {
+      rw.template replaceOpWithNewOp<mlir::agen::VectorLoadOp>(
+          op, vector, op.getBase(), nullptr, identity, op.getIndices(), set,
+          identity, nullptr);
+    } else {
+      mlir::Value value = op.getValueToStore();
+      // AGEN cannot store an immediate splat. Use the same bitstream/shuffle
+      // representation as linalg.fill, inside the unit performing the store.
+      // Leave constants used by other compute patterns to their own lowering.
+      mlir::DenseElementsAttr elements;
+      if (mlir::matchPattern(value, mlir::m_Constant(&elements)) &&
+          elements.isSplat() && vector.getElementTypeBitWidth() <= 64) {
+        auto scalar = elements.getSplatValue<mlir::Attribute>();
+        llvm::APInt bits;
+        if (auto floating = mlir::dyn_cast<mlir::FloatAttr>(scalar))
+          bits = floating.getValue().bitcastToAPInt();
+        else if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(scalar))
+          bits = integer.getValue();
+        else
+          return mlir::failure();
+        // IMMCOPY has only 16- and 32-bit floating-point modes. AGEN stores
+        // raw bits, so an i32 splat can use an f32 carrier of the same width
+        // without numerically converting its bitstream or the input tensor.
+        auto carrier = vector.getElementType().isSignlessInteger(32)
+                           ? rw.getF32Type()
+                           : vector.getElementType();
+        auto seed = mlir::vectorchain::ConstantBitstreamOp::create(
+            rw, op.getLoc(), mlir::VectorType::get({1}, carrier),
+            rw.getArrayAttr(
+                {rw.getIntegerAttr(rw.getI64Type(), bits.zextOrTrunc(64))}));
+        value = mlir::vectorchain::ShuffleOp::create(
+            rw, op.getLoc(), mlir::VectorType::get(vector.getShape(), carrier),
+            seed.getResult(), mlir::ValueRange{}, mlir::ValueRange{}, nullptr,
+            nullptr, rw.getI32ArrayAttr({0}),
+            static_cast<uint32_t>(vector.getNumElements()));
+      }
+      mlir::agen::VectorStoreOp::create(rw, op.getLoc(), value, op.getBase(),
+                                        nullptr, identity, op.getIndices(), set,
+                                        identity);
+      rw.eraseOp(op);
+    }
+    return mlir::success();
+  }
+};
+
+/// Only hardware MERGE masks are accepted. A general vector.shuffle must not
+/// silently become a pack the code generator cannot implement.
+struct LowerVectorShuffle : mlir::OpRewritePattern<mlir::vector::ShuffleOp> {
+  using OpRewritePattern::OpRewritePattern;
+  mlir::LogicalResult matchAndRewrite(
+      mlir::vector::ShuffleOp op, mlir::PatternRewriter& rw) const override {
+    auto type = mlir::cast<mlir::VectorType>(op.getResult().getType());
+    auto element = type.getElementType();
+    if (type.getRank() != 1 || type.isScalable() ||
+        (!element.isF16() && !element.isF32() &&
+         !element.isSignlessInteger(32)))
+      return mlir::failure();
+    int64_t word = element.isF16() ? 8 : 4;
+    int64_t lanes = word * 8;
+    if (type.getNumElements() != lanes || op.getV1().getType() != type ||
+        op.getV2().getType() != type)
+      return mlir::failure();
+    for (int64_t distance = 1; distance < word; distance *= 2) {
+      for (int64_t half = 0; half < 2; ++half) {
+        bool matches = true;
+        for (int64_t lane = 0; lane < lanes; ++lane) {
+          int64_t column = lane % word;
+          int64_t expected = lane - column + (column & ~distance) +
+                             half * distance +
+                             ((column & distance) ? lanes : 0);
+          matches &= op.getMask()[lane] == expected;
+        }
+        if (!matches) continue;
+        llvm::SmallVector<int32_t> indices;
+        for (int64_t column = 0; column < word; ++column)
+          indices.push_back((column & ~distance) + half * distance +
+                            ((column & distance) ? word : 0));
+        rw.replaceOpWithNewOp<mlir::vectorchain::PackOp>(
+            op, type, op.getV1(), op.getV2(), nullptr, nullptr,
+            rw.getI32ArrayAttr(indices), rw.getIndexAttr(8));
+        return mlir::success();
+      }
+    }
+    return mlir::failure();
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Returns true and sets `lhs_out`/`rhs_out` to the inputs of the abs ops when
@@ -191,6 +342,9 @@ struct LowerLinalgGenericPattern
               })
               .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
                 return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
+              })
+              .Case<mlir::arith::SIToFPOp>([&](mlir::arith::SIToFPOp op) {
+                return lowerSIToFPOp(op, rewriter);
               })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
@@ -367,6 +521,9 @@ struct LowerLinalgGenericPattern
               })
               .Case<mlir::math::FloorOp>([&](mlir::math::FloorOp op) {
                 return lowerUnaryFOp(op, op.getOperand(), rewriter, true);
+              })
+              .Case<mlir::arith::SIToFPOp>([&](mlir::arith::SIToFPOp op) {
+                return lowerSIToFPOp(op, rewriter);
               })
               .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
                 return lowerAddFOp(op, rewriter, identity_map);
@@ -631,6 +788,20 @@ struct LowerLinalgGenericPattern
     return mlir::success();
   }
 
+  mlir::LogicalResult lowerSIToFPOp(mlir::arith::SIToFPOp op,
+                                    mlir::PatternRewriter& rewriter) const {
+    auto input_type = mlir::dyn_cast<mlir::VectorType>(op.getIn().getType());
+    if (!input_type) return mlir::failure();
+    if (!input_type.getElementType().isSignlessInteger(32) ||
+        !op.getType().isF32())
+      return op.emitError("only i32 to f32 conversion is supported");
+    auto result_type =
+        mlir::VectorType::get(input_type.getShape(), rewriter.getF32Type());
+    rewriter.replaceOpWithNewOp<mlir::vectorchain::CastOp>(
+        op, result_type, op.getIn(), /*mask=*/nullptr, /*dbgName=*/nullptr);
+    return mlir::success();
+  }
+
   mlir::LogicalResult lowerUnaryFOp(mlir::Operation* op, mlir::Value input,
                                     mlir::PatternRewriter& rewriter,
                                     bool floor) const {
@@ -850,4 +1021,8 @@ void scheduler::populateLinalgLoweringPatterns(
     mlir::RewritePatternSet& patterns, SymbolAllocator& symbols) {
   patterns.add<LowerLinalgGenericPattern>(patterns.getContext());
   patterns.add<LowerLinalgFillPattern>(patterns.getContext(), symbols);
+  patterns.add<LowerVectorTransferRead, LowerVectorTransferWrite,
+               LowerVectorMemory<mlir::vector::LoadOp>,
+               LowerVectorMemory<mlir::vector::StoreOp>, LowerVectorShuffle>(
+      patterns.getContext());
 }

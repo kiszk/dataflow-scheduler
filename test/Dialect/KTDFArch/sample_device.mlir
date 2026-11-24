@@ -83,6 +83,7 @@
       access_granularity = #ktdf_arch.map<
         "L1" = [
           {size_in_words = 64, align_in_words = 64},
+          {size_in_words = 16, align_in_words = 16},
           {size_in_words = 8,  align_in_words = 8},
           {size_in_words = 2,  align_in_words = 2}
         ]
@@ -95,7 +96,7 @@
   ktdf_arch.features = { ktdf_arch.feature.queue = { depth = 16, ordered } }
 }
 #L1LU_SUBCORE_FIFO = {
-  ktdf_arch.transfer_granularity = array<i64: 64, 2>,
+  ktdf_arch.transfer_granularity = array<i64: 64, 16, 2>,
   ktdf_arch.features = { ktdf_arch.feature.queue = { depth = 16, ordered } }
 }
 
@@ -106,6 +107,7 @@
       access_granularity = #ktdf_arch.map<
         "L1" = [
           {size_in_words = 64, align_in_words = 64}, 
+          {size_in_words = 16, align_in_words = 16},
           {size_in_words = 2, align_in_words = 2}
         ]
       >
@@ -116,7 +118,7 @@
   ktdf_arch.features = { ktdf_arch.feature.queue = { depth = 16, ordered } }
 }
 #L1SU_SUBCORE_FIFO = {
-  ktdf_arch.transfer_granularity = array<i64: 64, 2>,
+  ktdf_arch.transfer_granularity = array<i64: 64, 16, 2>,
   ktdf_arch.features = { ktdf_arch.feature.queue = { depth = 16, ordered } }
 }
 

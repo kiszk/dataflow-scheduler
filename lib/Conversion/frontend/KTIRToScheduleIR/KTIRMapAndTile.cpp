@@ -21,6 +21,7 @@
 #include <llvm/ADT/TypeSwitch.h>
 #include <llvm/Support/DebugLog.h>
 #include <llvm/Support/MathExtras.h>
+#include <mlir/Dialect/Affine/IR/AffineOps.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Arith/Utils/Utils.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -490,16 +491,255 @@ auto tileNumericCast(mlir::IRRewriter& rewriter, mlir::Operation* root,
   return mlir::success();
 }
 
+// Exchange the physical lane axis with an outer dimension in 16-byte words.
+// Keep the permutation in a small linalg.generic until its compute stage is
+// known. MaterializeRegisters then expands it into ordinary vector operations.
+std::optional<unsigned> transposeAxis(mlir::linalg::GenericOp op) {
+  if (!isIdentityGeneric(op)) return std::nullopt;
+  auto input =
+      mlir::cast<mlir::RankedTensorType>(op.getDpsInputs()[0].getType());
+  auto output = mlir::cast<mlir::RankedTensorType>(op.getResult(0).getType());
+  auto maps = op.getIndexingMapsArray();
+  auto element = input.getElementType();
+  const int64_t lanes = element.isF16() ? 64 : 32;
+  const int64_t word = lanes / 8;
+  if (!input.hasStaticShape() || !output.hasStaticShape() ||
+      (!element.isF16() && !element.isF32() &&
+       !element.isSignlessInteger(32)) ||
+      input.getEncoding() || output.getEncoding() ||
+      input.getElementType() != output.getElementType() ||
+      input.getRank() < 2 || output.getRank() < 2 ||
+      input.getShape().back() != lanes || output.getShape().back() % word ||
+      !maps.back().isPermutation() || maps.front().getNumSymbols())
+    return std::nullopt;
+  auto source = maps.front().compose(mlir::inversePermutation(maps.back()));
+  for (unsigned axis = 0; axis + 1 < output.getRank(); ++axis) {
+    auto d = mlir::getAffineDimExpr(axis, op.getContext());
+    if (output.getDimSize(axis) % lanes ||
+        (source.getResults().back() != d &&
+         source.getResults().back() != d % lanes))
+      continue;
+    bool valid = true;
+    for (auto expr : source.getResults().drop_back()) {
+      auto residual = expr.replace(
+          d.floorDiv(lanes), mlir::getAffineConstantExpr(0, op.getContext()));
+      valid &= !residual.isFunctionOfDim(axis);
+    }
+    if (valid) return axis;
+  }
+  return std::nullopt;
+}
+
+mlir::LogicalResult tileTranspose(mlir::IRRewriter& rw,
+                                  mlir::linalg::GenericOp op, unsigned axis,
+                                  mlir::ktdf_arch::Mapping& mapping) {
+  auto compute = getUniqueComputeUnit(mapping.byKind());
+  auto simd = compute ? compute.getFeature<mlir::ktdf_arch::feature::SIMD>()
+                      : mlir::ktdf_arch::feature::SIMD{};
+  auto loc = op.getLoc();
+  auto source = op.getDpsInputs()[0];
+  auto input = mlir::cast<mlir::RankedTensorType>(source.getType());
+  auto output = mlir::cast<mlir::RankedTensorType>(op.getResult(0).getType());
+  auto element = input.getElementType();
+  const int64_t lanes = element.isF16() ? 64 : 32;
+  const int64_t word = lanes / 8;
+  if (!simd || simd.getLanes(element) != lanes ||
+      simd.getSubSimdLanes(element) != word)
+    return op.emitError(
+        "transpose requires 128-byte SIMD and 16-byte sub-SIMD lanes");
+  auto maps = op.getIndexingMapsArray();
+  auto source_map = maps.front().compose(mlir::inversePermutation(maps.back()));
+  auto packet = mlir::RankedTensorType::get({word}, element);
+  auto tile_type = mlir::RankedTensorType::get({word, word}, element);
+  auto map_word = [&](mlir::Operation* operation) {
+    operation->setAttr("ktdf_arch.maps_to", compute.getKind());
+    setThrottle(operation, word);
+  };
+  rw.setInsertionPoint(op);
+  auto zero = mlir::arith::ConstantIndexOp::create(rw, loc, 0);
+  llvm::SmallVector<mlir::Value> coords(output.getRank(), zero);
+  mlir::Value chunk = zero;
+  auto init =
+      mlir::tensor::EmptyOp::create(rw, loc, output, mlir::ValueRange{});
+  auto visit = [&](auto&& self, mlir::OpBuilder& b, unsigned dim,
+                   mlir::Value dest) -> mlir::Value {
+    if (dim < output.getRank()) {
+      int64_t width = (dim == axis || dim + 1 == output.getRank()) ? word : 1;
+      auto bound = mlir::arith::ConstantIndexOp::create(
+          b, loc, dim == axis ? 8 : output.getDimSize(dim) / width);
+      auto step = mlir::arith::ConstantIndexOp::create(b, loc, 1);
+      auto block_loop = [&](mlir::OpBuilder& builder, mlir::Value init) {
+        return mlir::scf::ForOp::create(
+                   builder, loc, zero, bound, step, mlir::ValueRange{init},
+                   [&](mlir::OpBuilder& inner, mlir::Location, mlir::Value iv,
+                       mlir::ValueRange carried) {
+                     coords[dim] = iv;
+                     mlir::scf::YieldOp::create(
+                         inner, loc,
+                         self(self, inner, dim + 1, carried.front()));
+                   })
+            .getResult(0);
+      };
+      if (dim != axis) return block_loop(b, dest);
+      auto chunks = mlir::arith::ConstantIndexOp::create(
+          b, loc, output.getDimSize(dim) / lanes);
+      return mlir::scf::ForOp::create(
+                 b, loc, zero, chunks, step, mlir::ValueRange{dest},
+                 [&](mlir::OpBuilder& inner, mlir::Location, mlir::Value iv,
+                     mlir::ValueRange carried) {
+                   chunk = iv;
+                   mlir::scf::YieldOp::create(
+                       inner, loc, block_loop(inner, carried.front()));
+                 })
+          .getResult(0);
+    }
+    auto tile_coords = coords;
+    for (unsigned d = 0; d < output.getRank(); ++d) {
+      int64_t width = (d == axis || d + 1 == output.getRank()) ? word : 1;
+      tile_coords[d] = mlir::affine::AffineApplyOp::create(
+          b, loc, mlir::AffineMap::get(1, 0, b.getAffineDimExpr(0) * width),
+          mlir::ValueRange{coords[d]});
+    }
+    llvm::SmallVector<mlir::Value> inputs;
+    llvm::SmallVector<mlir::OpFoldResult> sizes(input.getRank(),
+                                                b.getIndexAttr(1));
+    auto strides = sizes;
+    sizes.back() = b.getIndexAttr(word);
+    for (unsigned row = 0; row < word; ++row) {
+      auto indices = tile_coords;
+      indices.back() = mlir::affine::makeComposedAffineApply(
+          b, loc, mlir::AffineMap::get(1, 0, b.getAffineDimExpr(0) + row),
+          {indices.back()});
+      indices.push_back(chunk);
+      llvm::SmallVector<mlir::OpFoldResult> offsets;
+      for (auto [d, expr] : llvm::enumerate(source_map.getResults())) {
+        auto axis_expr = b.getAffineDimExpr(axis);
+        auto lowered = d + 1 == static_cast<unsigned>(input.getRank())
+                           ? axis_expr
+                           : expr.replace(axis_expr.floorDiv(lanes),
+                                          b.getAffineDimExpr(output.getRank()));
+        offsets.push_back(
+            mlir::affine::makeComposedAffineApply(
+                b, loc, mlir::AffineMap::get(output.getRank() + 1, 0, lowered),
+                mlir::getAsOpFoldResult(indices))
+                .getResult());
+      }
+      inputs.push_back(mlir::tensor::ExtractSliceOp::create(
+          b, loc, packet, source, offsets, sizes, strides));
+    }
+    mlir::Value assembled =
+        mlir::tensor::EmptyOp::create(b, loc, tile_type, mlir::ValueRange{});
+    for (int64_t row = 0; row < word; ++row) {
+      auto insert = mlir::tensor::InsertSliceOp::create(
+          b, loc, inputs[row], assembled,
+          llvm::ArrayRef<mlir::OpFoldResult>{b.getIndexAttr(row),
+                                             b.getIndexAttr(0)},
+          llvm::ArrayRef<mlir::OpFoldResult>{b.getIndexAttr(1),
+                                             b.getIndexAttr(word)},
+          llvm::ArrayRef<mlir::OpFoldResult>{b.getIndexAttr(1),
+                                             b.getIndexAttr(1)});
+      map_word(insert);
+      assembled = insert;
+    }
+    auto empty =
+        mlir::tensor::EmptyOp::create(b, loc, tile_type, mlir::ValueRange{});
+    auto transpose = mlir::linalg::GenericOp::create(
+        b, loc, mlir::TypeRange{tile_type}, mlir::ValueRange{assembled},
+        mlir::ValueRange{empty},
+        llvm::ArrayRef{mlir::AffineMap::getPermutationMap(
+                           llvm::ArrayRef<unsigned>{1, 0}, b.getContext()),
+                       b.getMultiDimIdentityMap(2)},
+        llvm::SmallVector<mlir::utils::IteratorType>(
+            2, mlir::utils::IteratorType::parallel),
+        [&](mlir::OpBuilder& body, mlir::Location l, mlir::ValueRange args) {
+          auto copy = mlir::spyreop::Identity::create(body, l, args[0]);
+          mlir::linalg::YieldOp::create(body, l, copy.getResult());
+        });
+    map_word(transpose);
+    sizes.assign(output.getRank(), b.getIndexAttr(1));
+    strides = sizes;
+    sizes.back() = b.getIndexAttr(word);
+    tile_coords[axis] = mlir::affine::AffineApplyOp::create(
+        b, loc,
+        mlir::AffineMap::get(
+            2, 0, b.getAffineDimExpr(0) * lanes + b.getAffineDimExpr(1)),
+        mlir::ValueRange{chunk, tile_coords[axis]});
+    for (unsigned column = 0; column < word; ++column) {
+      llvm::SmallVector<mlir::OpFoldResult> offsets(tile_coords.begin(),
+                                                    tile_coords.end());
+      offsets[axis] =
+          mlir::affine::makeComposedAffineApply(
+              b, loc,
+              mlir::AffineMap::get(1, 0, b.getAffineDimExpr(0) + column),
+              {tile_coords[axis]})
+              .getResult();
+      auto output_word = mlir::tensor::ExtractSliceOp::create(
+          b, loc, packet, transpose.getResult(0),
+          llvm::ArrayRef<mlir::OpFoldResult>{b.getIndexAttr(column),
+                                             b.getIndexAttr(0)},
+          llvm::ArrayRef<mlir::OpFoldResult>{b.getIndexAttr(1),
+                                             b.getIndexAttr(word)},
+          llvm::ArrayRef<mlir::OpFoldResult>{b.getIndexAttr(1),
+                                             b.getIndexAttr(1)});
+      map_word(output_word);
+      dest = mlir::tensor::InsertSliceOp::create(b, loc, output_word, dest,
+                                                 offsets, sizes, strides);
+    }
+    return dest;
+  };
+  rw.replaceOp(op, visit(visit, rw, 0, init));
+  return mlir::success();
+}
+
 void KTIRNumericCastTilingPass::runOnOperation() {
   auto func = getOperation();
+  llvm::SmallVector<std::pair<mlir::linalg::GenericOp, unsigned>> transposes;
   for (auto generic : func.getOps<mlir::linalg::GenericOp>()) {
+    if (auto axis = transposeAxis(generic)) {
+      transposes.emplace_back(generic, *axis);
+      continue;
+    }
+    if (isIdentityGeneric(generic)) {
+      auto maps = generic.getIndexingMapsArray();
+      if (maps[0].isPermutation() && maps[1].isPermutation()) {
+        auto source = maps[0].compose(mlir::inversePermutation(maps[1]));
+        if (source.getNumResults() &&
+            source.getResults().back() !=
+                mlir::getAffineDimExpr(source.getNumDims() - 1,
+                                       func.getContext())) {
+          generic.emitError(
+              "Standard lane transpose requires full SIMD input sticks and "
+              "complete output words");
+          return signalPassFailure();
+        }
+      }
+    }
+    auto lane_preserving = [&] {
+      auto maps = generic.getIndexingMapsArray();
+      if (maps.size() != 2 || !maps.back().isIdentity()) return false;
+      auto type = mlir::cast<mlir::ShapedType>(generic.getResult(0).getType());
+      if (!type.hasStaticShape() || !type.getRank()) return false;
+      auto lane = mlir::getAffineDimExpr(type.getRank() - 1, func.getContext());
+      auto width = type.getShape().back();
+      auto source = maps.front();
+      if (source.getResults().back() != lane &&
+          source.getResults().back() != lane % width)
+        return false;
+      return llvm::all_of(
+          source.getResults().drop_back(), [&](mlir::AffineExpr expr) {
+            return !expr.replace(
+                            lane.floorDiv(width),
+                            mlir::getAffineConstantExpr(0, func.getContext()))
+                        .isFunctionOfDim(type.getRank() - 1);
+          });
+    };
     if (!generic.getBody()->getOps<mlir::spyreop::Identity>().empty() &&
         llvm::any_of(generic.getIndexingMapsArray(),
                      [](auto map) {
                        return !map.isProjectedPermutation(
                            /*allowZeroInResults=*/true);
                      }) &&
-        !getPacketRelayoutDirection(generic)) {
+        !getPacketRelayoutDirection(generic) && !lane_preserving()) {
       generic.emitError(
           "no target packet relayout recipe for these indexing_maps and tensor "
           "shape");
@@ -510,11 +750,15 @@ void KTIRNumericCastTilingPass::runOnOperation() {
       llvm::any_of(func.getOps<mlir::linalg::GenericOp>(), [](auto op) {
         return getNumericCast(op) || getPacketRelayoutDirection(op).has_value();
       });
-  if (!has_packet_op) return;
+  if (!has_packet_op && transposes.empty()) return;
   auto& default_device = getAnalysis<mlir::ktdf_arch::DefaultDevice>();
   if (!default_device) return signalPassFailure();
   mlir::ktdf_arch::Mapping mapping(default_device.getRef());
   mlir::IRRewriter rewriter(func);
+  for (auto [generic, axis] : transposes)
+    if (failed(tileTranspose(rewriter, generic, axis, mapping)))
+      return signalPassFailure();
+  if (!has_packet_op) return;
   // The current FIFO route has one consumer per packet. Specialize pure
   // tensor producers per use before tiling, so independently ordered stores
   // never share a FIFO read or overwrite a sibling use's intermediate value.
@@ -1215,6 +1459,9 @@ void KTIRMapAndTilePass::runOnOperation() {
 
     LDBG() << "mapping nested " << mlir::OpWithFlags(op, kSkipRegions);
     mapToCompute(op, mapping, result_type.getElementType());
+    if (auto generic =
+            mlir::dyn_cast<mlir::linalg::GenericOp>(op.getOperation()))
+      if (auto width = getWordTransposeWidth(generic)) setThrottle(op, width);
   }
 
   // Tile all the compute operations and put them into loop nests that feature

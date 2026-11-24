@@ -475,8 +475,13 @@ def MaterializeRegistersPass : Pass<"materialize-registers", "mlir::ModuleOp"> {
     with a `ktdf_arch.maps_to` attribute, which needs an allocation and a fill
     of its own.
 
-    This requires the cardinality of the `linalg.generic` iteration domain to
-    be statically known, and all consumers of the registers to be either
+    It also expands complete word-sized identity transposes inside a mapped
+    compute stage into vector transfers, loads, stores and shuffles. Their
+    scratch registers are private to the pipeline and are allocated before
+    address assignment. FIFO words are consumed in their scheduled order.
+
+    Constant materialization requires the cardinality of the `linalg.generic`
+    iteration domain to be statically known, and its register consumers to be
     `memref.load`, `memref.store` or `ktdf.opaque`. Register sizes are
     increased to match the iteration domain, but scalar users remain fixed to
     the first element of the allocated segment. A store of a value the body
@@ -511,7 +516,9 @@ def MaterializeRegistersPass : Pass<"materialize-registers", "mlir::ModuleOp"> {
     "mlir::arith::ArithDialect",
     "mlir::ktdf::KTDFDialect",
     "mlir::linalg::LinalgDialect",
-    "mlir::memref::MemRefDialect"
+    "mlir::memref::MemRefDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::vector::VectorDialect"
   ];
 }
 

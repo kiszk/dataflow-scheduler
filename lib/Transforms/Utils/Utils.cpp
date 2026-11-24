@@ -25,9 +25,10 @@
 #include <algorithm>
 #include <cassert>
 
-#include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
+#include "ktir/Dialect/SpyreOp/SpyreOp.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -171,4 +172,87 @@ int64_t scheduler::getVectorLanes(mlir::Type elem_type,
   if (!lanes && mlir::isa<mlir::spyreop::DF16Type>(elem_type))
     lanes = simd.getLanes(mlir::Float16Type::get(elem_type.getContext()));
   return std::max(lanes, int64_t{1});
+}
+
+void scheduler::composeIndexMap(mlir::AffineMap& map,
+                                llvm::SmallVectorImpl<mlir::Value>& operands) {
+  auto* ctx = map.getContext();
+  llvm::SmallVector<mlir::Value> leaves;
+  auto index_expr = [&](auto&& self, mlir::Value value) -> mlir::AffineExpr {
+    if (auto constant = value.getDefiningOp<mlir::arith::ConstantIndexOp>())
+      return mlir::getAffineConstantExpr(constant.value(), ctx);
+    if (auto apply = value.getDefiningOp<mlir::affine::AffineApplyOp>()) {
+      auto nested = apply.getAffineMap();
+      auto replacements = llvm::map_to_vector(
+          apply.getMapOperands(), [&](mlir::Value v) { return self(self, v); });
+      auto expressions = llvm::ArrayRef(replacements);
+      return nested.getResult(0).replaceDimsAndSymbols(
+          expressions.take_front(nested.getNumDims()),
+          expressions.drop_front(nested.getNumDims()));
+    }
+    if (auto add = value.getDefiningOp<mlir::arith::AddIOp>())
+      return self(self, add.getLhs()) + self(self, add.getRhs());
+    if (auto mul = value.getDefiningOp<mlir::arith::MulIOp>()) {
+      if (auto constant =
+              mul.getLhs().getDefiningOp<mlir::arith::ConstantIndexOp>())
+        return self(self, mul.getRhs()) * constant.value();
+      if (auto constant =
+              mul.getRhs().getDefiningOp<mlir::arith::ConstantIndexOp>())
+        return self(self, mul.getLhs()) * constant.value();
+    }
+    auto it = llvm::find(leaves, value);
+    if (it != leaves.end())
+      return mlir::getAffineDimExpr(std::distance(leaves.begin(), it), ctx);
+    leaves.push_back(value);
+    return mlir::getAffineDimExpr(leaves.size() - 1, ctx);
+  };
+  auto replacements = llvm::map_to_vector(
+      operands, [&](mlir::Value v) { return index_expr(index_expr, v); });
+  auto expressions = llvm::ArrayRef(replacements);
+  map = map.replaceDimsAndSymbols(expressions.take_front(map.getNumDims()),
+                                  expressions.drop_front(map.getNumDims()),
+                                  leaves.size(), 0);
+  operands.assign(leaves.begin(), leaves.end());
+  mlir::affine::canonicalizeMapAndOperands(&map, &operands);
+  // Canonicalization may promote loop-invariant indices to symbols. Access
+  // maps retain the dimensions-only contract in dims/symbols operand order.
+  auto inputs = mlir::AffineMap::getMultiDimIdentityMap(map.getNumInputs(), ctx)
+                    .getResults();
+  map = mlir::simplifyAffineMap(map.replaceDimsAndSymbols(
+      inputs.take_front(map.getNumDims()), inputs.drop_front(map.getNumDims()),
+      map.getNumInputs(), 0));
+}
+
+bool scheduler::isIdentityGeneric(mlir::linalg::GenericOp generic) {
+  if (!generic.hasPureTensorSemantics() || generic.getNumDpsInputs() != 1 ||
+      generic.getNumDpsInits() != 1 || generic.getNumResults() != 1 ||
+      !llvm::all_of(generic.getIteratorTypesArray(), [](auto it) {
+        return it == mlir::utils::IteratorType::parallel;
+      }))
+    return false;
+  auto* body = generic.getBody();
+  auto yielded = body->getTerminator()->getOperand(0);
+  if (body->getOperations().size() == 1) return yielded == body->getArgument(0);
+  auto identity = mlir::dyn_cast<mlir::spyreop::Identity>(body->front());
+  return body->getOperations().size() == 2 && identity &&
+         identity.getOperand() == body->getArgument(0) &&
+         yielded == identity.getResult();
+}
+
+int64_t scheduler::getWordTransposeWidth(mlir::linalg::GenericOp generic) {
+  if (!isIdentityGeneric(generic)) return 0;
+  auto type =
+      mlir::cast<mlir::RankedTensorType>(generic.getResult(0).getType());
+  auto element = type.getElementType();
+  int64_t width = element.isF16() ? 8 : 4;
+  if ((!element.isF16() && !element.isF32() &&
+       !element.isSignlessInteger(32)) ||
+      type.getEncoding() ||
+      type.getShape() != llvm::ArrayRef<int64_t>{width, width} ||
+      generic.getDpsInputs()[0].getType() != type)
+    return 0;
+  auto maps = generic.getIndexingMapsArray();
+  auto transpose = mlir::AffineMap::getPermutationMap(
+      llvm::ArrayRef<unsigned>{1, 0}, generic.getContext());
+  return maps[0] == transpose && maps[1].isIdentity() ? width : 0;
 }
