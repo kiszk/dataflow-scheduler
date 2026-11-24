@@ -1,32 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
-// RUN: dataflow-scheduler-opt %s -ktdflowering-to-dfir | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=dataflow.opaque
+// RUN: dataflow-scheduler-opt %s --split-input-file -pass-pipeline='builtin.module(materialize-registers,address-assignment,ktdflowering-to-dfir)' | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=ktdf.opaque --implicit-check-not=vectorchain.scan_with_gap
 
-// FP32 MAX must fold four lanes per sub-SIMD group, then use FP32 REDUCE.
+// Both precisions use common opaque lowering, including allocation of the
+// in-place accumulator and its physical register dictionaries.
+
+// CHECK-LABEL: func.func @inner_max_f16()
+// CHECK: dataflow.opaque {dataflow_scheduler.register_names = ["t0", "t0"], func_name = "simdreduction_minmax", parameter_dictionary = {unroll = "1", x1 = "0", x2 = "8"}, read_only_register_dictionary = {}, read_write_register_dictionary = {t0 = "R0"}}
+ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+
+func.func @inner_max_f16() attributes {grid = [1]} {
+  %unit = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
+  ktdf_lowering.execute_on %unit {
+    %input = memref.alloc() : memref<1x64xf16, "SFU_REG">
+    ktdf.opaque "simdreduction_minmax" {
+      dataflow_scheduler.register_names = ["t0", "t0"],
+      func_name = "simdreduction_minmax", parameter_dictionary = {unroll = "1", x1 = "0", x2 = "8"}
+    } ins(%input : memref<1x64xf16, "SFU_REG">)
+      outs(%input : memref<1x64xf16, "SFU_REG">)
+  }
+  return
+}
+
+// -----
+
 // CHECK-LABEL: func.func @inner_max_f32()
-// CHECK: vectorchain.shuffle {{.*}}indices = [1 : i32, 0 : i32, 3 : i32, 3 : i32]{{.*}}repetition = 8
-// CHECK: vectorchain.binary {{.*}}binary_op = #vectorchain<binary_operator max>
-// CHECK: vectorchain.shuffle {{.*}}indices = [2 : i32, 0 : i32, 1 : i32, 3 : i32]{{.*}}repetition = 8
-// CHECK: vectorchain.binary {{.*}}binary_op = #vectorchain<binary_operator max>
-// CHECK: vectorchain.scan_with_gap {{.*}}gap = 8 : index{{.*}}reduction_op = #vectorchain<binary_operator max>
-// CHECK: agen.vector_store {{.*}}vector<32xf32>
-ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
+// CHECK: dataflow.opaque {dataflow_scheduler.register_names = ["t0", "t0"], func_name = "simdreduction_minmax_fp32", parameter_dictionary = {unroll = "1", x1 = "0", x2 = "8"}, read_only_register_dictionary = {}, read_write_register_dictionary = {t0 = "R0"}}
+ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
 func.func @inner_max_f32() attributes {grid = [1]} {
   %unit = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
   ktdf_lowering.execute_on %unit {
     %input = memref.alloc() : memref<1x32xf32, "SFU_REG">
-    %head = memref.subview %input[0, 0] [1, 1] [1, 1]
-        : memref<1x32xf32, "SFU_REG"> to memref<1x1xf32, strided<[32, 1]>, "SFU_REG">
-    linalg.generic {
-      indexing_maps = [affine_map<(r, l, o) -> (r, l)>,
-                       affine_map<(r, l, o) -> (r, o)>],
-      iterator_types = ["parallel", "reduction", "parallel"]
+    ktdf.opaque "simdreduction_minmax_fp32" {
+      dataflow_scheduler.register_names = ["t0", "t0"],
+      func_name = "simdreduction_minmax_fp32", parameter_dictionary = {unroll = "1", x1 = "0", x2 = "8"}
     } ins(%input : memref<1x32xf32, "SFU_REG">)
-      outs(%head : memref<1x1xf32, strided<[32, 1]>, "SFU_REG">) {
-    ^bb0(%value: f32, %acc: f32):
-      %max = arith.maximumf %value, %acc : f32
-      linalg.yield %max : f32
-    }
+      outs(%input : memref<1x32xf32, "SFU_REG">)
   }
   return
 }

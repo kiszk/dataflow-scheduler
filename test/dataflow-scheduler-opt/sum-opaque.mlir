@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// RUN: dataflow-scheduler-opt %s --split-input-file -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=ktdf.opaque --implicit-check-not=vectorchain.scan_with_gap
+// RUN: dataflow-scheduler-opt %s --split-input-file -allow-unregistered-dialect -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=ktdf.opaque --implicit-check-not=vectorchain.scan_with_gap
 
-// Accumulate two sticks per row, then reduce the lanes with the architecture's
-// SUM template. Only lane 0 of each output stick is the logical row sum.
+// Accumulate two sticks per row, then reduce the lanes with a precision-specific
+// SUM test op. Only lane 0 of each output stick is the logical row sum.
 // Both FP16 and FP32 must take the same complete KTIR -> KTDF -> DFIR pipeline.
 
 // CHECK-LABEL: func.func @sum_f16(
@@ -10,12 +10,13 @@
 // CHECK-LABEL: func.func @local_schedule_0_body()
 // CHECK: dataflow.receive {{.*}}vector<64xf16>
 // CHECK: vectorchain.binary {{.*}}binary_operator add{{.*}}vector<64xf16>
-// CHECK: dataflow.opaque {{.*}}func_name = "simdreduction_sum"
-// CHECK-SAME: parameter_dictionary = {unroll = "1"}
-// CHECK-SAME: read_write_register_dictionary = {t0 = "R{{[0-9]+}}"}
+// CHECK: "test.simd_reduction_sum"
 // CHECK: dataflow.send {{.*}}vector<64xf16>
 
-ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
+ktdf_arch.device @sample_device attributes {
+  mem_space_mapping = #ktdf_arch.map<
+    #ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">
+} import("../Dialect/KTDFArch/sample_device.mlir")
 
 #input = affine_set<(k, r, l) :
     (k >= 0, 1 - k >= 0, r >= 0, 1 - r >= 0, l >= 0, 63 - l >= 0)>
@@ -61,12 +62,13 @@ func.func @sum_f16(%src: index, %dst: index) attributes {grid = [1]} {
 // CHECK-LABEL: func.func @local_schedule_0_body()
 // CHECK: dataflow.receive {{.*}}vector<32xf32>
 // CHECK: vectorchain.binary {{.*}}binary_operator add{{.*}}vector<32xf32>
-// CHECK: dataflow.opaque {{.*}}func_name = "simdreduction_sum_fp32"
-// CHECK-SAME: parameter_dictionary = {unroll = "1"}
-// CHECK-SAME: read_write_register_dictionary = {t0 = "R{{[0-9]+}}"}
+// CHECK: "test.simd_reduction_sum_fp32"
 // CHECK: dataflow.send {{.*}}vector<32xf32>
 
-ktdf_arch.device @sample_device import("Inputs/access-order-device.mlir")
+ktdf_arch.device @sample_device attributes {
+  mem_space_mapping = #ktdf_arch.map<
+    #ktdp.memory_space<global> = "DDR", #ktdp.memory_space<ct_local> = "L1">
+} import("../Dialect/KTDFArch/sample_device.mlir")
 
 #input = affine_set<(k, r, l) :
     (k >= 0, 1 - k >= 0, r >= 0, 1 - r >= 0, l >= 0, 31 - l >= 0)>

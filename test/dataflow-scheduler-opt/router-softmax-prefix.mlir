@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// RUN: dataflow-scheduler-opt %s -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=spyreop.numeric_cast
+// RUN: dataflow-scheduler-opt %s -kEmitDFIR --split-dfir-output-dir=%t | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=spyreop.numeric_cast --implicit-check-not=vectorchain.scan_with_gap
 
 // Gemma4 router softmax prefix, bf16 [128,128], with 32-way row division:
 // DL16 -> Staggered FP32 -> row MAX -> subtract -> exp -> row SUM.
-// Intermediates use ct_local. The opaque exp and SUM fixtures exercise the
-// shared device-pattern path; FP32 MAX uses native VectorChain forwarding.
+// Intermediates use ct_local. The opaque exp, MAX and SUM fixtures exercise
+// the shared device-pattern path.
 // Hardware coverage also checks division and the final Staggered FP32 D2H.
 // CHECK-LABEL: func.func @router_softmax_prefix
 // CHECK: call @local_schedule_4
@@ -12,7 +12,7 @@
 // CHECK: vectorchain.cast
 // CHECK-LABEL: func.func @local_schedule_1_body
 // CHECK: vectorchain.binary {{.*}}binary_operator max
-// CHECK: vectorchain.scan_with_gap {{.*}}reduction_op = #vectorchain<binary_operator max>
+// CHECK: dataflow.opaque {{.*}}func_name = "simdreduction_minmax_fp32"{{.*}}parameter_dictionary = {unroll = "1", x1 = "0", x2 = "8"}
 // CHECK-LABEL: func.func @local_schedule_2_body
 // CHECK: vectorchain.binary {{.*}}binary_operator sub
 // CHECK-LABEL: func.func @local_schedule_3_body

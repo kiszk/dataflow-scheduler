@@ -5,7 +5,7 @@
 // elementwise lowering, even if the scalar body is otherwise supported.
 // A partial register cannot use the full-register SUM template.
 // CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
-ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
+ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
   %unit = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
@@ -31,7 +31,7 @@ func.func @inner_sum() attributes {grid = [1]} {
 
 // A subview at a nonzero lane is not the reduction destination.
 // CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
-ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
+ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
   %unit = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
@@ -57,7 +57,7 @@ func.func @inner_sum() attributes {grid = [1]} {
 
 // An unsupported reduction must not become an elementwise multiply.
 // CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
-ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
+ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
   %unit = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
@@ -83,7 +83,7 @@ func.func @inner_sum() attributes {grid = [1]} {
 
 // A reduction left on a load-only unit must also be rejected.
 // CHECK: error: inner reduction must be lowered by device patterns before DataflowIR conversion
-ktdf_arch.device @sample_device import("../../../../dataflow-scheduler-opt/Inputs/access-order-device.mlir")
+ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
 func.func @inner_sum() attributes {grid = [1]} {
   %unit = dataflow.get_unit {core = 0 : i32, name = "C0-L1LU", type = "L1LU"} : index
