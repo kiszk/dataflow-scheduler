@@ -1,52 +1,69 @@
-// RUN: dataflow-scheduler-opt %s --split-input-file -allow-unregistered-dialect -apply-device-patterns='groups=post_scheduling' | FileCheck %s --implicit-check-not=linalg.generic --implicit-check-not=memref.subview --implicit-check-not=ktdf.opaque
+// RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect -apply-device-patterns='groups=post_scheduling' | FileCheck %s
 
-// The sample device selects a precision-specific test op and passes the whole
-// accumulator register rather than the one-element output subview.
+// CHECK-LABEL:   func.func @sum_reduction() {
+// CHECK-NEXT:     %[[ALLOC_0:.*]] = memref.alloc() : memref<64x32xf16, "L1">
+// CHECK-NEXT:     %[[ALLOC_1:.*]] = memref.alloc() : memref<64xf16, "L1">
+// CHECK-NEXT:     "test.simd_reduction_sum"(%[[ALLOC_0]], %[[ALLOC_1]]) : (memref<64x32xf16, "L1">, memref<64xf16, "L1">) -> ()
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
 
-// CHECK-LABEL: func.func @sum_reduction_f16()
-// CHECK: %[[REG:.*]] = memref.alloc() : memref<64xf16, "SFU_REG">
-// CHECK-NEXT: "test.simd_reduction_sum"(%[[REG]], %[[REG]]) : (memref<64xf16, "SFU_REG">, memref<64xf16, "SFU_REG">) -> ()
-// CHECK-NEXT: return
+// CHECK-LABEL:   func.func @sum_reduction_f32() {
+// CHECK-NEXT:     %[[ALLOC_0:.*]] = memref.alloc() : memref<64x32xf32, "L1">
+// CHECK-NEXT:     %[[ALLOC_1:.*]] = memref.alloc() : memref<64xf32, "L1">
+// CHECK-NEXT:     "test.simd_reduction_sum_fp32"(%[[ALLOC_0]], %[[ALLOC_1]]) : (memref<64x32xf32, "L1">, memref<64xf32, "L1">) -> ()
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
+
+
+// Verify that the post_scheduling PDL pattern in the sample device rewrites a
+// linalg.generic sum-reduction (inner-dim, output via subview) into a bare
+// test.simd_reduction op whose second operand is the subview's *source*.
+
+#map_in  = affine_map<(d0, d1) -> (d0, d1)>
+#map_out = affine_map<(d0, d1) -> (d0)>
+
 module {
-  ktdf_arch.device @sample_device import("../../Dialect/KTDFArch/sample_device.mlir")
-  func.func @sum_reduction_f16() {
-    %input = memref.alloc() : memref<64xf16, "SFU_REG">
-    %head = memref.subview %input[0] [1] [1]
-        : memref<64xf16, "SFU_REG"> to memref<1xf16, "SFU_REG">
+  ktdf_arch.device @sample_device attributes {} import("../../Dialect/KTDFArch/sample_device.mlir")
+
+  func.func @sum_reduction() {
+    %alloc_in  = memref.alloc() : memref<64x32xf16, "L1">
+    %alloc_acc = memref.alloc() : memref<64xf16, "L1">
+
+    // The pattern requires the output to be a memref.subview of the accumulator.
+    %subview = memref.subview %alloc_acc[0][64][1]
+        : memref<64xf16, "L1"> to memref<64xf16, "L1">
+
     linalg.generic {
-      indexing_maps = [affine_map<(l, o) -> (l)>, affine_map<(l, o) -> (o)>],
-      iterator_types = ["reduction", "parallel"]
-    } ins(%input : memref<64xf16, "SFU_REG">)
-      outs(%head : memref<1xf16, "SFU_REG">) {
-    ^bb0(%value: f16, %acc: f16):
-      %sum = arith.addf %value, %acc : f16
+      indexing_maps = [#map_in, #map_out],
+      iterator_types = ["parallel", "reduction"]
+    } ins(%alloc_in : memref<64x32xf16, "L1">)
+      outs(%subview  : memref<64xf16, "L1">) {
+    ^bb0(%in: f16, %out: f16):
+      %sum = arith.addf %in, %out : f16
       linalg.yield %sum : f16
     }
+
     return
   }
-}
 
-// -----
-
-// CHECK-LABEL: func.func @sum_reduction_f32()
-// CHECK: %[[REG:.*]] = memref.alloc() : memref<32xf32, "SFU_REG">
-// CHECK-NEXT: "test.simd_reduction_sum_fp32"(%[[REG]], %[[REG]]) : (memref<32xf32, "SFU_REG">, memref<32xf32, "SFU_REG">) -> ()
-// CHECK-NEXT: return
-module {
-  ktdf_arch.device @sample_device import("../../Dialect/KTDFArch/sample_device.mlir")
   func.func @sum_reduction_f32() {
-    %input = memref.alloc() : memref<32xf32, "SFU_REG">
-    %head = memref.subview %input[0] [1] [1]
-        : memref<32xf32, "SFU_REG"> to memref<1xf32, "SFU_REG">
+    %alloc_in  = memref.alloc() : memref<64x32xf32, "L1">
+    %alloc_acc = memref.alloc() : memref<64xf32, "L1">
+
+    // The pattern requires the output to be a memref.subview of the accumulator.
+    %subview = memref.subview %alloc_acc[0][64][1]
+        : memref<64xf32, "L1"> to memref<64xf32, "L1">
+
     linalg.generic {
-      indexing_maps = [affine_map<(l, o) -> (l)>, affine_map<(l, o) -> (o)>],
-      iterator_types = ["reduction", "parallel"]
-    } ins(%input : memref<32xf32, "SFU_REG">)
-      outs(%head : memref<1xf32, "SFU_REG">) {
-    ^bb0(%value: f32, %acc: f32):
-      %sum = arith.addf %value, %acc : f32
+      indexing_maps = [#map_in, #map_out],
+      iterator_types = ["parallel", "reduction"]
+    } ins(%alloc_in : memref<64x32xf32, "L1">)
+      outs(%subview  : memref<64xf32, "L1">) {
+    ^bb0(%in: f32, %out: f32):
+      %sum = arith.addf %in, %out : f32
       linalg.yield %sum : f32
     }
+
     return
   }
 }

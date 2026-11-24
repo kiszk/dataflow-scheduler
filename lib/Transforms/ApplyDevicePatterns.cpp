@@ -134,10 +134,20 @@ auto reductionKindOf(mlir::Value yielded) -> llvm::StringRef {
   return "absmax";
 }
 
-// Rewrite helper: ktdf.template_for_precision(op, names) -> StringAttr.
-// The accumulator's element type selects "fp16" or "fp32" from a dictionary.
-// A string instead supplies a base name to which "_fp16" or "_fp32" is
-// appended.
+// Rewrite helper: ktdf.template_for_precision(op, name) → StringAttr
+//
+// Expected `values` entries, two of them in this order:
+//   [0] mlir::Operation*  — the op whose accumulator gives the element type
+//   [1] mlir::Attribute   — a StringAttr naming the template, less the width,
+//                         or a DictionaryAttr mapping precision to full names
+//
+// For a string, returns `name` with the accumulator's precision
+// appended, "_fp16" or "_fp32", as the templates written for each width are
+// named. Fails for a type no template is written for, so the compute is left as
+// it is rather than lowered at the wrong width.
+//
+// For a dictionary, returns the full template name under "fp16" or "fp32".
+// Fails if the selected entry is missing.
 auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
                               mlir::PDLResultList& results,
                               llvm::ArrayRef<mlir::PDLValue> values)
