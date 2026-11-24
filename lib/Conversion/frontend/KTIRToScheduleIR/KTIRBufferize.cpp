@@ -493,9 +493,8 @@ struct LowerTiledLoad : mlir::OpRewritePattern<mlir::ktdp_lowering::LoadOp> {
           });
       // Preserve the readable extent along a physically contiguous dimension.
       const auto view_type = memory_view.getType();
-      if (repeats_source &&
-          (view_type.getElementType().isF32() ||
-           view_type.getElementType().isInteger(32))) {
+      if (repeats_source && (view_type.getElementType().isF32() ||
+                             view_type.getElementType().isInteger(32))) {
         for (size_t dim = 0; dim < view_shape.size(); ++dim) {
           if (view_shape[dim] == 1 && view_type.getDimSize(dim) > 1 &&
               mlir::isZeroInteger((*indices)[dim]) && strides[dim] == 1) {
