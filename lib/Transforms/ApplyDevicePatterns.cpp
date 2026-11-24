@@ -139,12 +139,16 @@ auto reductionKindOf(mlir::Value yielded) -> llvm::StringRef {
 //
 // Expected `values` entries, two of them in this order:
 //   [0] mlir::Operation*  — the op whose accumulator gives the element type
-//   [1] mlir::Attribute   — a StringAttr naming the template, less the width
+//   [1] mlir::Attribute   — a StringAttr naming the template, less the width,
+//                         or a DictionaryAttr mapping precision to full names
 //
-// Returns `name` with the precision of the element type the op accumulates in
+// For a string, returns `name` with the accumulator's precision
 // appended, "_fp16" or "_fp32", as the templates written for each width are
 // named. Fails for a type no template is written for, so the compute is left as
 // it is rather than lowered at the wrong width.
+//
+// For a dictionary, returns the full template name under "fp16" or "fp32".
+// Fails if the selected entry is missing.
 auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
                               mlir::PDLResultList& results,
                               llvm::ArrayRef<mlir::PDLValue> values)
@@ -153,10 +157,6 @@ auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
   auto written = llvm::dyn_cast_if_present<mlir::DestinationStyleOpInterface>(
       values[0].cast<mlir::Operation*>());
   if (!written || written.getDpsInits().empty()) return mlir::failure();
-  auto name = llvm::dyn_cast_if_present<mlir::StringAttr>(
-      values[1].cast<mlir::Attribute>());
-  if (!name) return mlir::failure();
-
   auto accumulator =
       llvm::dyn_cast<mlir::ShapedType>(written.getDpsInits().front().getType());
   if (!accumulator) return mlir::failure();
@@ -171,15 +171,24 @@ auto ktdfTemplateForPrecision(mlir::PatternRewriter& rewriter,
     return mlir::failure();
   }
 
-  results.push_back(rewriter.getStringAttr(name.getValue() + precision));
+  mlir::Attribute names = values[1].cast<mlir::Attribute>();
+  mlir::StringAttr name;
+  if (auto table = llvm::dyn_cast<mlir::DictionaryAttr>(names)) {
+    name = table.getAs<mlir::StringAttr>(precision.drop_front());
+  } else if (auto base = llvm::dyn_cast<mlir::StringAttr>(names)) {
+    name = rewriter.getStringAttr(base.getValue() + precision);
+  }
+  if (!name) return mlir::failure();
+  results.push_back(name);
   return mlir::success();
 }
 
-// Constraint: ktdf.is_reduction_kind(op, expected_kind)
+// Constraint: ktdf.is_reduction_kind(op, expected_kind[, element_type])
 //
 // Expected `values` entries (in order):
 //   [0] mlir::Operation*   — the linalg.generic op to inspect
 //   [1] mlir::Attribute    — a StringAttr naming the expected reduction kind
+//   [2] mlir::Type         — optional accumulator element type
 //
 // Succeeds when `op` is a linalg.generic whose body matches `expected_kind`:
 //   "sum"    — single arith.addf
@@ -190,10 +199,16 @@ auto ktdfIsReductionKind(mlir::PatternRewriter& /*rewriter*/,
                          mlir::PDLResultList& /*results*/,
                          llvm::ArrayRef<mlir::PDLValue> values)
     -> mlir::LogicalResult {
-  assert(values.size() == 2);
+  assert(values.size() == 2 || values.size() == 3);
   auto generic = llvm::dyn_cast_if_present<mlir::linalg::GenericOp>(
       values[0].cast<mlir::Operation*>());
   if (!generic) return mlir::failure();
+  if (values.size() == 3 &&
+      llvm::any_of(generic.getOutputs(), [&](mlir::Value output) {
+        return mlir::cast<mlir::ShapedType>(output.getType())
+                   .getElementType() != values[2].cast<mlir::Type>();
+      }))
+    return mlir::failure();
 
   auto expected = llvm::dyn_cast_if_present<mlir::StringAttr>(
       values[1].cast<mlir::Attribute>());

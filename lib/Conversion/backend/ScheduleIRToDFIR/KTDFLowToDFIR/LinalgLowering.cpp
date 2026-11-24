@@ -290,6 +290,20 @@ struct LowerLinalgGenericPattern
       mlir::PatternRewriter& rewriter) const {
     mlir::Location loc = generic_op.getLoc();
 
+    if (!generic_op.getInputs().empty()) {
+      auto map = generic_op.getIndexingMapsArray().front();
+      if (map.getNumResults()) {
+        auto lane = mlir::dyn_cast<mlir::AffineDimExpr>(
+            map.getResult(map.getNumResults() - 1));
+        if (lane && generic_op.getIteratorTypesArray()[lane.getPosition()] ==
+                        mlir::utils::IteratorType::reduction) {
+          return generic_op.emitError(
+              "inner reduction must be lowered by device patterns before "
+              "DataflowIR conversion");
+        }
+      }
+    }
+
     mlir::Block& body = generic_op.getRegion().front();
     auto yield_op = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
     const unsigned accumulators = generic_op.getNumDpsInits();

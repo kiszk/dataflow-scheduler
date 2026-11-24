@@ -262,18 +262,37 @@ ktdf_arch.device @sample_device {
   }
 
   patterns ["post_scheduling"] {
-    // SUM  →  simdreduction_sum
+    // FP16 SUM -> test.simd_reduction_sum
     pdl.pattern : benefit(1) {
       %in  = operand
       %acc = operand
       %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
       apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
       %expected_kind = attribute = "sum"
-      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind : !pdl.operation, !pdl.attribute)
+      %element_type = type : f16
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind, %element_type : !pdl.operation, !pdl.attribute, !pdl.type)
 
       rewrite {
         %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
         %new_op = operation "test.simd_reduction_sum"
+          (%in, %acc_src : !pdl.value, !pdl.value)
+        replace %generic with %new_op
+      }
+    }
+
+    // FP32 SUM -> test.simd_reduction_sum_fp32
+    pdl.pattern : benefit(1) {
+      %in  = operand
+      %acc = operand
+      %generic = operation "linalg.generic" (%in, %acc : !pdl.value, !pdl.value)
+      apply_native_constraint "ktdf.is_inner_dim_reduction"(%generic : !pdl.operation)
+      %expected_kind = attribute = "sum"
+      %element_type = type : f32
+      apply_native_constraint "ktdf.is_reduction_kind"(%generic, %expected_kind, %element_type : !pdl.operation, !pdl.attribute, !pdl.type)
+
+      rewrite {
+        %acc_src = apply_native_rewrite "ktdf.subview_source"(%acc : !pdl.value) : !pdl.value
+        %new_op = operation "test.simd_reduction_sum_fp32"
           (%in, %acc_src : !pdl.value, !pdl.value)
         replace %generic with %new_op
       }
