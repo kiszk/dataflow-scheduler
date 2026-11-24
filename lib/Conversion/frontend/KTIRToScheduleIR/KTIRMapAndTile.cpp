@@ -495,7 +495,10 @@ void KTIRNumericCastTilingPass::runOnOperation() {
   for (auto generic : func.getOps<mlir::linalg::GenericOp>()) {
     if (!generic.getBody()->getOps<mlir::spyreop::Identity>().empty() &&
         llvm::any_of(generic.getIndexingMapsArray(),
-                     [](auto map) { return !map.isProjectedPermutation(); }) &&
+                     [](auto map) {
+                       return !map.isProjectedPermutation(
+                           /*allowZeroInResults=*/true);
+                     }) &&
         !getPacketRelayoutDirection(generic)) {
       generic.emitError(
           "no target packet relayout recipe for these indexing_maps and tensor "

@@ -492,15 +492,16 @@ struct LowerTiledLoad : mlir::OpRewritePattern<mlir::ktdp_lowering::LoadOp> {
             auto [size, stride] = size_and_stride;
             return size > 1 && stride == 0;
           });
-      // Keep the readable lanes of the original stick for a scalar splat.
-      // The access tile still requests only lane zero; splat legalization
-      // chooses the device's actual load width later.
-      if (!view_shape.empty() && view_shape.back() == 1 &&
-          memory_view.getType().getElementType().isF32() &&
-          memory_view.getType().getShape().back() > 1 &&
-          mlir::isZeroInteger(indices->back()) && strides.back() == 1 &&
-          repeats_source) {
-        view_shape.back() = memory_view.getType().getShape().back();
+      // Preserve the readable extent along a physically contiguous dimension.
+      const auto view_type = memory_view.getType();
+      if (repeats_source && (view_type.getElementType().isF32() ||
+                             view_type.getElementType().isInteger(32))) {
+        for (size_t dim = 0; dim < view_shape.size(); ++dim) {
+          if (view_shape[dim] == 1 && view_type.getDimSize(dim) > 1 &&
+              mlir::isZeroInteger((*indices)[dim]) && strides[dim] == 1) {
+            view_shape[dim] = view_type.getDimSize(dim);
+          }
+        }
       }
       source = buildBaseView(rewriter, load.getLoc(), memory_view, offset,
                              view_shape, mem_space_map_,
