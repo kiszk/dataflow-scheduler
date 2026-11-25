@@ -37,6 +37,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -700,8 +701,8 @@ mlir::LogicalResult propagateTypes(
     llvm::SmallVector<mlir::Operation*> users(old_val.getUsers().begin(),
                                               old_val.getUsers().end());
     for (auto* user : users) {
-      if (mlir::isa<mlir::ktdf::DataTransferOp, mlir::ktdf::IndDataTransferOp>(
-              user)) {
+      if (mlir::isa<mlir::ktdf::DataTransferOp, mlir::ktdf::IndDataTransferOp,
+                    mlir::linalg::LinalgOp>(user)) {
         user->replaceUsesOfWith(old_val, new_val);
       } else if (auto sel = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(user)) {
         sel->replaceUsesOfWith(old_val, new_val);

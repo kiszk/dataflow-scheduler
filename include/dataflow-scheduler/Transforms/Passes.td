@@ -25,6 +25,18 @@
 
 include "mlir/Pass/PassBase.td"
 
+def PrepareTargetOperationsPass : Pass<"prepare-target-operations", "mlir::ModuleOp"> {
+  let summary = "Validate and prepare target-specific operations after the frontend";
+  let description = [{
+    Invokes the target extension before scheduler optimization and address
+    assignment. Target-specific operations may retain tensor semantics until
+    this point so validation can inspect their original inputs and outputs.
+    Without an extension, operations marked
+    `dataflow_scheduler.requires_target_lowering` are rejected.
+  }];
+  let constructor = "::scheduler::createPrepareTargetOperationsPass()";
+}
+
 def PathExpansionPass : Pass<"path-expansion", "mlir::ModuleOp"> {
   let summary = "Expand data movement paths to match architecture graph";
   let description = [{

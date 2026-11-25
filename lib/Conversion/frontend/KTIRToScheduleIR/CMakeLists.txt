@@ -7,6 +7,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
     KTIRLegalityCheck.cpp
     KTIRMapAndTile.cpp
     KTIRPipeline.cpp
+    MpeMatmul.cpp
 
   ADDITIONAL_HEADER_DIRS
     ${DataflowScheduler_SOURCE_DIR}/include/dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR

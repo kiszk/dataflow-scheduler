@@ -55,6 +55,7 @@
 #include "Utils.h"
 #include "dataflow-scheduler/Conversion/Utils/Utils.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
+#include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/MpeMatmul.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
@@ -1467,6 +1468,12 @@ void KTIRMapAndTilePass::runOnOperation() {
   // Tile all the compute operations and put them into loop nests that feature
   // loop-carried dependencies.
   for (auto& op : computes) {
+    if (isMpeMatmul(op, mapping)) {
+      mapToCompute(op, mapping,
+                   mlir::cast<mlir::ShapedType>(op->getResult(0).getType())
+                       .getElementType());
+      continue;
+    }
     auto maybe_loops = tile(rewriter, op, mapping);
     if (failed(maybe_loops)) {
       signalPassFailure();

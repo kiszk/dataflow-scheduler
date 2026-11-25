@@ -24,6 +24,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 
 using namespace scheduler;
@@ -36,4 +37,28 @@ const SchedulerExtContext& SchedulerExtContext::dummyContext() {
   // The dummy context is initialized thread-safe and never written to.
   static const DummySchedulerExtContext dummy_ctx;
   return dummy_ctx;
+}
+
+namespace {
+mlir::LogicalResult rejectTargetOperations(mlir::Operation* root) {
+  return root->walk([](mlir::Operation* op) {
+               if (!op->hasAttr("dataflow_scheduler.requires_target_lowering"))
+                 return mlir::WalkResult::advance();
+               op->emitError(
+                   "operation requires a target-specific scheduler extension");
+               return mlir::WalkResult::interrupt();
+             }).wasInterrupted()
+             ? mlir::failure()
+             : mlir::success();
+}
+}  // namespace
+
+mlir::LogicalResult SchedulerExtContext::prepareTargetOperations(
+    mlir::ModuleOp module) const {
+  return rejectTargetOperations(module);
+}
+
+mlir::LogicalResult SchedulerExtContext::lowerTargetOperations(
+    mlir::func::FuncOp func) const {
+  return rejectTargetOperations(func);
 }

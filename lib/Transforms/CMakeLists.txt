@@ -24,6 +24,7 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
     ReuseRegisters.cpp
     ParallelizeLoopsAcrossInstances.cpp
     PathExpansion.cpp
+    PrepareTargetOperations.cpp
     SimplifyLinalg.cpp
     SplatLegalizationPass.cpp
     StripMineSCFForLoops.cpp

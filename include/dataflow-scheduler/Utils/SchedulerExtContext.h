@@ -22,6 +22,10 @@
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/BuiltinOps.h>
 
+namespace mlir::func {
+class FuncOp;
+}
+
 namespace scheduler {
 
 struct SchedulerExtContext {
@@ -34,6 +38,17 @@ struct SchedulerExtContext {
   static const SchedulerExtContext& dummyContext();
 
   virtual bool isDummy() const { return false; }
+
+  /// Validate target-specific operations after the KTIR frontend, then finish
+  /// their pipeline preparation before scheduling and address assignment.
+  /// The default context rejects operations marked requires_target_lowering.
+  virtual mlir::LogicalResult prepareTargetOperations(
+      mlir::ModuleOp module) const;
+
+  /// Expand target-specific operations after common operation lowering and
+  /// before the final DFIR cleanup. The context must outlive the pass manager.
+  virtual mlir::LogicalResult lowerTargetOperations(
+      mlir::func::FuncOp func) const;
 };
 
 /// @brief Construct a DummySchedulerExtContext. In general prefer

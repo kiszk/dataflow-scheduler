@@ -36,6 +36,9 @@ struct SchedulerExtContext;
 /// Builds the KTIR frontend stage: checks the incoming KTIR is legal and
 /// converts it into an initial Schedule IR (KTDF) pipeline.
 /// Numeric casts keep their physical tensors until the backend.
+/// Target-specific contractions retain their original tensors and accesses;
+/// callers must run createPrepareTargetOperationsPass(scheduler_ctx) after
+/// this stage and before scheduler optimization.
 ///
 /// Passes come from `Conversion/frontend/KTIRToScheduleIR`.
 void buildKTIRFrontendPipeline(
@@ -67,6 +70,7 @@ void buildDFIRBackendPipeline(
 
 /// Builds the full KTDP to DFIR pipeline with the given pass manager, by
 /// chaining the KTIR frontend, scheduler optimization and DFIR backend stages.
+/// Target validation and preparation run between the frontend and scheduling.
 ///
 /// Note: this does not emit the DFIR output. Callers that want the resulting
 /// DFIR written out should append `createSplitDFIROutputPass()` themselves.

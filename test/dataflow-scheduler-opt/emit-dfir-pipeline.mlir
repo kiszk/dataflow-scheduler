@@ -37,6 +37,7 @@
 // CHECK-NEXT:   ktir-pipeline
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
+// CHECK-NEXT:   prepare-target-operations
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   apply-device-patterns{groups={pre_scheduling}}

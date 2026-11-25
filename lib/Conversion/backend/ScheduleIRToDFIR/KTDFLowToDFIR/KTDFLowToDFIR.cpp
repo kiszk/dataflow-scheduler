@@ -295,6 +295,9 @@ struct KTDFLowToDFIRPass
         return signalPassFailure();
       }
 
+      if (mlir::failed(schedulerExtContext().lowerTargetOperations(func)))
+        return signalPassFailure();
+
       // Final cleanup: canonicalize + DCE the fully-lowered function so the
       // emitted DFIR has no dead/duplicate/foldable leftovers (duplicate
       // folded constants from query-map collapse, addi(const,const), dead

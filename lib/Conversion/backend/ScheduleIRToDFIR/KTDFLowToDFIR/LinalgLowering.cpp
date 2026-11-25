@@ -276,6 +276,8 @@ struct LowerLinalgGenericPattern
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const override {
+    if (generic_op->hasAttr("dataflow_scheduler.mpe_matmul"))
+      return mlir::failure();
     // Buffer-semantics path: init operand is a memref accumulator.
     if (generic_op.hasPureBufferSemantics())
       return lowerMemRefGenericOp(generic_op, rewriter);
@@ -916,6 +918,7 @@ struct LowerLinalgFillPattern
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::FillOp fill_op,
       mlir::PatternRewriter& rewriter) const override {
+    if (fill_op->hasAttr("dataflow_scheduler.mpe_init")) return mlir::failure();
     // Match constant fill value input.
     if (fill_op.getInputs().size() != 1) {
       return rewriter.notifyMatchFailure(fill_op,

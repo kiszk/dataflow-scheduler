@@ -45,6 +45,9 @@ std::unique_ptr<mlir::Pass> createPathExpansionPass();
 std::unique_ptr<mlir::Pass> createPathExpansionPass(
     const SchedulerExtContext& scheduler_ctx);
 std::unique_ptr<mlir::Pass> createNormalizeGridTo1DPass();
+std::unique_ptr<mlir::Pass> createPrepareTargetOperationsPass();
+std::unique_ptr<mlir::Pass> createPrepareTargetOperationsPass(
+    const SchedulerExtContext& scheduler_ctx);
 
 std::unique_ptr<mlir::Pass> createParallelizeLoopsAcrossInstancesPass();
 std::unique_ptr<mlir::Pass> createParallelizeLoopsAcrossInstancesPass(

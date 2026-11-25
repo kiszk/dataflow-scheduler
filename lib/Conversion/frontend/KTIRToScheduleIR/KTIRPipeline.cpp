@@ -42,6 +42,7 @@
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 #include "Utils.h"
+#include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/MpeMatmul.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/PipelineBuilder.h"
@@ -336,6 +337,10 @@ void KTIRPipelinePass::runOnOperation() {
     return;
   }
   mlir::ktdf_arch::Mapping mapping(default_device.getRef());
+
+  // The target extension validates the original contraction, initializer and
+  // accesses immediately after this frontend. It then builds these pipelines.
+  if (deferMpeMatmulPipelines(func, mapping)) return;
 
   // Create the pipelines.
   llvm::SmallVector<mlir::ktdf::StageOp> phases;

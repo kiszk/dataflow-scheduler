@@ -168,7 +168,7 @@ void scheduler::buildDFIRBackendPipeline(
   pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
       createApplyDevicePatternsPass({"post_lowering"}));
 
-  pm.addPass(createKTDFLowToDFIRPass());
+  pm.addPass(createKTDFLowToDFIRPass(scheduler_ctx));
   // And each program given the two levels it is read at: what it is, and the
   // DataflowIR it is compiled from, which takes no arguments.
   pm.addPass(createWrapProgramDFIRPass());
@@ -177,6 +177,7 @@ void scheduler::buildDFIRBackendPipeline(
 void scheduler::buildKTDPToDFIRPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   buildKTIRFrontendPipeline(pm, scheduler_ctx);
+  pm.addPass(createPrepareTargetOperationsPass(scheduler_ctx));
   buildSchedulerOptimizationPipeline(pm, scheduler_ctx);
   buildDFIRBackendPipeline(pm, scheduler_ctx);
 }
