@@ -34,6 +34,7 @@
 #include "dataflow-scheduler/Transforms/Utils/Utils.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -255,6 +256,26 @@ mlir::Value walkViewChain(
   return cursor;
 }
 
+// A caller's loop IV reaches an extracted program as a function argument.
+// It is fixed for that invocation, unlike an IV of the program's own loops.
+bool dependsOnCallArgument(mlir::Value value,
+                           const SymbolAllocator* run_inputs = nullptr) {
+  llvm::SmallVector<mlir::Value> pending{value};
+  llvm::DenseSet<mlir::Value> seen;
+  while (!pending.empty()) {
+    auto next = pending.pop_back_val();
+    if (!seen.insert(next).second) continue;
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(next)) {
+      if (mlir::isa<mlir::func::FuncOp>(arg.getOwner()->getParentOp()) &&
+          (!run_inputs || !run_inputs->inputSymbolIdFor(arg)))
+        return true;
+    } else if (auto* op = next.getDefiningOp()) {
+      llvm::append_range(pending, op->getOperands());
+    }
+  }
+  return false;
+}
+
 /// Phase 3b: replace Source A chains with get_logical_memory_view.
 /// Emits the view op and RAUWs the chain tail inline; does not populate
 /// `replacements` (Source A handles its own erasure).
@@ -316,13 +337,26 @@ mlir::LogicalResult replaceSourceAChains(
         mlir::Value unit = resolved_units.lookup(llvm::cast<ResourceType>(*ms));
         if (!unit) return cmv.emitError("no resolved unit for memory space");
 
+        // A rank-changing reinterpret is a new coordinate system over the
+        // same storage, not just a displaced slice of the original view.
+        // Preserve its shape and strides for consumers such as contractions.
+        auto view_type = plain_type;
+        auto view_layout = layout_map;
+        if (rc && rc.getType().getRank() != src_type.getRank()) {
+          if (llvm::any_of(rc.getStaticStrides(), mlir::ShapedType::isDynamic))
+            return rc.emitError("dynamic reshape strides are not supported");
+          view_type = mlir::MemRefType::get(rc.getType().getShape(),
+                                            src_type.getElementType());
+          view_layout = buildLinearizationMap(ctx, rc.getStaticStrides());
+        }
+
         // Emit get_logical_memory_view with plain result type (no memory space,
         // no strided layout). The builder is already positioned after the last
         // chain op (and after any offset arithmetic just emitted), so no
         // setInsertionPoint needed here.
         auto view_op = mlir::dataflow::GetLogicalMemoryViewOp::create(
-            builder, cmv.getLoc(), plain_type, unit, start_address,
-            mlir::AffineMapAttr::get(layout_map));
+            builder, cmv.getLoc(), view_type, unit, start_address,
+            mlir::AffineMapAttr::get(view_layout));
 
         // cursor is the tail of the chain, replace all its users with the new
         // view.
@@ -334,6 +368,45 @@ mlir::LogicalResult replaceSourceAChains(
         for (auto* op : llvm::reverse(intermediates)) op->erase();
         return mlir::success();
       };
+
+      // An access tile can start at an enclosing loop's runtime position.
+      // Correct the complete address for each invocation, not the transfer's
+      // index arithmetic inside the DFIR binary. Constant bases count elements;
+      // bases supplied by the caller count bytes, as on the path below.
+      if (rc) {
+        auto offset =
+            mlir::dyn_cast<mlir::Value>(rc.getConstifiedMixedOffset());
+        // Keep the existing single-run-input path for constant bases. The
+        // general expression is needed when the offset is supplied by the
+        // caller's loop, or when both base and offset depend on call arguments.
+        if (offset && dependsOnCallArgument(offset) &&
+            (dependsOnCallArgument(cmv.getOffset()) ||
+             dependsOnCallArgument(offset, &symbols))) {
+          builder.setInsertionPointAfter(rc);
+          auto loc = rc.getLoc();
+          auto scale = mlir::arith::ConstantIndexOp::create(
+              builder, loc, *tryGetSizeInBytes(src_type.getElementType()));
+          mlir::Value base = cmv.getOffset();
+          if (!dependsOnCallArgument(base))
+            base = mlir::arith::MulIOp::create(builder, loc, base, scale);
+          auto bytes = mlir::arith::MulIOp::create(builder, loc, offset, scale);
+          auto address = mlir::arith::AddIOp::create(builder, loc, base, bytes);
+          auto space = getMemorySpaceAttr(cursor.getType());
+          if (!space)
+            return cmv.emitError("missing memory space in view chain");
+          auto word_size =
+              wordSizeOf(pu, llvm::cast<ResourceType>(*space), resource_kinds);
+          if (mlir::failed(word_size)) return mlir::failure();
+          auto word =
+              mlir::arith::ConstantIndexOp::create(builder, loc, *word_size);
+          auto in_words =
+              mlir::arith::DivSIOp::create(builder, loc, address, word);
+          auto symbol = emitRuntimeIndexSymbol(in_words, pu, symbols, builder,
+                                               definitions);
+          if (mlir::failed(symbol)) return mlir::failure();
+          return emitView(*symbol);
+        }
+      }
 
       // Whether this tensor's address is computed from one of the run's inputs
       // rather than from constants the compiler picked. If it is, no value

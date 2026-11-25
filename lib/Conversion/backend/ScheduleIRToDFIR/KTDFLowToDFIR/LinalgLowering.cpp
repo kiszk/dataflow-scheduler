@@ -721,6 +721,13 @@ struct LowerLinalgGenericPattern
                                     mlir::PatternRewriter& rewriter,
                                     mlir::AffineMap identity_map) const {
     mlir::Value input = op.getInput();
+    // Fusion has already composed any layout permutation into the generic's
+    // indexing maps. A binary result needs no additional forwarding op. Keep
+    // the OR for a value received by an otherwise empty compute stage.
+    if (input.getDefiningOp<mlir::vectorchain::BinaryOp>()) {
+      rewriter.replaceOp(op, input);
+      return mlir::success();
+    }
     const auto shaped = llvm::dyn_cast<mlir::ShapedType>(input.getType());
     if (!shaped) {
       // Still the body's scalar: the driver comes back once the block

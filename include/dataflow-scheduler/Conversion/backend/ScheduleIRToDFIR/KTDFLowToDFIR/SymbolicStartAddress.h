@@ -314,6 +314,17 @@ mlir::FailureOr<int64_t> declareScalarSymbol(mlir::Value value,
                                              mlir::func::FuncOp program,
                                              SymbolAllocator& symbols);
 
+/// Declare an index expression over the program's call arguments, including
+/// enclosing loop IVs supplied by its caller. Specialize per-unit constants
+/// before declaring each step; keep all arithmetic outside the DFIR body.
+/// The runtime correction reads the call operands to expand loop-dependent
+/// symbols for each iteration. A value defined inside a program's own loop
+/// cannot be corrected this way and is rejected.
+mlir::FailureOr<mlir::Value> emitRuntimeIndexSymbol(
+    mlir::Value value, mlir::dataflow::ProgramUnitOp pu,
+    SymbolAllocator& symbols, mlir::OpBuilder& builder,
+    mlir::OpBuilder& definitions);
+
 /// Emits the start address \p taken describes, displaced by \p displacement and
 /// divided by \p word_size, at \p builder's insertion point, and returns what
 /// the view should read.

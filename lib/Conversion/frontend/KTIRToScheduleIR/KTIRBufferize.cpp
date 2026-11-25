@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/SmallVectorExtras.h>
@@ -271,6 +272,45 @@ void copyAttrsAndThrottle(mlir::Operation* from, mlir::Operation* to,
   return offset;
 }
 
+// A compute group called inside a kernel loop receives that loop's IV as a
+// function argument. Put its origin in the view's address so the backend can
+// declare a per-invocation correction symbol, rather than leaving a runtime
+// argument in a transfer's generated index arithmetic.
+mlir::Value displaceRuntimeOrigin(mlir::OpBuilder& builder, mlir::Location loc,
+                                  mlir::Value source, MemRef memory_view,
+                                  llvm::SmallVectorImpl<mlir::Value>& indices) {
+  llvm::SmallVector<mlir::Value> pending(indices.begin(), indices.end());
+  llvm::DenseSet<mlir::Value> seen;
+  bool runtime = false;
+  while (!pending.empty()) {
+    auto value = pending.pop_back_val();
+    if (!seen.insert(value).second) continue;
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+      runtime |= mlir::isa<mlir::func::FuncOp>(arg.getOwner()->getParentOp());
+    } else if (auto* op = value.getDefiningOp()) {
+      llvm::append_range(pending, op->getOperands());
+    }
+  }
+  if (!runtime) return source;
+  auto strides = getMemRefStrides(memory_view);
+  auto offset = computeReinterpretCastOffset(builder, loc, indices, strides);
+  auto type = mlir::cast<mlir::MemRefType>(source.getType());
+  auto result_type = mlir::MemRefType::get(
+      type.getShape(), type.getElementType(),
+      mlir::StridedLayoutAttr::get(builder.getContext(),
+                                   mlir::ShapedType::kDynamic, strides),
+      type.getMemorySpace());
+  llvm::SmallVector<mlir::OpFoldResult> sizes, mixed_strides;
+  for (auto size : type.getShape()) sizes.push_back(builder.getIndexAttr(size));
+  for (auto stride : strides)
+    mixed_strides.push_back(builder.getIndexAttr(stride));
+  auto shifted = mlir::memref::ReinterpretCastOp::create(
+      builder, loc, result_type, source, offset, sizes, mixed_strides);
+  mlir::Value zero = mlir::arith::ConstantIndexOp::create(builder, loc, 0);
+  llvm::fill(indices, zero);
+  return shifted;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers shared by LowerLoad and LowerStore
 // ---------------------------------------------------------------------------
@@ -342,6 +382,9 @@ struct LowerLoad : mlir::OpRewritePattern<mlir::ktdp::LoadOp> {
     if (!is_iab_fill_path)
       source = emitMemorySpaceCast(rewriter, load.getLoc(), memory_view,
                                    mem_space_map_);
+    if (!is_iab_fill_path)
+      source = displaceRuntimeOrigin(rewriter, load.getLoc(), source,
+                                     memory_view, *indices);
 
     // Build mixed offsets (per-dim indices) and unit strides.
     llvm::SmallVector<mlir::OpFoldResult> mixed_offsets, mixed_sizes,
@@ -412,6 +455,9 @@ struct LowerStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     if (!is_iab_fill_path)
       dest = emitMemorySpaceCast(rewriter, store.getLoc(), memory_view,
                                  mem_space_map_);
+    if (!is_iab_fill_path)
+      dest = displaceRuntimeOrigin(rewriter, store.getLoc(), dest, memory_view,
+                                   *indices);
 
     // Build mixed offsets (per-dim indices) and unit strides.
     llvm::SmallVector<mlir::OpFoldResult> mixed_offsets, mixed_sizes,

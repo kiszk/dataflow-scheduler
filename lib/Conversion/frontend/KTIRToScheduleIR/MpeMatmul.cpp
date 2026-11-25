@@ -23,6 +23,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/Utils/DataTransfers.h"
 #include "dataflow-scheduler/Dialect/KTDF/Utils/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
+#include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
@@ -81,6 +82,46 @@ void transfer(OpBuilder& b, Location loc, Value src, Value dst,
   scheduler::setThrottle(op, 64);
 }
 
+// Reuse a complete, contiguous operand already materialized in local memory.
+// The reshape changes only coordinates; the preceding identity generic is
+// responsible for putting the elements in that order. L3 DMA cannot copy LX
+// to LX, and no copy is needed for such an input or output.
+template <typename AccessOp>
+Value localOperand(IRRewriter& rw, AccessOp access, Value source,
+                   RankedTensorType tensor_type, Attribute local) {
+  auto type = dyn_cast<MemRefType>(source.getType());
+  if (!type || scheduler::getMemorySpace(source) != local ||
+      access.getStaticSizes() != type.getShape() ||
+      llvm::any_of(access.getMixedOffsets(), [](OpFoldResult offset) {
+        return getConstantIntValue(offset) != 0;
+      }))
+    return {};
+  Value base = source;
+  while (auto cast = base.getDefiningOp<memref::MemorySpaceCastOp>())
+    base = cast.getSource();
+  auto view = base.getDefiningOp<ktdp::ConstructMemoryViewOp>();
+  if (!view) return {};
+  int64_t stride = 1;
+  for (int dim = type.getRank() - 1; dim >= 0; --dim) {
+    if (view.getStaticStrides()[dim] != stride) return {};
+    stride *= type.getDimSize(dim);
+  }
+  SmallVector<OpFoldResult> sizes, strides(tensor_type.getRank());
+  stride = 1;
+  for (int dim = tensor_type.getRank() - 1; dim >= 0; --dim) {
+    strides[dim] = rw.getIndexAttr(stride);
+    stride *= tensor_type.getDimSize(dim);
+  }
+  for (int64_t size : tensor_type.getShape())
+    sizes.push_back(rw.getIndexAttr(size));
+  auto result_type =
+      MemRefType::get(tensor_type.getShape(), tensor_type.getElementType(),
+                      MemRefLayoutAttrInterface{}, local);
+  return memref::ReinterpretCastOp::create(rw, access.getLoc(), result_type,
+                                           source, rw.getIndexAttr(0), sizes,
+                                           strides);
+}
+
 void prepare(linalg::GenericOp op, IRRewriter& rw) {
   // Target validation has already checked the contraction and memory accesses.
   // This only constructs the common transfer/compute pipeline.
@@ -105,16 +146,24 @@ void prepare(linalg::GenericOp op, IRRewriter& rw) {
         MemRefType::get(type.getShape(), type.getElementType(),
                         MemRefLayoutAttrInterface{}, local));
   };
-  Value lx_a = alloc(a_type), lx_b = alloc(b_type), lx_c = alloc(c_type);
+  rw.setInsertionPoint(pipeline);
+  Value local_a = localOperand(rw, a_load, a_load.getSource(), a_type, local);
+  Value local_b = localOperand(rw, b_load, b_load.getSource(), b_type, local);
+  Value local_c = localOperand(rw, store, store.getDest(), c_type, local);
+  Value lx_a = local_a ? local_a : alloc(a_type);
+  Value lx_b = local_b ? local_b : alloc(b_type);
+  Value lx_c = local_c ? local_c : alloc(c_type);
   auto ready = priv.createToken(loc), done = priv.createToken(loc);
   rw.setInsertionPointToEnd(pipeline.getBody());
   auto load_stage =
       ktdf::StageOp::create(rw, loc, ValueRange{}, ValueRange{ready},
                             [&](OpBuilder& b, Location loc) {
-                              transfer(b, loc, a_load.getSource(), lx_a, a_load,
-                                       true, a_type.getShape());
-                              transfer(b, loc, b_load.getSource(), lx_b, b_load,
-                                       true, b_type.getShape());
+                              if (!local_a)
+                                transfer(b, loc, a_load.getSource(), lx_a,
+                                         a_load, true, a_type.getShape());
+                              if (!local_b)
+                                transfer(b, loc, b_load.getSource(), lx_b,
+                                         b_load, true, b_type.getShape());
                             });
   load_stage.setApplicableUnitsAttr(
       rw.getArrayAttr({rw.getStringAttr("L3LU")}));
@@ -135,8 +184,9 @@ void prepare(linalg::GenericOp op, IRRewriter& rw) {
       rw.getArrayAttr({ktdf_arch::Mappable::getMapsTo(op)}));
   auto store_stage = ktdf::StageOp::create(
       rw, loc, ValueRange{done}, ValueRange{}, [&](OpBuilder& b, Location loc) {
-        transfer(b, loc, lx_c, store.getDest(), store, false,
-                 c_type.getShape());
+        if (!local_c)
+          transfer(b, loc, lx_c, store.getDest(), store, false,
+                   c_type.getShape());
       });
   store_stage.setApplicableUnitsAttr(
       rw.getArrayAttr({rw.getStringAttr("L3SU")}));

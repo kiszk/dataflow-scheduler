@@ -225,6 +225,18 @@ struct ReductionDimChunkingPass
   // counts, and per-dim chunk sizes, then delegates to rewriteComputeStage().
   // -----------------------------------------------------------------------
   LogicalResult transformPipeline(ktdf::StageOp compute_stage) {
+    // Locate and classify the reduction before assuming load/store stages.
+    // A contraction may read or write an already allocated local operand.
+    linalg::GenericOp generic_op = findReductionGenericOp(compute_stage);
+    assert(generic_op && "no reduction linalg.generic in compute stage");
+
+    // FIXME: Current implementation leads to invalid IR when processing
+    //        contractions, so skip them for now to allow matmul to pass.
+    if (linalg::isContraction(generic_op)) {
+      LDBG() << "ignoring contraction";
+      return success();
+    }
+
     // Stages are always direct children of a pipeline.
     auto inner_pipeline = cast<ktdf::PipelineOp>(compute_stage->getParentOp());
 
@@ -246,17 +258,6 @@ struct ReductionDimChunkingPass
         StageFactory::findStoreStage(inner_pipeline, compute_stage);
     assert(store_stage &&
            "could not find store stage downstream of compute stage");
-
-    // Locate the linalg.generic with a reduction iterator.
-    linalg::GenericOp generic_op = findReductionGenericOp(compute_stage);
-    assert(generic_op && "no reduction linalg.generic in compute stage");
-
-    // FIXME: Current implementation leads to invalid IR when processing
-    //        contractions, so skip them for now to allow matmul to pass.
-    if (ktdf::isContraction(generic_op)) {
-      LDBG() << "ignoring contraction";
-      return success();
-    }
 
     // ------------------------------------------------------------------
     // Determine reduction dims and per-dim chunk sizes.

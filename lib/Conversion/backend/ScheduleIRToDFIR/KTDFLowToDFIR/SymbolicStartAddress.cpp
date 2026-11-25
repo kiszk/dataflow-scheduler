@@ -158,7 +158,12 @@ std::optional<int64_t> evaluateAtUnit(mlir::Value value, mlir::Value unit) {
   }
 
   mlir::Operation* op = value.getDefiningOp();
-  if (!op || !readableAsDefinition(op) || op->getNumOperands() != 2)
+  // Flattening a multidimensional core grid uses unsigned division/remainder.
+  // These can be folded for each unit even though runtime symbol expressions
+  // themselves use the signed arithmetic supported by the correction format.
+  if (!op || op->getNumOperands() != 2 ||
+      (!readableAsDefinition(op) &&
+       !mlir::isa<mlir::arith::DivUIOp, mlir::arith::RemUIOp>(op)))
     return std::nullopt;
 
   std::optional<int64_t> lhs = evaluateAtUnit(op->getOperand(0), unit);
@@ -183,6 +188,12 @@ std::optional<int64_t> evaluateAtUnit(mlir::Value value, mlir::Value unit) {
   // A division by zero is undefined where the program runs and is not something
   // to work out an address from here either.
   if (*rhs == 0) return std::nullopt;
+  if (mlir::isa<mlir::arith::DivUIOp>(op))
+    return static_cast<int64_t>(static_cast<uint64_t>(*lhs) /
+                                static_cast<uint64_t>(*rhs));
+  if (mlir::isa<mlir::arith::RemUIOp>(op))
+    return static_cast<int64_t>(static_cast<uint64_t>(*lhs) %
+                                static_cast<uint64_t>(*rhs));
   if (mlir::isa<mlir::arith::DivSIOp>(op)) return *lhs / *rhs;
   if (mlir::isa<mlir::arith::RemSIOp>(op)) return *lhs % *rhs;
   // Rounding up is only worked out for a positive numerator and denominator --
@@ -762,4 +773,81 @@ mlir::FailureOr<int64_t> scheduler::declareScalarSymbol(
                                      clone->getResult(0), id);
   }
   return id;
+}
+
+mlir::FailureOr<mlir::Value> scheduler::emitRuntimeIndexSymbol(
+    mlir::Value value, mlir::dataflow::ProgramUnitOp pu,
+    SymbolAllocator& symbols, mlir::OpBuilder& builder,
+    mlir::OpBuilder& definitions) {
+  auto program = pu->getParentOfType<mlir::func::FuncOp>();
+  auto& entry = program.getBody().front();
+  llvm::SmallVector<mlir::Value> keys, values;
+  // Pair each rebuilt value with its symbol, or zero for a constant. Using
+  // operand ids in the key preserves the expression's edges, including two
+  // distinct call arguments and shared subexpressions.
+  using Term = std::pair<mlir::Value, int64_t>;
+  for (mlir::Value unit : pu.getUnits()) {
+    llvm::DenseMap<mlir::Value, Term> rebuilt;
+    auto materialize = [&](auto&& self,
+                           mlir::Value v) -> mlir::FailureOr<Term> {
+      if (auto it = rebuilt.find(v); it != rebuilt.end()) return it->second;
+      if (auto constant = evaluateAtUnit(v, unit)) {
+        auto result = mlir::arith::ConstantIndexOp::create(
+            definitions, v.getLoc(), *constant);
+        return rebuilt[v] = {result, 0};
+      }
+      if (auto argument = asFunctionArgument(v)) {
+        if (argument.getOwner() != &entry) return mlir::failure();
+        auto id = symbols.inputSymbolIdFor(v);
+        if (!id) {
+          DerivedKey key;
+          key.root = v;
+          id = symbols.derivedIdFor(key).first;
+        }
+        if (!declaredIn(entry, *id))
+          mlir::symbol::CreateIdOp::create(definitions, v.getLoc(), v, *id);
+        return rebuilt[v] = {v, *id};
+      }
+      auto* op = v.getDefiningOp();
+      if (!op || !readableAsDefinition(op)) return mlir::failure();
+      mlir::IRMapping mapping;
+      DerivedKey key;
+      key.root = entry.getArgument(0);
+      ExpressionStep step{op->getName(), {}};
+      for (mlir::Value operand : op->getOperands()) {
+        auto term = self(self, operand);
+        if (mlir::failed(term)) return mlir::failure();
+        mapping.map(operand, term->first);
+        step.operands.push_back(mlir::getConstantIntValue(term->first));
+        key.terms.push_back(term->second);
+      }
+      key.expression.push_back(std::move(step));
+      auto id = symbols.derivedIdFor(key).first;
+      if (auto declared = declaredIn(entry, id))
+        return rebuilt[v] = {declared, id};
+      auto* clone = definitions.clone(*op, mapping);
+      auto result = clone->getResult(0);
+      mlir::symbol::CreateIdOp::create(definitions, v.getLoc(), result, id);
+      return rebuilt[v] = {result, id};
+    };
+    auto term = materialize(materialize, value);
+    if (mlir::failed(term))
+      return pu.emitError(
+          "runtime address must depend only on program call arguments, "
+          "per-unit constants and supported index arithmetic");
+    keys.push_back(unit);
+    values.push_back(
+        term->second
+            ? createSymbolicStartAddress(builder, value.getLoc(), term->second)
+            : mlir::arith::ConstantIndexOp::create(
+                  builder, value.getLoc(),
+                  *mlir::getConstantIntValue(term->first)));
+  }
+  if (values.size() == 1) return values.front();
+  auto map = mlir::uniform::DefImmutableMappingOp::create(
+      builder, value.getLoc(), builder.getIndexType(), keys, values);
+  return mlir::uniform::QueryMapOp::create(
+             builder, value.getLoc(), builder.getIndexType(), map.getResult(),
+             pu.getRegion().front().getArgument(0))
+      .getResult();
 }

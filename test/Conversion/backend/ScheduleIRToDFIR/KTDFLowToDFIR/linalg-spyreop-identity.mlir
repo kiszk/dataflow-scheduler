@@ -32,6 +32,19 @@
 // CHECK-NOT:       spyreop.identity
 // CHECK:           dataflow.send %{{.*}}, %[[OR]] : vector<32xi32>
 
+// After fusion, identity applied to a computed vector must not introduce an
+// extra binary OR. The result is already available for the FIFO send.
+// CHECK-LABEL: func.func @computed_identity_f16(
+// CHECK: dataflow.program_unit
+// CHECK: dataflow.program_unit
+// CHECK: %[[IN:.*]] = dataflow.receive %{{.*}} : vector<64xf16>
+// CHECK-NEXT: %[[MUL:.*]] = vectorchain.binary %[[IN]], %[[IN]] {binary_op = #vectorchain<binary_operator mul>, op_specific_map = #{{.*}}} : vector<64xf16>, vector<64xf16>, vector<64xf16>
+// CHECK-NOT: binary_operator or0
+// CHECK: dataflow.send %{{.*}}, %[[MUL]] : vector<64xf16>
+// CHECK-NOT: spyreop.identity
+// CHECK-NOT: binary_operator or0
+// CHECK: return
+
 #id = affine_map<(d0) -> (d0)>
 
 module {
@@ -150,6 +163,35 @@ module {
     }
     ktdf_lowering.execute_on %u_l1lu {
       ktdf.data_transfer from %out_fifo size [32] to %alloc_l1[%c0, %c0] size [1, 32] : !ktdf.fifo.slot<"SFU" -> "L1LU", 32xi32>, memref<1x32xi32, "L1">
+    }
+    return
+  }
+
+  func.func @computed_identity_f16() attributes {grid = [1]} {
+    %l1lu = dataflow.get_unit {core = 0 : i32, name = "C0-L1LU", type = "L1LU"} : index
+    %sfu = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
+    %c0 = arith.constant 0 : index
+    %alloc_l1 = memref.alloc() : memref<1x64xf16, "L1">
+    %in_fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+    %out_fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1LU", 64xf16>
+    ktdf_lowering.execute_on %l1lu {
+      ktdf.data_transfer from %alloc_l1[%c0, %c0] size [1, 64] to %in_fifo size [64] : memref<1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+    }
+    ktdf_lowering.execute_on %sfu {
+      %input = ktdf.read_from_fifo %in_fifo : !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
+      %init = tensor.empty() : tensor<64xf16>
+      %result = linalg.generic {
+        indexing_maps = [#id, #id], iterator_types = ["parallel"]
+      } ins(%input : tensor<64xf16>) outs(%init : tensor<64xf16>) {
+      ^bb0(%in: f16, %out: f16):
+        %product = arith.mulf %in, %in : f16
+        %v = spyreop.identity %product : f16
+        linalg.yield %v : f16
+      } -> tensor<64xf16>
+      ktdf.write_to_fifo %result, %out_fifo : tensor<64xf16>, <"SFU" -> "L1LU", 64xf16>
+    }
+    ktdf_lowering.execute_on %l1lu {
+      ktdf.data_transfer from %out_fifo size [64] to %alloc_l1[%c0, %c0] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1LU", 64xf16>, memref<1x64xf16, "L1">
     }
     return
   }
