@@ -430,9 +430,15 @@ void ComputeGroupExtractionPass::extractComputeGroup(
   auto func_op = mlir::func::FuncOp::create(top_level_module.getLoc(),
                                             func_name, func_type);
   func_op.setPublic();
-  // Copy grid attribute from original function if it exists
-  if (auto grid_attr = original_func->getAttr("grid")) {
-    func_op->setAttr("grid", grid_attr);
+  // A structured compute scope may use fewer cores or a different work
+  // division from adjacent groups. Preserve its grid on the extracted program.
+  for (auto* scope = group.first_load->getParentOp(); scope;
+       scope = scope->getParentOp()) {
+    if (auto grid = scope->getAttr("grid")) {
+      func_op->setAttr("grid", grid);
+      break;
+    }
+    if (scope == original_func) break;
   }
   extracted_module.push_back(func_op);
 
@@ -659,11 +665,23 @@ void ComputeGroupExtractionPass::runOn(mlir::ModuleOp module_op) {
     extractComputeGroup(module_op, original_module, group);
   }
 
+  // The extracted functions now own their grids. Remove the single-block
+  // scopes, leaving ordinary sequential calls in the orchestration function.
+  mlir::IRRewriter rewriter(module_op.getContext());
+  original_module.walk([&](mlir::scf::ExecuteRegionOp scope) {
+    if (!scope->hasAttr("grid") || scope.getNumResults() ||
+        !llvm::hasSingleElement(scope.getRegion()))
+      return;
+    auto& body = scope.getRegion().front();
+    rewriter.eraseOp(body.getTerminator());
+    rewriter.inlineBlockBefore(&body, scope);
+    rewriter.eraseOp(scope);
+  });
+
   // Clean up side-effect-free ops left dead after extraction (e.g. ops that
   // were cloned into child modules but whose originals are now unused in the
   // top-level module). runRegionDCE recurses into nested regions, so passing
   // the module's regions covers child modules created above.
-  mlir::IRRewriter rewriter(module_op.getContext());
   (void)mlir::runRegionDCE(rewriter, module_op->getRegions());
 }
 

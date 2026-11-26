@@ -42,6 +42,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchAttributes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
+#include "dataflow-scheduler/Transforms/Utils/Utils.h"
 
 #define PASS_NAME "fuse-linalg"
 #define DEBUG_TYPE PASS_NAME
@@ -212,6 +213,55 @@ struct FuseElementwiseOps : mlir::OpRewritePattern<mlir::linalg::GenericOp> {
   mlir::linalg::ControlFusionFn control_fusion_;
 };
 
+/// Fold a lane-preserving result permutation into a reduction's output map.
+/// Elementwise fusion cannot fuse a reduction producer. Leaving this copy as
+/// a separate tiled loop would require a full intermediate tensor between the
+/// reduction and its store, instead of a pipeline for each output tile.
+struct FoldReductionResultPermutation
+    : mlir::OpRewritePattern<mlir::linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  auto matchAndRewrite(mlir::linalg::GenericOp copy,
+                       mlir::PatternRewriter& rewriter) const
+      -> llvm::LogicalResult override {
+    if (!isIdentityGeneric(copy)) return llvm::failure();
+    auto producer =
+        copy.getDpsInputs()[0].getDefiningOp<mlir::linalg::GenericOp>();
+    if (!producer || !producer.hasPureTensorSemantics() ||
+        producer.getNumResults() != 1 || !producer->hasOneUse() ||
+        producer.getNumReductionLoops() == 0 ||
+        !producer.getDpsInits()[0].getDefiningOp<mlir::tensor::EmptyOp>() ||
+        !copy.getDpsInits()[0].getDefiningOp<mlir::tensor::EmptyOp>())
+      return llvm::failure();
+
+    auto maps = copy.getIndexingMapsArray();
+    if (!maps.front().isPermutation() || !maps.back().isPermutation())
+      return llvm::failure();
+    auto permutation =
+        maps.back().compose(mlir::inversePermutation(maps.front()));
+    if (permutation.getNumResults() == 0 ||
+        permutation.getResults().back() !=
+            mlir::getAffineDimExpr(permutation.getNumDims() - 1,
+                                   copy.getContext()))
+      return llvm::failure();
+    auto mapping = fuseMappings(mlir::ktdf_arch::Mappable::getMapsTo(producer),
+                                mlir::ktdf_arch::Mappable::getMapsTo(copy));
+    if (failed(mapping)) return llvm::failure();
+
+    auto producer_maps = producer.getIndexingMapsArray();
+    producer_maps.back() = permutation.compose(producer_maps.back());
+    auto fused = mlir::cast<mlir::linalg::GenericOp>(rewriter.clone(*producer));
+    fused.getDpsInitsMutable().assign(copy.getDpsInits());
+    fused.getResult(0).setType(copy.getResult(0).getType());
+    fused.setIndexingMapsAttr(rewriter.getAffineMapArrayAttr(producer_maps));
+    if (*mapping)
+      std::ignore = mlir::ktdf_arch::Mappable::setMapsTo(fused, *mapping);
+    rewriter.replaceOp(copy, fused.getResults());
+    rewriter.eraseOp(producer);
+    return llvm::success();
+  }
+};
+
 /// Detects the implied mapping of @p generic and explicitly sets it.
 ///
 /// @returns  Succeeds when @p generic explicitly declares the correct mapping.
@@ -270,6 +320,7 @@ struct FuseLinalgPass : public impl::FuseLinalgPassBase<FuseLinalgPass> {
 
     mlir::RewritePatternSet patterns(&getContext());
     patterns.add<RemoveOutsDependency>(patterns.getContext());
+    patterns.add<FoldReductionResultPermutation>(patterns.getContext());
     patterns.add<FuseElementwiseOps>(
         patterns.getContext(), [&](mlir::OpOperand* through) -> bool {
           auto* const producer = through->get().getDefiningOp();
