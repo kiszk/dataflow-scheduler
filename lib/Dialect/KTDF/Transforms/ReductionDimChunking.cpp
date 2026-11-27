@@ -232,7 +232,7 @@ struct ReductionDimChunkingPass
 
     // FIXME: Current implementation leads to invalid IR when processing
     //        contractions, so skip them for now to allow matmul to pass.
-    if (linalg::isContraction(generic_op)) {
+    if (ktdf::isContraction(generic_op)) {
       LDBG() << "ignoring contraction";
       return success();
     }
