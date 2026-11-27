@@ -85,6 +85,9 @@ struct RemoveOutsDependency : mlir::OpRewritePattern<mlir::linalg::GenericOp> {
           init.get().getDefiningOp<mlir::tensor::EmptyOp>()) {
         continue;
       }
+      // A partial output map retains values outside the written region even
+      // when the scalar body does not read its init argument.
+      if (!generic.getMatchingIndexingMap(&init).isPermutation()) continue;
 
       llvm::SmallVector<mlir::Value> sizes;
       for (auto [index, size] : llvm::enumerate(type.getShape())) {

@@ -50,6 +50,7 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -258,6 +259,62 @@ static void composeAgenIndexMaps(mlir::func::FuncOp func) {
   });
 }
 
+// Compare first/last-iteration guards against the normalized counter itself.
+// For example, 2*q != 0 becomes q != 0, while 2*q+1 != 0 is always true.
+// Keeping the denormalized counter as scalar arithmetic would require target
+// instructions that are not available on every unit executing these guards.
+static void foldExpandedLoopGuards(llvm::ArrayRef<mlir::scf::ForOp> loops,
+                                   mlir::IRRewriter& rewriter) {
+  auto d0 = rewriter.getAffineDimExpr(0);
+  for (auto loop : loops) {
+    mlir::Value iv = loop.getInductionVar();
+    loop.walk([&](mlir::arith::CmpIOp compare) {
+      auto predicate = compare.getPredicate();
+      if (predicate != mlir::arith::CmpIPredicate::eq &&
+          predicate != mlir::arith::CmpIPredicate::ne)
+        return;
+      mlir::Value value = compare.getLhs();
+      auto constant =
+          compare.getRhs().getDefiningOp<mlir::arith::ConstantIndexOp>();
+      if (!constant) {
+        constant =
+            compare.getLhs().getDefiningOp<mlir::arith::ConstantIndexOp>();
+        value = compare.getRhs();
+      }
+      if (!constant) return;
+      auto map = rewriter.getDimIdentityMap();
+      llvm::SmallVector<mlir::Value> operands{value};
+      composeIndexMap(map, operands);
+      if (operands.size() != 1 || operands.front() != iv) return;
+      auto expr = mlir::simplifyAffineMap(map).getResult(0);
+      auto bias = mlir::dyn_cast<mlir::AffineConstantExpr>(
+          expr.replaceDimsAndSymbols({rewriter.getAffineConstantExpr(0)}, {}));
+      if (!bias || (expr != d0 + bias && expr != d0 * 2 + bias)) return;
+      int64_t scale = expr == d0 * 2 + bias ? 2 : 1;
+      int64_t difference;
+      if (llvm::SubOverflow(constant.value(), bias.getValue(), difference))
+        return;
+      auto lower =
+          loop.getLowerBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+      auto upper =
+          loop.getUpperBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+      bool impossible = difference % scale != 0 ||
+                        (lower && difference / scale < lower.value()) ||
+                        (upper && difference / scale >= upper.value());
+      rewriter.setInsertionPoint(compare);
+      if (impossible) {
+        rewriter.replaceOpWithNewOp<mlir::arith::ConstantIntOp>(
+            compare, predicate == mlir::arith::CmpIPredicate::ne, 1);
+      } else {
+        auto bound = mlir::arith::ConstantIndexOp::create(
+            rewriter, compare.getLoc(), difference / scale);
+        rewriter.replaceOpWithNewOp<mlir::arith::CmpIOp>(compare, predicate, iv,
+                                                         bound);
+      }
+    });
+  }
+}
+
 // Keep both buffers, but expose a complete ping-pong cycle to the address
 // generator. A loop-carried `sum - offset` is not an arithmetic progression:
 // treating it as a fixed address increment reads outside the buffers after
@@ -293,6 +350,7 @@ static mlir::LogicalResult expandAlternatingBufferOffsets(
     if (unrolled->epilogueLoopOp) loops.push_back(*unrolled->epilogueLoopOp);
     normalizeSCFLoops(loops, rewriter);
     composeAgenIndexMaps(func);
+    foldExpandedLoopGuards(loops, rewriter);
     canonicalizeFunc(func);
   }
 }

@@ -35,6 +35,7 @@
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Location.h>
 #include <mlir/IR/Operation.h>
+#include <mlir/IR/OperationSupport.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/Value.h>
 #include <mlir/Interfaces/LoopLikeInterface.h>
@@ -48,6 +49,7 @@
 #include <limits>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/DataTransferLowering.h"
@@ -531,23 +533,34 @@ struct TileLoad : mlir::OpRewritePattern<mlir::tensor::ExtractSliceOp> {
 /// Determines whether any op strictly between @p begin and @p end , which must
 /// be in this order in the same block, may have memory effects.
 [[nodiscard]] auto hasMemoryEffectsBetween(mlir::Operation* begin,
-                                           mlir::Operation* end) -> bool {
+                                           mlir::Operation* end,
+                                           bool include_reads = true) -> bool {
   assert(begin->getBlock() == end->getBlock() && begin->isBeforeInBlock(end));
   return llvm::any_of(
       llvm::make_range(std::next(begin->getIterator()), end->getIterator()),
-      [](mlir::Operation& op) { return !mlir::isMemoryEffectFree(&op); });
+      [include_reads](mlir::Operation& op) {
+        if (include_reads) return !mlir::isMemoryEffectFree(&op);
+        auto effects = mlir::getEffectsRecursively(&op);
+        return !effects || llvm::any_of(*effects, [](const auto& effect) {
+          return !llvm::isa<mlir::MemoryEffects::Read>(effect.getEffect());
+        });
+      });
 }
 
-struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
+template <typename StoreOp>
+struct TileStore : mlir::OpRewritePattern<StoreOp> {
   explicit TileStore(mlir::MLIRContext* context,
                      const AttrMapping& mem_space_map)
-      : OpRewritePattern(context), mem_space_map_(mem_space_map) {}
+      : mlir::OpRewritePattern<StoreOp>(context),
+        mem_space_map_(mem_space_map) {}
 
-  auto matchAndRewrite(mlir::ktdp::StoreOp store,
-                       mlir::PatternRewriter& rewriter) const
+  auto matchAndRewrite(StoreOp store, mlir::PatternRewriter& rewriter) const
       -> mlir::LogicalResult override {
     // Vias come after reshapes, and consecutive vias are folded.
-    mlir::Value data = store.getDataTile();
+    auto data_tile = store->getOperand(0);
+    auto access_tile = store->getOperand(1);
+    auto data_type = mlir::cast<mlir::RankedTensorType>(data_tile.getType());
+    mlir::Value data = data_tile;
     auto via = data.getDefiningOp<mlir::ktdf::ViaOp>();
     if (via) {
       data = via.getOperand();
@@ -567,8 +580,8 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     if (failed(nest)) {
       return rewriter.notifyMatchFailure(store, "not a data tile source");
     }
-    auto insert_slice = nest->insert_slice;
-    auto outermost = nest->outermost;
+    mlir::tensor::InsertSliceOp insert_slice = nest->insert_slice;
+    mlir::LoopLikeOpInterface outermost = nest->outermost;
     const bool more_inserts =
         nest->is_update &&
         insert_slice.getDest().getDefiningOp<mlir::tensor::InsertSliceOp>();
@@ -578,15 +591,62 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     if (has_reshape) {
       auto mapped =
           mapSlice(rewriter, slice, insert_slice.getDestType().getShape(),
-                   store.getDataTile().getType().getShape());
+                   data_type.getShape());
       if (failed(mapped)) {
         return rewriter.notifyMatchFailure(store, "unsupported reshape");
       }
       slice = std::move(*mapped);
     }
-    if (has_reshape && !nest->is_update) {
+    if (has_reshape && outermost && !nest->is_update) {
       return rewriter.notifyMatchFailure(insert_slice,
                                          "can not reshape inserted tile");
+    }
+
+    // A partial output map can leave an insertion outside the tiled compute
+    // loops. Store its source, then let the same pattern sink that sliced store
+    // through the source's loop nest. Preserve unrelated destination elements.
+    if (!outermost) {
+      mlir::Value initial = insert_slice.getDest();
+      bool preserve = !initial.getDefiningOp<mlir::tensor::EmptyOp>();
+      auto load = initial.getDefiningOp<mlir::ktdp::LoadOp>();
+      if constexpr (std::is_same_v<StoreOp, mlir::ktdp::StoreOp>) {
+        if (load && !via && !has_reshape &&
+            load->getBlock() == store->getBlock() &&
+            !hasMemoryEffectsBetween(load, store, /*include_reads=*/false)) {
+          auto loaded_tile = load.getAccessTile();
+          auto* loaded_op = loaded_tile.getDefiningOp();
+          auto* stored_op = access_tile.getDefiningOp();
+          if (loaded_tile == access_tile ||
+              (loaded_op && stored_op &&
+               mlir::OperationEquivalence::isEquivalentTo(
+                   loaded_op, stored_op,
+                   mlir::OperationEquivalence::IgnoreLocations)))
+            preserve = false;
+        }
+      }
+      rewriter.setInsertionPoint(store);
+      auto stored = reshapeTo(rewriter, store.getLoc(),
+                              insert_slice.getSource(), getSliceShape(slice));
+      if (via)
+        stored = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), stored,
+                                           via.getHops());
+      // Preserve the initial tensor before the update when it is not already
+      // in the destination memory. The original store can itself be tiled.
+      if (preserve) {
+        initial =
+            reshapeTo(rewriter, store.getLoc(), initial, data_type.getShape());
+        if (via)
+          initial = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), initial,
+                                              via.getHops());
+        rewriter.modifyOpInPlace(store, [&] { store->setOperand(0, initial); });
+        rewriter.setInsertionPointAfter(store);
+      }
+      auto new_store = createSlicedStore(rewriter, store, stored, slice);
+      setThrottle(new_store, getThrottle(insert_slice.getSourceMutable()));
+      if (!preserve) rewriter.eraseOp(store);
+      if (insert_slice->use_empty()) rewriter.eraseOp(insert_slice);
+      if (load && load->use_empty()) rewriter.eraseOp(load);
+      return mlir::success();
     }
 
     // The store has to sink into the loop nest, and for that it might have to
@@ -602,9 +662,12 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
         return rewriter.notifyMatchFailure(store,
                                            "memory effects before store");
       }
-      if (mlir::failed(mlir::moveValueDefinitions(
-              rewriter, store.getAccessTile(), outermost))) {
-        return rewriter.notifyMatchFailure(store, "can not move access tile");
+      for (auto operand : store->getOperands().drop_front()) {
+        if (mlir::failed(
+                mlir::moveValueDefinitions(rewriter, operand, outermost))) {
+          return rewriter.notifyMatchFailure(store,
+                                             "can not move store access");
+        }
       }
     }
 
@@ -627,7 +690,7 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     if (via) {
       llvm::append_range(hops, via.getHops());
     }
-    hops.push_back(getMemorySpace(store.getAccessTile()));
+    hops.push_back(getMemorySpace(access_tile));
     canonicalizeHops(hops, mem_space_map_);
     if (hops.size() > 1) {
       stored = mlir::ktdf::ViaOp::create(
@@ -636,8 +699,7 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
     }
 
     // Create the `ktdp_lowering.store` that captures the applied tiling.
-    auto new_store = mlir::ktdp_lowering::StoreOp::create(
-        rewriter, store.getLoc(), stored, store.getAccessTile(), slice);
+    auto new_store = createSlicedStore(rewriter, store, stored, slice);
     setThrottle(new_store, getThrottle(insert_slice.getSourceMutable()));
 
     // The loop nest no longer produces the data, and remaining users must now
@@ -650,20 +712,25 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
       mlir::Value initial = outermost.getTiedLoopInit(nest->result)->get();
       if (!initial.getDefiningOp<mlir::tensor::EmptyOp>()) {
         rewriter.setInsertionPoint(outermost);
-        initial = reshapeTo(rewriter, store.getLoc(), initial,
-                            store.getDataTile().getType().getShape());
+        initial =
+            reshapeTo(rewriter, store.getLoc(), initial, data_type.getShape());
         if (via) {
           initial = mlir::ktdf::ViaOp::create(rewriter, store.getLoc(), initial,
                                               via.getHops());
         }
-        auto initial_store =
-            mlir::cast<mlir::ktdp::StoreOp>(rewriter.clone(*store));
-        initial_store.getDataTileMutable().assign(initial);
+        auto initial_store = rewriter.clone(*store);
+        initial_store->setOperand(0, initial);
       }
       rewriter.setInsertionPointAfter(outermost);
-      auto reloaded = mlir::ktdp::LoadOp::create(rewriter, store.getLoc(),
-                                                 store.getDataTile().getType(),
-                                                 store.getAccessTile());
+      mlir::Value reloaded;
+      if constexpr (std::is_same_v<StoreOp, mlir::ktdp::StoreOp>) {
+        reloaded = mlir::ktdp::LoadOp::create(rewriter, store.getLoc(),
+                                              data_type, access_tile);
+      } else {
+        reloaded = mlir::ktdp_lowering::LoadOp::create(
+            rewriter, store.getLoc(), access_tile, getSlice(store),
+            data_type.getElementType());
+      }
       rewriter.replaceAllUsesWith(
           nest->result,
           reshapeTo(
@@ -677,6 +744,33 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
   }
 
  private:
+  static auto createSlicedStore(mlir::OpBuilder& builder, StoreOp store,
+                                mlir::Value data,
+                                llvm::ArrayRef<mlir::Range> slice)
+      -> mlir::ktdp_lowering::StoreOp {
+    if constexpr (std::is_same_v<StoreOp, mlir::ktdp::StoreOp>) {
+      return mlir::ktdp_lowering::StoreOp::create(builder, store.getLoc(), data,
+                                                  store.getAccessTile(), slice);
+    } else {
+      const auto [offsets, sizes, strides] =
+          mlir::getOffsetsSizesAndStrides(slice);
+      llvm::SmallVector<mlir::OpFoldResult> merged_offsets, merged_sizes,
+          merged_strides;
+      // Both slices have the stored tensor's rank (rank reduction was undone
+      // by reshapeTo), so this composition has no dropped dimensions.
+      auto merged = mlir::affine::mergeOffsetsSizesAndStrides(
+          builder, store.getLoc(), store.getMixedOffsets(),
+          store.getMixedSizes(), store.getMixedStrides(),
+          llvm::SmallBitVector(offsets.size()), offsets, sizes, strides,
+          merged_offsets, merged_sizes, merged_strides);
+      assert(succeeded(merged) && "same-rank store slices must compose");
+      (void)merged;
+      return mlir::ktdp_lowering::StoreOp::create(
+          builder, store.getLoc(), data, store.getDest(), merged_offsets,
+          merged_sizes, merged_strides);
+    }
+  }
+
   /// Loop nest that yields the result of a `tensor.insert_slice`.
   struct LoopNest {
     mlir::tensor::InsertSliceOp insert_slice;
@@ -741,7 +835,9 @@ struct TileStore : mlir::OpRewritePattern<mlir::ktdp::StoreOp> {
 void scheduler::populateKTDPTilingPatterns(mlir::RewritePatternSet& patterns,
                                            const AttrMapping& mem_space_map) {
   patterns.add<MoveViaAfterReshape>(patterns.getContext());
-  patterns.add<TileLoad, TileStore>(patterns.getContext(), mem_space_map);
+  patterns.add<TileLoad, TileStore<mlir::ktdp::StoreOp>,
+               TileStore<mlir::ktdp_lowering::StoreOp>>(patterns.getContext(),
+                                                        mem_space_map);
 }
 
 //===----------------------------------------------------------------------===//

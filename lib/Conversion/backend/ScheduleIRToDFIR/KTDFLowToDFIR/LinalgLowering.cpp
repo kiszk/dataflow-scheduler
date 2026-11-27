@@ -276,7 +276,8 @@ struct LowerLinalgGenericPattern
   mlir::LogicalResult matchAndRewrite(
       mlir::linalg::GenericOp generic_op,
       mlir::PatternRewriter& rewriter) const override {
-    if (generic_op->hasAttr("dataflow_scheduler.mpe_matmul"))
+    if (generic_op->hasAttr("dataflow_scheduler.mpe_matmul") ||
+        generic_op->hasAttr("dataflow_scheduler.mpe_partial_combine"))
       return mlir::failure();
     // Buffer-semantics path: init operand is a memref accumulator.
     if (generic_op.hasPureBufferSemantics())
@@ -722,9 +723,15 @@ struct LowerLinalgGenericPattern
                                     mlir::AffineMap identity_map) const {
     mlir::Value input = op.getInput();
     // Fusion has already composed any layout permutation into the generic's
-    // indexing maps. An arithmetic result needs no additional forwarding op.
+    // indexing maps. An identity feeding another body op and an identity of
+    // an arithmetic result need no additional forwarding instruction.
     // Keep the OR for a value received by an otherwise empty compute stage.
-    if (mlir::isa_and_nonnull<mlir::vectorchain::BinaryOp,
+    if (llvm::none_of(op->getUsers(),
+                      [](mlir::Operation* user) {
+                        return mlir::isa<mlir::linalg::YieldOp>(user);
+                      }) ||
+        mlir::isa_and_nonnull<mlir::vectorchain::BinaryOp,
+                              mlir::vectorchain::MultiplyAndAccumulateOp,
                               mlir::vectorchain::FloorOp,
                               mlir::vectorchain::NegOp>(
             input.getDefiningOp())) {
@@ -826,6 +833,20 @@ struct LowerLinalgGenericPattern
               : mlir::vectorchain::NegOp::create(rewriter, op->getLoc(), type,
                                                  input, nullptr, nullptr)
                     .getData();
+    if (!floor) {
+      // Negation is an input modifier of multiply-and-accumulate, not a
+      // standalone target instruction. Use the existing SDSC neg form,
+      // FNMS(x, 1, 0), so a received operand is consumed and the result sent.
+      auto one = mlir::arith::ConstantOp::create(
+          rewriter, op->getLoc(),
+          mlir::DenseElementsAttr::get(
+              type, rewriter.getFloatAttr(type.getElementType(), 1.0)));
+      auto zero = mlir::arith::ConstantOp::create(rewriter, op->getLoc(), type,
+                                                  rewriter.getZeroAttr(type));
+      output = mlir::vectorchain::MultiplyAndAccumulateOp::create(
+          rewriter, op->getLoc(), type, output, one, zero, nullptr, nullptr,
+          rewriter.getMultiDimIdentityMap(1));
+    }
     rewriter.replaceOp(op, output);
     return mlir::success();
   }

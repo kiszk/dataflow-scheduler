@@ -61,6 +61,19 @@ std::optional<unsigned> findInnerDimLoopDim(linalg::GenericOp generic_op) {
 // StageFactory method definitions
 // ---------------------------------------------------------------------------
 
+SmallVector<ktdf::DataTransferOp> StageFactory::buildTransfers(
+    OpBuilder& builder, Location loc, ArrayRef<ChunkTransfer> transfers) {
+  SmallVector<ktdf::DataTransferOp> result;
+  for (const auto& transfer : transfers) {
+    const auto& src = transfer.source;
+    const auto& dst = transfer.destination;
+    result.push_back(ktdf::DataTransferOp::create(
+        builder, loc, src.buffer, src.map, src.indices, src.sizes, dst.buffer,
+        dst.map, dst.indices, dst.sizes));
+  }
+  return result;
+}
+
 FifoPrivateResult StageFactory::buildFifoPrivate(
     const ChunkPipelineConfig& cfg) {
   auto tok_type = pipe_bldr_.getType<ktdf::TokenType>();
@@ -184,15 +197,15 @@ void StageFactory::buildLoadStage(
       AffineMap::get(static_cast<unsigned>(input_rank),
                      /*symbolCount=*/0, map_results, b.getContext());
 
-  // Transfer the input chunk into each in-slot.
+  SmallVector<ChunkTransfer, 2> transfers;
   for (unsigned i = 0; i < cfg.in_slot_types.size(); ++i) {
-    Value fifo_in_slot = slots_.inSlot(i);
-    auto fifo_type = cast<ktdf::FifoSlotType>(fifo_in_slot.getType());
-    ktdf::DataTransferOp::create(
-        b, loc_, input_memref, input_map, src_indices, src_static_sizes,
-        fifo_in_slot, AffineMap{}, ValueRange{},
-        ArrayRef<int64_t>{static_cast<int64_t>(fifo_type.getNumElements())});
+    Value fifo = slots_.inSlot(i);
+    auto type = cast<ktdf::FifoSlotType>(fifo.getType());
+    transfers.push_back(
+        {{input_memref, input_map, src_indices, src_static_sizes},
+         {fifo, {}, {}, {static_cast<int64_t>(type.getNumElements())}}});
   }
+  buildTransfers(b, loc_, transfers);
 
   // On non-first iterations, feed each partial accumulator into its partial-
   // slot so the Compute stage can read back the running result.

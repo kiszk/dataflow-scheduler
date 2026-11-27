@@ -77,9 +77,6 @@ class MemoryTracker {
   /// Track next available address per memory resource attribute
   llvm::DenseMap<ResourceType, size_t> next_address_;
 
-  /// Helper to align an address to the specified alignment
-  static size_t alignAddress(size_t address, size_t alignment);
-
   /// Helper to produce a printable string for a memory resource
   static std::string resourceToString(ResourceType memory_resource);
 };

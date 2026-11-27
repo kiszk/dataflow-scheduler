@@ -92,19 +92,19 @@ module {
 
 // -----
 
-// The only pinned stage is on a load/store unit, not a compute unit, so the
-// pipeline has no compute stage to anchor the two sides.
+// A transfer-only pipeline has neither a compute anchor nor a direct route:
+// MNILU can move DDR to L1, but cannot copy DDR to DDR.
 
 // CHECK:     Pipeline has no stage pinned to a compute unit
 // CHECK:     error: path-expansion: failed to plan path expansion
 
 module {
   ktdf_arch.device @sample_device attributes {} import("../../Dialect/KTDFArch/sample_device.mlir")
-  func.func @no_compute_stage(%a: memref<64xf16, "DDR">, %d: memref<64xf16, "L1">) {
+  func.func @no_compute_stage(%a: memref<64xf16, "DDR">, %d: memref<64xf16, "DDR">) {
     %c0 = arith.constant 0 : index
     ktdf.pipeline {
       ktdf.stage depends_in(none) depends_out(none) {
-        ktdf.data_transfer from %a[%c0] size [64] to %d[%c0] size [64] : memref<64xf16, "DDR">, memref<64xf16, "L1">
+        ktdf.data_transfer from %a[%c0] size [64] to %d[%c0] size [64] : memref<64xf16, "DDR">, memref<64xf16, "DDR">
       } {applicable_units = ["MNILU"]}
     }
     return

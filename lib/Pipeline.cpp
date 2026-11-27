@@ -29,9 +29,11 @@
 #include <mlir/Transforms/Passes.h>
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/Passes.h"
+#include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/MpeMatmul.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
+#include "dataflow-scheduler/Transforms/AllocationPlan.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 
@@ -58,6 +60,9 @@ void scheduler::buildKTIRFrontendPipeline(
     nested.addPass(mlir::createConvertElementwiseToLinalgPass());
     nested.addPass(mlir::createLinalgMorphOpsPass(
         {.categoryToGeneric = true, .namedToGeneric = true}));
+    // Share equivalent access origins before partial-store tiling, but before
+    // numeric-cast tiling deliberately specializes packet pipelines per use.
+    nested.addPass(mlir::createCSEPass());
     // Form native packets before simplification drops physical unit axes.
     nested.addPass(createKTIRNumericCastTilingPass());
     nested.addPass(createSimplifyLinalgPass());
@@ -68,7 +73,7 @@ void scheduler::buildKTIRFrontendPipeline(
   }
 }
 
-void scheduler::buildSchedulerOptimizationPipeline(
+static void buildSchedulerOptimizations(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
   // Checkpoint 'pre_scheduling':
   //   - The input is 'ktdf' with nested modules (!), but not necessarily
@@ -150,9 +155,118 @@ void scheduler::buildSchedulerOptimizationPipeline(
   // order the consumer uses them, as the FIFO delivers them in that order.
   pm.addPass(createOrderFifoSlotsByUsePass());
   pm.addPass(createReuseRegistersPass());
+}
+
+namespace {
+/// Retry only memory-capacity failures, always from the validated prepared IR.
+/// This runs the same optimizations for each candidate and checks their actual
+/// allocations, including buffers introduced by device patterns and pipelining.
+class ScheduleWithChunkPlanPass
+    : public mlir::PassWrapper<ScheduleWithChunkPlanPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+ public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScheduleWithChunkPlanPass)
+  explicit ScheduleWithChunkPlanPass(const SchedulerExtContext& ctx)
+      : ctx_(&ctx) {}
+  llvm::StringRef getArgument() const final {
+    return "schedule-with-chunk-plan";
+  }
+  llvm::StringRef getDescription() const final {
+    return "Schedule validated matmuls with capacity-bounded K chunks";
+  }
+  void getDependentDialects(mlir::DialectRegistry& registry) const override {
+    mlir::OpPassManager pm(mlir::ModuleOp::getOperationName());
+    buildSchedulerOptimizations(pm, *ctx_);
+    pm.getDependentDialects(registry);
+  }
+  void runOnOperation() override {
+    auto module = getOperation();
+    auto collect = [](mlir::ModuleOp root) {
+      llvm::SmallVector<mlir::linalg::GenericOp> ops;
+      root.walk([&](mlir::linalg::GenericOp op) {
+        if (op.hasPureBufferSemantics() &&
+            op->hasAttr("dataflow_scheduler.mpe_matmul") &&
+            !op->hasAttr("dataflow_scheduler.mpe_chunk_profile"))
+          ops.push_back(op);
+      });
+      return ops;
+    };
+    auto original = collect(module);
+    auto schedule = [&]() {
+      mlir::OpPassManager pm(mlir::ModuleOp::getOperationName());
+      buildSchedulerOptimizations(pm, *ctx_);
+      return runPipeline(pm, module);
+    };
+    if (original.empty()) {
+      if (mlir::failed(schedule())) signalPassFailure();
+      return;
+    }
+    // Preserve allocations already made by the frontend (notably HBM address
+    // buffers). Restoring only IR would incorrectly reset that live state.
+    MemoryTracker initial = getAnalysis<MemoryTrackerAnalysis>().getTracker();
+    mlir::OwningOpRef<mlir::ModuleOp> checkpoint(module.clone());
+    llvm::SmallVector<llvm::SmallVector<MpeMatmulChunkPlan>> candidates;
+    llvm::SmallVector<mlir::StringAttr> programs;
+    for (auto op : original) {
+      candidates.push_back(getMpeMatmulChunkPlans(op));
+      programs.push_back(
+          op->getParentOfType<mlir::ModuleOp>().getSymNameAttr());
+    }
+    llvm::SmallVector<int64_t> selected(original.size(), -1);
+    bool first = true;
+    while (true) {
+      if (!first) {
+        getAnalysisManager().clear();
+        mlir::OwningOpRef<mlir::ModuleOp> copy(checkpoint->clone());
+        module->setAttrs(copy->getOperation()->getAttrs());
+        module.getBodyRegion().takeBody(copy->getBodyRegion());
+        getAnalysis<MemoryTrackerAnalysis>().getTracker() = initial;
+        auto ops = collect(module);
+        for (auto [i, op] : llvm::enumerate(ops)) {
+          if (selected[i] < 0) continue;
+          if (mlir::failed(
+                  chunkMpeMatmulPipeline(op, candidates[i][selected[i]]))) {
+            signalPassFailure();
+            return;
+          }
+        }
+      }
+      first = false;
+      if (mlir::failed(schedule())) return signalPassFailure();
+      auto plan = planAllocations(module, getAnalysis<MemoryTrackerAnalysis>());
+      if (plan) return;  // AddressAssignment applies this same model next.
+      auto scope = plan.failed_operation->getParentOfType<mlir::ModuleOp>();
+      auto program = scope ? scope.getSymNameAttr() : mlir::StringAttr{};
+      bool retry = false;
+      if (plan.capacity_exceeded) {
+        for (unsigned i = 0; i < candidates.size(); ++i) {
+          if (programs[i] != program ||
+              selected[i] + 1 == static_cast<int64_t>(candidates[i].size()))
+            continue;
+          ++selected[i];
+          retry = true;
+          break;
+        }
+      }
+      if (retry) continue;
+      (void)plan.diagnose();
+      if (plan.capacity_exceeded)
+        module.emitError(
+            "no legal matmul K chunk and input buffer count fits the memory "
+            "allocation plan");
+      return signalPassFailure();
+    }
+  }
+
+ private:
+  const SchedulerExtContext* ctx_;
+};
+}  // namespace
+
+void scheduler::buildSchedulerOptimizationPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  pm.addPass(std::make_unique<ScheduleWithChunkPlanPass>(scheduler_ctx));
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
-  // TODO: position of cross-instance parallelization is TBD
-  // pm.addPass(createParallelizeLoopsAcrossInstancesPass(scheduler_ctx));
   pm.addPass(createNormalizeGridTo1DPass());
 }
 

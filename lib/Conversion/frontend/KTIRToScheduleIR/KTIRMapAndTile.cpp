@@ -717,21 +717,28 @@ void KTIRNumericCastTilingPass::runOnOperation() {
     }
     auto lane_preserving = [&] {
       auto maps = generic.getIndexingMapsArray();
-      if (maps.size() != 2 || !maps.back().isIdentity()) return false;
-      auto type = mlir::cast<mlir::ShapedType>(generic.getResult(0).getType());
-      if (!type.hasStaticShape() || !type.getRank()) return false;
-      auto lane = mlir::getAffineDimExpr(type.getRank() - 1, func.getContext());
-      auto width = type.getShape().back();
-      auto source = maps.front();
-      if (source.getResults().back() != lane &&
-          source.getResults().back() != lane % width)
-        return false;
+      if (maps.size() != 2 || !generic.getNumLoops()) return false;
+      auto lane_axis = generic.getNumLoops() - 1;
+      auto lane = mlir::getAffineDimExpr(lane_axis, func.getContext());
+      // Slices and partial writes can change rank and offset outer axes on
+      // either side. They still transfer complete sticks when both maps keep
+      // the lane coordinate and no outer coordinate depends on it.
       return llvm::all_of(
-          source.getResults().drop_back(), [&](mlir::AffineExpr expr) {
-            return !expr.replace(
-                            lane.floorDiv(width),
-                            mlir::getAffineConstantExpr(0, func.getContext()))
-                        .isFunctionOfDim(type.getRank() - 1);
+          llvm::zip(maps, generic.getOperands()), [&](auto item) {
+            auto [map, operand] = item;
+            auto type = mlir::cast<mlir::ShapedType>(operand.getType());
+            if (!type.hasStaticShape() || !type.getRank()) return false;
+            auto width = type.getShape().back();
+            if (map.getResults().back() != lane &&
+                map.getResults().back() != lane % width)
+              return false;
+            return llvm::all_of(
+                map.getResults().drop_back(), [&](mlir::AffineExpr expr) {
+                  return !expr.replace(lane.floorDiv(width),
+                                       mlir::getAffineConstantExpr(
+                                           0, func.getContext()))
+                              .isFunctionOfDim(lane_axis);
+                });
           });
     };
     if (!generic.getBody()->getOps<mlir::spyreop::Identity>().empty() &&
@@ -1414,6 +1421,15 @@ void KTIRMapAndTilePass::runOnOperation() {
   mlir::func::FuncOp func = getOperation();
   mlir::IRRewriter rewriter(func);
 
+  // Fusion can retain an unused result with a different shape or permutation.
+  // Drop it before deciding whether the remaining results can be tiled.
+  {
+    mlir::RewritePatternSet patterns(&getContext());
+    mlir::linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
+    if (failed(mlir::applyPatternsGreedily(func, std::move(patterns))))
+      return signalPassFailure();
+  }
+
   // Compute operations already nested in loops (e.g. by
   // IndirectAccessLoopMaterialization) are mapped but not tiled.
   auto computes = llvm::to_vector(func.getOps<mlir::linalg::LinalgOp>());
@@ -1498,6 +1514,9 @@ void KTIRMapAndTilePass::runOnOperation() {
     mlir::tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
     mlir::tensor::populateFoldTensorEmptyPatterns(patterns);
     populateSimplifyLoopsPatterns(patterns);
+    // Tiling can make outputs retained by elementwise fusion dead. Remove
+    // them after the corresponding loop-carried insertions are dropped.
+    mlir::linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
 
     if (failed(mlir::applyPatternsGreedily(func, std::move(patterns)))) {
       signalPassFailure();

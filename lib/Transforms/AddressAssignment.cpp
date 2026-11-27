@@ -52,6 +52,7 @@
 #include "dataflow-scheduler/Analysis/Utils.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"  // IWYU pragma: keep
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
+#include "dataflow-scheduler/Transforms/AllocationPlan.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -187,6 +188,11 @@ struct AllocOp
     LDBG(1) << "Analyzing allocation: " << *this;
     LDBG(1) << "  Type: " << getResult().getType();
 
+    const auto shape = getUpperShapeBound();
+    if (mlir::failed(shape) ||
+        llvm::any_of(*shape, [](int64_t size) { return size < 0; }))
+      return llvm::failure();
+    if (llvm::is_contained(*shape, int64_t{0})) return size_t{0};
     const auto maybe_offset = getUpperOffsetBound();
     if (llvm::failed(maybe_offset)) {
       return llvm::failure();
@@ -198,8 +204,9 @@ struct AllocOp
       return llvm::failure();
     }
 
-    size_t total_bytes;
-    if (__builtin_mul_overflow(*maybe_offset + 1, *maybe_size, &total_bytes)) {
+    size_t elements, total_bytes;
+    if (__builtin_add_overflow(*maybe_offset, size_t{1}, &elements) ||
+        __builtin_mul_overflow(elements, *maybe_size, &total_bytes)) {
       LDBG() << "allocation too large";
       return llvm::failure();
     }
@@ -242,27 +249,6 @@ struct AllocOp
 
   return allocs;
 }
-
-/// Gets whether any allocation under \p module names a memory space.
-///
-/// Asked before the tracker is built, which needs the device: a module with
-/// nothing to assign need not carry one.
-[[nodiscard]] auto hasAllocationsWithMemorySpace(mlir::ModuleOp module)
-    -> bool {
-  return module
-      .walk([](AllocOp alloc) {
-        return alloc.getType().getMemorySpace() ? mlir::WalkResult::interrupt()
-                                                : mlir::WalkResult::advance();
-      })
-      .wasInterrupted();
-}
-
-/// Result of processing a single allocation.
-struct AllocationResult {
-  bool success;
-  size_t assigned_address;
-  size_t size;
-};
 
 /// Replace memref.alloc with unrealized_conversion_cast using the assigned
 /// address, and remove any corresponding memref.dealloc operations.
@@ -309,198 +295,22 @@ void materializeAddressAssignment(AllocOp alloc, size_t assigned_address,
 
 struct AddressAssignmentPass
     : public impl::AddressAssignmentPassBase<AddressAssignmentPass> {
-  AddressAssignmentPass()
-      : scheduler_ctx_(SchedulerExtContext::dummyContext()) {}
-  explicit AddressAssignmentPass(const SchedulerExtContext& ctx)
-      : scheduler_ctx_(ctx) {}
+  AddressAssignmentPass() = default;
+  explicit AddressAssignmentPass(const SchedulerExtContext&) {}
 
   void runOnOperation() override {
-    if (DisableThisPass) {
+    if (DisableThisPass || !hasAllocationsWithMemorySpace(getOperation()))
       return;
-    }
-
-    LDBG(1) << "========= " PASS_NAME " =========";
-
-    mlir::ModuleOp module = getOperation();
-
-    LDBG(1) << "Starting address assignment analysis";
-
-    if (!hasAllocationsWithMemorySpace(module)) {
-      LDBG(1) << "No allocations with memory space attributes";
-      return;
-    }
-
-    // Get the MemoryTrackerAnalysis.
-    auto& tracker = getAnalysis<MemoryTrackerAnalysis>();
-    mlir::OpBuilder builder(&getContext());
-
-    // Caller-owned fixed scratchpad views survive across extracted programs.
-    // Protect their entire prefix in every program, including programs that do
-    // not access the view but run while its contents are live. Offsets/strides
-    // in these views count elements; the allocator counts bytes.
-    llvm::DenseMap<ResourceType, size_t> fixed_ends;
-    auto reserve_view = [&](auto view) -> mlir::WalkResult {
-      const auto space = llvm::dyn_cast<ResourceType>(view.getMemorySpace());
-      const auto& tree = tracker.getMemoryTree();
-      if (!space || !tree.isPerCoreScratchPadMemory(space))
-        return mlir::WalkResult::advance();
-      llvm::APInt address;
-      if (!mlir::matchPattern(view.getOffset(), mlir::m_ConstantInt(&address)))
-        return mlir::WalkResult::advance();  // Runtime address: caller-managed.
-      int64_t offset = address.getSExtValue();
-      auto bytes = tryGetSizeInBytes(view.getType().getElementType());
-      size_t end = offset >= 0 ? static_cast<size_t>(offset) : 0;
-      bool invalid = offset < 0 || !bytes;
-      for (auto [size, stride] :
-           llvm::zip_equal(view.getStaticSizes(), view.getStaticStrides())) {
-        size_t span;
-        if (size <= 0 || stride < 0 ||
-            __builtin_mul_overflow(size - 1, stride, &span) ||
-            __builtin_add_overflow(end, span, &end))
-          invalid = true;
-      }
-      if (invalid || __builtin_add_overflow(end, size_t{1}, &end) ||
-          __builtin_mul_overflow(end, *bytes, &end)) {
-        view.emitError(
-            "fixed scratchpad view requires a bounded nonnegative "
-            "address, shape and strides");
-        return mlir::WalkResult::interrupt();
-      }
-      auto node = tree.getNode(*tree.getNodeIdForMemory(space));
-      if (!node->capacity_in_bytes || end > *node->capacity_in_bytes) {
-        view.emitError("fixed scratchpad view exceeds memory capacity");
-        return mlir::WalkResult::interrupt();
-      }
-      auto& reserved_end = fixed_ends[node->memory_resource];
-      reserved_end = std::max(reserved_end, end);
-      return mlir::WalkResult::advance();
-    };
-    if (module
-            .walk([&](mlir::ktdp::ConstructMemoryViewOp view) {
-              return reserve_view(view);
-            })
-            .wasInterrupted() ||
-        module
-            .walk([&](mlir::ktdp_lowering::ConstructMemoryViewOp view) {
-              return reserve_view(view);
-            })
-            .wasInterrupted()) {
+    auto& analysis = getAnalysis<MemoryTrackerAnalysis>();
+    auto plan = planAllocations(getOperation(), analysis);
+    if (mlir::failed(plan.diagnose())) {
+      ++num_failed;
       signalPassFailure();
       return;
     }
-
-    // Compiler scratch is reusable between programs. The caller-owned prefix
-    // above remains live. Whatever sits outside programs is a scope of its own.
-    llvm::SmallVector<mlir::ModuleOp> scopes{module};
-    llvm::append_range(scopes, module.getOps<mlir::ModuleOp>());
-
-    for (auto scope : scopes) {
-      const auto allocs = collectAllocations(scope);
-      LDBG(1) << "Found " << allocs.size()
-              << " allocations with memory space attributes";
-
-      // Only the memories this program has to itself start over. Global memory
-      // is how one program hands its results to the next, so it keeps what
-      // earlier ones left in it.
-      llvm::SmallDenseSet<ResourceType> reusable;
-      for (auto alloc : allocs) {
-        const auto space =
-            llvm::cast<ResourceType>(alloc.getType().getMemorySpace());
-        if (!tracker.getMemoryTree().isGlobalMemory(space)) {
-          reusable.insert(space);
-        }
-      }
-      tracker.reset(llvm::to_vector(reusable));
-
-      for (auto space : reusable) {
-        auto node = tracker.getMemoryTree().getNode(space);
-        size_t end = fixed_ends.lookup(node->memory_resource);
-        size_t next = tracker.getNextAvailableAddress(space);
-        if (end <= next) continue;
-        auto reserved = tracker.allocate(space, end - next);
-        if (!reserved) {
-          scope.emitError() << llvm::toString(reserved.takeError());
-          signalPassFailure();
-          return;
-        }
-      }
-
-      for (auto alloc : allocs) {
-        if (failed(processAllocation(alloc, tracker, builder))) {
-          ++num_failed;
-        }
-        ++num_processed;
-      }
-    }
-
-    LDBG(1) << "Allocation summary:";
-    LDBG(1) << "  Total allocations: " << num_processed;
-    LDBG(1) << "  Failed assignments: " << num_failed;
-    // TODO: Use memory hierarchy view to diagnose memref.alloc in namespaces
-    // that are not supposed to be address assigned by the scheduler
-
-    if (num_failed > 0) {
-      module->emitError("AddressAssignment: failed to assign addresses for ")
-          << num_failed << " allocation(s)";
-      signalPassFailure();
-    }
+    num_processed += plan.placements.size();
+    applyAllocationPlan(plan, analysis);
   }
-
- private:
-  auto processAllocation(AllocOp alloc, MemoryTrackerAnalysis& tracker,
-                         mlir::OpBuilder& builder)
-      -> llvm::FailureOr<AllocationResult> {
-    const auto maybe_size = alloc.getSize();
-    if (llvm::failed(maybe_size)) {
-      LDBG(1) << "  Skipping allocation with unknown size: " << alloc;
-      return llvm::failure();
-    }
-
-    // Get the memory space attribute from the memref type
-    auto memref_type = alloc.getType();
-    const auto memory_space_attr =
-        llvm::cast<ResourceType>(memref_type.getMemorySpace());
-    assert(memory_space_attr);
-
-    // The tracker hands out byte addresses, but the address is materialized in
-    // elements, as a memory view's offset counts them. Aligning to an element
-    // as well as to what the allocation asks for makes that division exact.
-    // getSize() has already checked that the element type has a size.
-    const size_t element_bytes =
-        *tryGetSizeInBytes(memref_type.getElementType());
-    const size_t alignment =
-        std::lcm(alloc.getAlignment().valueOrOne().value(), element_bytes);
-    auto address_result =
-        tracker.allocate(memory_space_attr, *maybe_size, alignment);
-
-    if (!address_result) {
-      llvm::Error err = address_result.takeError();
-      std::string error_msg;
-      llvm::handleAllErrors(std::move(err), [&](const llvm::ErrorInfoBase& ei) {
-        error_msg = ei.message();
-      });
-
-      alloc.emitError() << "Failed to allocate " << memory_space_attr
-                        << " memory: " << error_msg;
-      return llvm::failure();
-    }
-
-    assert(*address_result % element_bytes == 0 &&
-           "allocation must be element-aligned");
-    size_t assigned_address = *address_result / element_bytes;
-
-    LDBG(1) << "  Assigned address " << assigned_address << " (byte "
-            << *address_result << ") to allocation: " << alloc;
-    LDBG(1) << "    Size: " << *maybe_size << " bytes, Alignment: " << alignment
-            << " bytes";
-
-    // Materialize the address assignment in the IR
-    materializeAddressAssignment(alloc, assigned_address, builder);
-
-    return AllocationResult{true, assigned_address, *maybe_size};
-  }
-
-  const SchedulerExtContext& scheduler_ctx_;
 };
 
 }  // namespace
@@ -512,6 +322,148 @@ std::unique_ptr<mlir::Pass> scheduler::createAddressAssignmentPass() {
 std::unique_ptr<mlir::Pass> scheduler::createAddressAssignmentPass(
     const SchedulerExtContext& scheduler_ctx) {
   return std::make_unique<AddressAssignmentPass>(scheduler_ctx);
+}
+
+bool scheduler::hasAllocationsWithMemorySpace(mlir::ModuleOp module) {
+  return module
+      .walk([](AllocOp alloc) {
+        return alloc.getType().getMemorySpace() ? mlir::WalkResult::interrupt()
+                                                : mlir::WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+mlir::LogicalResult AllocationPlan::diagnose() const {
+  if (*this) return mlir::success();
+  failed_operation->emitError(error);
+  return mlir::failure();
+}
+
+AllocationPlan scheduler::planAllocations(
+    mlir::ModuleOp module, const MemoryTrackerAnalysis& analysis) {
+  AllocationPlan plan(analysis.getTracker());
+  const auto& tree = analysis.getMemoryTree();
+  auto fail = [&](mlir::Operation* op, llvm::Twine message,
+                  bool capacity = false) {
+    plan.failed_operation = op;
+    plan.error = message.str();
+    plan.capacity_exceeded = capacity;
+    return mlir::WalkResult::interrupt();
+  };
+  llvm::DenseMap<ResourceType, size_t> fixed_ends;
+  auto reserve_view = [&](auto view) -> mlir::WalkResult {
+    auto space = mlir::dyn_cast<ResourceType>(view.getMemorySpace());
+    if (!space || !tree.isPerCoreScratchPadMemory(space))
+      return mlir::WalkResult::advance();
+    llvm::APInt address;
+    if (!mlir::matchPattern(view.getOffset(), mlir::m_ConstantInt(&address)))
+      return mlir::WalkResult::advance();  // Runtime address: caller-managed.
+    int64_t offset = address.getSExtValue();
+    auto bytes = tryGetSizeInBytes(view.getType().getElementType());
+    size_t end = offset >= 0 ? static_cast<size_t>(offset) : 0;
+    bool invalid = offset < 0 || !bytes;
+    for (auto [size, stride] :
+         llvm::zip_equal(view.getStaticSizes(), view.getStaticStrides())) {
+      size_t span;
+      if (size <= 0 || stride < 0 ||
+          __builtin_mul_overflow(size - 1, stride, &span) ||
+          __builtin_add_overflow(end, span, &end))
+        invalid = true;
+    }
+    if (invalid || __builtin_add_overflow(end, size_t{1}, &end) ||
+        __builtin_mul_overflow(end, *bytes, &end))
+      return fail(view,
+                  "fixed scratchpad view requires a bounded nonnegative "
+                  "address, shape and strides");
+    auto node = tree.getNode(*tree.getNodeIdForMemory(space));
+    if (!node->capacity_in_bytes || end > *node->capacity_in_bytes)
+      return fail(view, "fixed scratchpad view exceeds memory capacity");
+    auto& reserved_end = fixed_ends[node->memory_resource];
+    reserved_end = std::max(reserved_end, end);
+    return mlir::WalkResult::advance();
+  };
+  if (module
+          .walk([&](mlir::ktdp::ConstructMemoryViewOp view) {
+            return reserve_view(view);
+          })
+          .wasInterrupted() ||
+      module
+          .walk([&](mlir::ktdp_lowering::ConstructMemoryViewOp view) {
+            return reserve_view(view);
+          })
+          .wasInterrupted())
+    return plan;
+
+  llvm::SmallVector<mlir::ModuleOp> scopes{module};
+  llvm::append_range(scopes, module.getOps<mlir::ModuleOp>());
+  for (auto scope : scopes) {
+    auto allocs = collectAllocations(scope);
+    llvm::SmallDenseSet<ResourceType> reusable;
+    for (auto alloc : allocs) {
+      auto space = llvm::cast<ResourceType>(alloc.getType().getMemorySpace());
+      auto id = tree.getNodeIdForMemory(space);
+      auto node = id ? tree.getNode(*id)
+                     : std::optional<arch_view::MemoryTree::MemoryNode>{};
+      if (!node || !node->capacity_in_bytes) {
+        fail(alloc, "allocation requires a memory resource with capacity");
+        return plan;
+      }
+      if (!tree.isGlobalMemory(space)) reusable.insert(node->memory_resource);
+    }
+    plan.tracker.reset(llvm::to_vector(reusable));
+    for (auto space : reusable) {
+      size_t end = fixed_ends.lookup(space);
+      size_t next = plan.tracker.getNextAvailableAddress(space);
+      if (end <= next) continue;
+      auto reserved = plan.tracker.allocate(space, end - next);
+      if (!reserved) {
+        fail(scope, llvm::toString(reserved.takeError()));
+        return plan;
+      }
+    }
+    for (auto alloc : allocs) {
+      auto size = alloc.getSize();
+      if (mlir::failed(size)) {
+        fail(alloc,
+             "AddressAssignment: allocation has unknown or overflowing size");
+        return plan;
+      }
+      auto space = llvm::cast<ResourceType>(alloc.getType().getMemorySpace());
+      auto resource =
+          tree.getNode(*tree.getNodeIdForMemory(space))->memory_resource;
+      size_t element_bytes =
+          *tryGetSizeInBytes(alloc.getType().getElementType());
+      size_t requested = alloc.getAlignment().valueOrOne().value();
+      size_t alignment;
+      if (__builtin_mul_overflow(requested / std::gcd(requested, element_bytes),
+                                 element_bytes, &alignment)) {
+        fail(alloc, "allocation alignment overflows");
+        return plan;
+      }
+      auto address = plan.tracker.allocate(resource, *size, alignment);
+      if (!address) {
+        std::string message;
+        llvm::raw_string_ostream os(message);
+        os << "Failed to allocate " << space
+           << " memory: " << llvm::toString(address.takeError());
+        fail(alloc, message, true);
+        return plan;
+      }
+      plan.placements.push_back({alloc, *address / element_bytes});
+    }
+  }
+  return plan;
+}
+
+void scheduler::applyAllocationPlan(const AllocationPlan& plan,
+                                    MemoryTrackerAnalysis& analysis) {
+  assert(plan && "cannot apply an unsuccessful allocation plan");
+  for (auto placement : plan.placements) {
+    mlir::OpBuilder builder(placement.allocation);
+    materializeAddressAssignment(mlir::cast<AllocOp>(placement.allocation),
+                                 placement.element_address, builder);
+  }
+  analysis.getTracker() = plan.tracker;
 }
 
 // Made with Bob

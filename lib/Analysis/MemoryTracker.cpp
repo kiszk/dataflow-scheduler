@@ -49,29 +49,22 @@ std::string MemoryTracker::resourceToString(ResourceType memory_resource) {
   return str;
 }
 
-size_t MemoryTracker::alignAddress(size_t address, size_t alignment) {
-  if (alignment <= 1) return address;
-
-  // Round up to next multiple of alignment
-  size_t remainder = address % alignment;
-  if (remainder == 0) return address;
-
-  return address + (alignment - remainder);
-}
-
 llvm::Expected<size_t> MemoryTracker::allocate(ResourceType memory_resource,
                                                size_t size_in_bytes,
                                                size_t alignment) {
-  assert(next_address_.find(memory_resource) != next_address_.end() &&
-         "Memory resource not found in capacity map");
-  // Get current address for this memory resource
-  size_t current_address = next_address_[memory_resource];
-
-  // Align the address
-  size_t aligned_address = alignAddress(current_address, alignment);
-
-  // Calculate the new next address after this allocation
-  size_t new_next_address = aligned_address + size_in_bytes;
+  auto next = next_address_.find(memory_resource);
+  if (next == next_address_.end())
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Memory resource has no capacity information");
+  size_t current_address = next->second;
+  size_t remainder = alignment > 1 ? current_address % alignment : 0;
+  size_t padding = remainder ? alignment - remainder : 0;
+  size_t aligned_address, new_next_address;
+  if (__builtin_add_overflow(current_address, padding, &aligned_address) ||
+      __builtin_add_overflow(aligned_address, size_in_bytes, &new_next_address))
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "Memory allocation address overflows");
 
   // Query the available capacity
   auto capacity_it = capacities_.find(memory_resource);

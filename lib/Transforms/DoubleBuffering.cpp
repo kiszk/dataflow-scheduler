@@ -39,11 +39,13 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 
 #define PASS_NAME "double-buffering"
@@ -197,6 +199,11 @@ scanProducersConsumers(mlir::ktdf::PipelineOp pipeline, mlir::Value buffer) {
   llvm::SmallSetVector<mlir::ktdf::StageOp, 4> producers;
   llvm::SmallSetVector<mlir::ktdf::StageOp, 4> consumers;
 
+  auto root = [](mlir::Value value) {
+    while (auto view = value.getDefiningOp<mlir::ViewLikeOpInterface>())
+      value = view.getViewSource();
+    return value;
+  };
   for (auto stage : pipeline.getStages()) {
     stage->walk([&](mlir::Operation* op) {
       mlir::Value write_buffer;
@@ -207,13 +214,20 @@ scanProducersConsumers(mlir::ktdf::PipelineOp pipeline, mlir::Value buffer) {
       } else if (auto ind = mlir::dyn_cast<mlir::ktdf::IndDataTransferOp>(op)) {
         write_buffer = ind.getDirDst();
         read_buffer = ind.getDirSrc();
+      } else if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(op)) {
+        if (!generic->hasAttr("dataflow_scheduler.mpe_chunk_profile")) return;
+        for (auto input : generic.getInputs())
+          if (root(input) == buffer) consumers.insert(stage);
+        for (auto output : generic.getOutputs())
+          if (root(output) == buffer) producers.insert(stage);
+        return;
       } else {
         return;
       }
-      if (write_buffer == buffer) {
+      if (root(write_buffer) == buffer) {
         producers.insert(stage);
       }
-      if (read_buffer == buffer) {
+      if (root(read_buffer) == buffer) {
         consumers.insert(stage);
       }
     });
@@ -501,6 +515,10 @@ void rewritePipeline(mlir::ktdf::PipelineOp pipeline,
 /// the reason via LDBG.
 bool isPipelineEligible(mlir::ktdf::PipelineOp pipeline,
                         const mlir::ktdf::PipelineEnclosingScope& scope) {
+  if (auto count = pipeline->getAttrOfType<mlir::IntegerAttr>(
+          "dataflow_scheduler.mpe_chunk_buffers");
+      count && count.getInt() == 1)
+    return false;
   if (pipeline.getModuloAttr()) {
     LDBG(1) << "skip pipeline at " << pipeline.getLoc()
             << ": modulo already set";

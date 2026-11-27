@@ -115,6 +115,9 @@ struct TileSCFForLoopsPass
     // Collect all outermost scf.for loops using preorder walk with skip
     llvm::SmallVector<mlir::scf::ForOp> root_loops;
     op->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp for_op) {
+      if (for_op->hasAttr("dataflow_scheduler.mpe_chunk_loop") ||
+          for_op->hasAttr("dataflow_scheduler.mpe_output_group"))
+        return mlir::WalkResult::skip();
       root_loops.push_back(for_op);
       return mlir::WalkResult::skip();
     });

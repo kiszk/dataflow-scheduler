@@ -137,8 +137,23 @@ struct ChunkPipelineConfig {
 // This class can be reused whenever a 3-stage Load / Compute / Store pipeline
 // is required.
 // ---------------------------------------------------------------------------
+/// One rectangular operand access. Each input owns its source map and range.
+struct ChunkTransferSlice {
+  Value buffer;
+  AffineMap map;
+  SmallVector<Value> indices;
+  SmallVector<int64_t> sizes;
+};
+struct ChunkTransfer {
+  ChunkTransferSlice source;
+  ChunkTransferSlice destination;
+};
+
 class StageFactory {
  public:
+  static SmallVector<ktdf::DataTransferOp> buildTransfers(
+      OpBuilder& builder, Location loc, ArrayRef<ChunkTransfer> transfers);
+
   // -------------------------------------------------------------------------
   // Records the pipeline body builder, location, batch induction variable,
   // and per-stage applicable-unit attributes.  Does not emit any IR.

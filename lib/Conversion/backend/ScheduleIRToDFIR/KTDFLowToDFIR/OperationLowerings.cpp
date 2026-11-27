@@ -608,19 +608,33 @@ struct LowerSignalPattern
       }
     }
 
-    // Create all sync_send operations (from current unit to other units)
-    bool wait_immediately_for_async_transfer = true;
-    for (mlir::Value other_query_map : other_query_maps) {
-      mlir::dataflow::SyncSendOp::create(
-          rewriter, signal_op.getLoc(), other_query_map, /*dbgName=*/nullptr,
-          rewriter.getBoolAttr(wait_immediately_for_async_transfer));
+    auto sender = signal_op->getAttrOfType<mlir::IntegerAttr>(
+        "dataflow_scheduler.signal_sender");
+    bool send = true, receive = true;
+    if (sender) {
+      if (sender.getInt() < 0 ||
+          static_cast<uint64_t>(sender.getInt()) >= signal_op.getNumUnits())
+        return signal_op.emitError(
+            "directed signal sender index is out of range");
+      send = scheduler::getUnitTypeFromQueryMap(curr_unit_query_map) ==
+             scheduler::getUnitTypeFromQueryMap(signal_units[sender.getInt()]);
+      receive = !send;
     }
-
-    // Create all sync_recv operations (from other units to current unit)
-    for (mlir::Value other_query_map : other_query_maps) {
-      mlir::dataflow::SyncRecvOp::create(rewriter, signal_op.getLoc(),
-                                         other_query_map, /*dbgName=*/nullptr);
-    }
+    auto mark = [&](mlir::Operation* op) {
+      for (auto name : {"dataflow_scheduler.mpe_input_ready",
+                        "dataflow_scheduler.mpe_input_credit"})
+        if (auto attr = signal_op->getAttr(name)) op->setAttr(name, attr);
+    };
+    if (send)
+      for (mlir::Value other_query_map : other_query_maps)
+        mark(mlir::dataflow::SyncSendOp::create(
+            rewriter, signal_op.getLoc(), other_query_map, /*dbgName=*/nullptr,
+            rewriter.getBoolAttr(true)));
+    if (receive)
+      for (mlir::Value other_query_map : other_query_maps)
+        mark(mlir::dataflow::SyncRecvOp::create(rewriter, signal_op.getLoc(),
+                                                other_query_map,
+                                                /*dbgName=*/nullptr));
 
     // Erase the signal operation
     rewriter.eraseOp(signal_op);

@@ -49,6 +49,20 @@
 
 namespace mlir::ktdf {
 
+/// A static projected-permutation contraction domain, shared by all operands.
+/// Axes come from indexing maps, never from the first input's physical rank.
+struct ContractionChunkDomain {
+  SmallVector<int64_t> loop_sizes;
+  linalg::ContractionDimensions dimensions;
+};
+FailureOr<ContractionChunkDomain> analyzeContractionChunkDomain(
+    linalg::GenericOp op);
+
+/// Descending legal divisors. Products and byte counts are checked separately
+/// on the actual IR allocations by the common allocation planner.
+SmallVector<int64_t> getReductionChunkSizes(int64_t extent,
+                                            int64_t granularity);
+
 /// Result returned by analyzeReductionChunks().
 struct ReductionChunkResult {
   /// Number of sequential chunks (same value applied to every reduction dim).

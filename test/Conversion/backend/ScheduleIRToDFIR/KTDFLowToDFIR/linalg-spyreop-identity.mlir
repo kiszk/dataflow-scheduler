@@ -57,13 +57,17 @@
 // CHECK-NOT: spyreop.identity
 // CHECK: return
 
+// A fused gather/negate/scatter must eliminate both surrounding identities.
 // CHECK-LABEL: func.func @neg_identity_f16(
+// CHECK-DAG: %[[ONE:.*]] = arith.constant dense<1.000000e+00> : vector<64xf16>
+// CHECK-DAG: %[[ZERO:.*]] = arith.constant dense<0.000000e+00> : vector<64xf16>
 // CHECK: dataflow.program_unit
 // CHECK: dataflow.program_unit
 // CHECK: %[[IN:.*]] = dataflow.receive %{{.*}} : vector<64xf16>
 // CHECK-NEXT: %[[NEG:.*]] = vectorchain.neg %[[IN]]
+// CHECK-NEXT: %[[OUT:.*]] = vectorchain.multiply_and_accumulate %[[NEG]], %[[ONE]], %[[ZERO]]
 // CHECK-NOT: vectorchain.binary
-// CHECK: dataflow.send %{{.*}}, %[[NEG]] : vector<64xf16>
+// CHECK: dataflow.send %{{.*}}, %[[OUT]] : vector<64xf16>
 // CHECK-NOT: spyreop.identity
 // CHECK: return
 
@@ -264,7 +268,8 @@ module {
         indexing_maps = [#id, #id], iterator_types = ["parallel"]
       } ins(%input : tensor<64xf16>) outs(%init : tensor<64xf16>) {
       ^bb0(%in: f16, %out: f16):
-        %neg = arith.negf %in : f16
+        %copy = spyreop.identity %in : f16
+        %neg = arith.negf %copy : f16
         %v = spyreop.identity %neg : f16
         linalg.yield %v : f16
       } -> tensor<64xf16>

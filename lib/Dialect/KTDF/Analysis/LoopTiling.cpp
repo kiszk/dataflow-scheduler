@@ -249,6 +249,10 @@ void LoopTilingInfo::assignMetadata(PerfectNestingInfo& nest) {
       }
     }
 
+    if (loop->hasAttr("dataflow_scheduler.mpe_chunk_loop") ||
+        loop->hasAttr("dataflow_scheduler.mpe_output_group"))
+      metadata.strategy = LoopTilingMetadata::Strategy::kNone;
+
     // Store in the map for fast lookup
     loop_to_metadata_[loop.getOperation()] = metadata;
 

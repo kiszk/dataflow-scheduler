@@ -62,248 +62,138 @@ bool areMemoryViewsMatchingExceptOffset(
          view_0.getFromUnit() == view_1.getFromUnit();
 }
 
-// Returns a map from original ForOp → cloned ForOp. The cloned chain has one
-// additional iter arg cascaded from outermost to innermost. In BufferFirst mode
-// the toggle subi is placed at yield; in BufferLast mode it is placed at the
-// top of the innermost loop body.
-llvm::DenseMap<mlir::scf::ForOp, mlir::scf::ForOp>
-cloneLoopChainWithDoubleBufferingIterArgs(
-    llvm::ArrayRef<mlir::scf::ForOp> loops, mlir::Value initial_offset,
-    mlir::Value offset_sum, DoubleBufferingMode mode) {
-  llvm::DenseMap<mlir::scf::ForOp, mlir::scf::ForOp> cloned_loops;
-
-  // Clone from innermost to outermost so each outer clone finds its inner
-  // already in cloned_loops.
-  for (int i = static_cast<int>(loops.size()) - 1; i >= 0; --i) {
-    auto loop = loops[i];
-    bool is_innermost = (i == static_cast<int>(loops.size()) - 1);
-
-    mlir::IRMapping ir_map;
-    auto new_loop = createForOpWithAdditionalIterArgs(
-        loop, /*n_values=*/1, ir_map, /*delete_op=*/true);
-    cloned_loops[loop] = new_loop;
-
-    auto yield_op =
-        mlir::cast<mlir::scf::YieldOp>(new_loop.getBody()->getTerminator());
-    mlir::OpBuilder yield_builder(yield_op);
-    auto new_iter_arg = new_loop.getRegionIterArgs().back();
-
-    mlir::Value yield_value;
-    if (is_innermost) {
-      if (mode == DoubleBufferingMode::BufferFirst) {
-        // Mode A: toggle subi at yield
-        yield_value = mlir::arith::SubIOp::create(
-            yield_builder, yield_op.getLoc(), offset_sum, new_iter_arg);
-      } else {
-        // Mode B: insert toggle subi at loop body top, yield its result
-        mlir::OpBuilder body_builder(&new_loop.getBody()->front());
-        yield_value = mlir::arith::SubIOp::create(
-            body_builder, yield_op.getLoc(), offset_sum, new_iter_arg);
-      }
+// Add all offsets in one traversal. Cloning once per select would invalidate
+// the other selects and lose the shared phase (and existing loop-carried SSA).
+mlir::scf::ForOp cloneLoopChainWithDoubleBufferingIterArgs(
+    llvm::ArrayRef<mlir::scf::ForOp> loops, mlir::ValueRange initial_offsets,
+    mlir::ValueRange offset_sums, DoubleBufferingMode mode) {
+  mlir::scf::ForOp inner;
+  unsigned count = initial_offsets.size();
+  for (auto loop : llvm::reverse(loops)) {
+    mlir::IRMapping map;
+    auto clone =
+        createForOpWithAdditionalIterArgs(loop, count, map, /*delete_op=*/true);
+    auto args = clone.getRegionIterArgs().take_back(count);
+    auto yield =
+        mlir::cast<mlir::scf::YieldOp>(clone.getBody()->getTerminator());
+    llvm::SmallVector<mlir::Value> next;
+    if (inner) {
+      auto child =
+          mlir::cast<mlir::scf::ForOp>(map.lookup(inner.getOperation()));
+      for (auto [operand, arg] :
+           llvm::zip_equal(child.getInitsMutable().take_back(count), args))
+        operand.set(arg);
+      llvm::append_range(next, child.getResults().take_back(count));
     } else {
-      // Outer loop: the previously-cloned inner loop was re-cloned into
-      // new_loop's body by createForOpWithAdditionalIterArgs (and the
-      // pre-clone was destroyed when its containing outer loop was erased).
-      // Use ir_map to find the live re-clone inside new_loop's body.
-      auto pre_clone_inner = cloned_loops[loops[i + 1]];
-      auto* re_cloned_op = ir_map.lookupOrNull(pre_clone_inner.getOperation());
-      assert(re_cloned_op &&
-             "inner loop should have been re-cloned into outer loop body");
-      auto inner_re_cloned = mlir::cast<mlir::scf::ForOp>(re_cloned_op);
-      // Update cloned_loops to the live clone so the next outer iteration
-      // (if any) can find it.
-      cloned_loops[loops[i + 1]] = inner_re_cloned;
-      yield_value = inner_re_cloned.getResults().back();
-
-      // Cascade: inner loop's new iter arg init = outer loop's new iter arg
-      inner_re_cloned
-          .getInitsMutable()[inner_re_cloned.getNumRegionIterArgs() - 1]
-          .assign(new_iter_arg);
+      mlir::OpBuilder b(yield);
+      if (mode == DoubleBufferingMode::BufferLast)
+        b.setInsertionPointToStart(clone.getBody());
+      for (auto [sum, arg] : llvm::zip_equal(offset_sums, args))
+        next.push_back(
+            mlir::arith::SubIOp::create(b, yield.getLoc(), sum, arg));
     }
-
-    llvm::SmallVector<mlir::Value> new_yield_operands(
-        yield_op.getOperands().begin(), yield_op.getOperands().end());
-    new_yield_operands.back() = yield_value;
-    yield_op->setOperands(new_yield_operands);
+    yield.getResultsMutable()
+        .slice(yield.getNumOperands() - count, count)
+        .assign(next);
+    inner = clone;
   }
-
-  // Set the initial value on the outermost loop's new iter arg
-  if (!loops.empty()) {
-    auto outermost = cloned_loops[loops.front()];
-    outermost.getInitsMutable()[outermost.getNumRegionIterArgs() - 1].assign(
-        initial_offset);
-  }
-
-  return cloned_loops;
-}
-
-// Replace cloned_buffer_phase and cloned_select with a new
-// get_logical_memory_view using mem_view_offset as the offset operand.
-mlir::LogicalResult replaceBufferPhaseAndSelectInClonedLoops(
-    mlir::ktdf::BufferPhaseOp cloned_buffer_phase,
-    mlir::ktdf::SelectMemrefOp cloned_select, mlir::MemRefType memref_ty,
-    mlir::Value unit, mlir::AffineMapAttr layout_map_attr,
-    mlir::Value mem_view_offset) {
-  mlir::OpBuilder builder(cloned_select);
-  auto new_view = mlir::dataflow::GetLogicalMemoryViewOp::create(
-      builder, cloned_select.getLoc(), memref_ty, unit, mem_view_offset,
-      layout_map_attr);
-  cloned_select.getResult().replaceAllUsesWith(new_view.getResult());
-  return mlir::success();
+  for (auto [operand, offset] : llvm::zip_equal(
+           inner.getInitsMutable().take_back(count), initial_offsets))
+    operand.set(offset);
+  return inner;
 }
 
 mlir::LogicalResult processOneBufferPhasePair(
-    mlir::ktdf::BufferPhaseOp buffer_phase_op,
-    mlir::ktdf_arch::Mapping& mapping) {
-  // Validate num_phases == 2
-  auto num_phases_attr = buffer_phase_op.getNumPhasesAttr();
-  if (!num_phases_attr || num_phases_attr.getInt() != 2) {
-    buffer_phase_op.emitError(
+    mlir::ktdf::BufferPhaseOp phase, mlir::ktdf_arch::Mapping& mapping) {
+  if (phase.getNumPhases() != 2)
+    return phase.emitError(
         "buffer_phase must have num_phases = 2 for double buffering");
-    return mlir::failure();
+  llvm::SmallVector<mlir::ktdf::SelectMemrefOp> selects;
+  for (auto* user : phase->getUsers()) {
+    auto select = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(user);
+    if (!select)
+      return phase.emitError(
+          "buffer_phase users must be select_memref operations");
+    selects.push_back(select);
   }
-
-  // TODO: Handle case where buffer_phase_op has multiple users
-  // (or check against it)
-  auto select_op = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(
-      *buffer_phase_op.getResult().getUsers().begin());
-  if (!select_op) {
-    buffer_phase_op.emitError(
-        "buffer_phase's sole user must be a select_memref operation");
-    return mlir::failure();
+  if (selects.empty()) {
+    phase.erase();
+    return mlir::success();
   }
-
-  auto candidates = select_op.getCandidates();
-  if (candidates.size() != 2) {
-    select_op.emitError("select_memref must have exactly 2 candidate memrefs");
-    return mlir::failure();
-  }
-
-  auto get_mem_view_0 =
-      candidates[0].getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
-  auto get_mem_view_1 =
-      candidates[1].getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
-  if (!get_mem_view_0 || !get_mem_view_1) {
-    select_op.emitError(
-        "select_memref operands must be get_logical_memory_view operations");
-    return mlir::failure();
-  }
-  if (!areMemoryViewsMatchingExceptOffset(get_mem_view_0, get_mem_view_1)) {
-    select_op.emitError(
-        "get_logical_memory_view operations must match except for offset");
-    return mlir::failure();
-  }
-
-  auto memref_ty =
-      llvm::cast<mlir::MemRefType>(get_mem_view_0.getResult().getType());
-  mlir::Value unit = get_mem_view_0.getFromUnit();
-  mlir::Value offset_0 = get_mem_view_0.getStartAddress();
-  mlir::Value offset_1 = get_mem_view_1.getStartAddress();
-
-  // Resolve mode from enclosing program_unit's resource type
-  auto resource = mapping.resolve(buffer_phase_op);
-  if (!resource) {
-    buffer_phase_op.emitError(
-        "lowerDoubleBuffering: could not resolve component type from "
-        "enclosing program_unit");
-    return mlir::failure();
-  }
-
+  auto resource = mapping.resolve(phase);
+  if (!resource)
+    return phase.emitError(
+        "lowerDoubleBuffering: could not resolve component type from enclosing "
+        "program_unit");
   auto mode = getDoubleBufferingMode(resource);
-
-  // Collect loops from IV operands
   llvm::SmallVector<mlir::scf::ForOp> loops;
-  for (auto iv : buffer_phase_op.getIvs()) {
-    auto block_arg = mlir::cast<mlir::BlockArgument>(iv);
-    loops.push_back(
-        mlir::cast<mlir::scf::ForOp>(block_arg.getOwner()->getParentOp()));
+  for (auto iv : phase.getIvs()) {
+    auto arg = mlir::dyn_cast<mlir::BlockArgument>(iv);
+    auto loop =
+        arg ? mlir::dyn_cast<mlir::scf::ForOp>(arg.getOwner()->getParentOp())
+            : mlir::scf::ForOp{};
+    if (!loop || iv != loop.getInductionVar())
+      return phase.emitError(
+          "buffer_phase operands must be scf.for induction variables");
+    loops.push_back(loop);
   }
+  if (loops.empty())
+    return phase.emitError("buffer_phase must have at least one IV");
 
-  // Compute offset_sum before the outermost loop
-  mlir::OpBuilder builder(loops.front());
-  auto offset_sum = mlir::arith::AddIOp::create(
-      builder, buffer_phase_op.getLoc(), offset_0, offset_1);
-
-  // Mark buffer_phase_op so we can find its clone after loop cloning
-  buffer_phase_op->setAttr(PROCESSING_MARKER_ATTR,
-                           mlir::UnitAttr::get(buffer_phase_op.getContext()));
-
-  // Select initial offset: Mode A = buffer0, Mode B = buffer1
-  mlir::Value initial_offset =
-      (mode == DoubleBufferingMode::BufferFirst) ? offset_0 : offset_1;
-
-  auto cloned_loops = cloneLoopChainWithDoubleBufferingIterArgs(
-      loops, initial_offset, offset_sum, mode);
-
-  LDBG(1) << "Loops cloned, finding marked buffer_phase_op";
-
-  // Find the cloned buffer_phase by marker
-  auto cloned_outermost = cloned_loops[loops.front()];
-  mlir::ktdf::BufferPhaseOp cloned_buffer_phase = nullptr;
-  mlir::ktdf::SelectMemrefOp cloned_select = nullptr;
-
-  cloned_outermost.walk([&](mlir::ktdf::BufferPhaseOp bp) {
-    if (bp->hasAttr(PROCESSING_MARKER_ATTR)) {
-      cloned_buffer_phase = bp;
-      bp->removeAttr(PROCESSING_MARKER_ATTR);
-      cloned_select = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(
-          *bp.getResult().getUsers().begin());
-      return mlir::WalkResult::interrupt();
-    }
-    return mlir::WalkResult::advance();
+  // Validate every select before changing any loop or operation.
+  llvm::SmallVector<mlir::Value> initial_offsets, sums;
+  mlir::OpBuilder b(loops.front());
+  for (auto select : selects) {
+    if (select.getCandidates().size() != 2)
+      return select.emitError(
+          "select_memref must have exactly 2 candidate memrefs");
+    auto first = select.getCandidates()[0]
+                     .getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+    auto second = select.getCandidates()[1]
+                      .getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+    if (!first || !second)
+      return select.emitError(
+          "select_memref operands must be get_logical_memory_view operations");
+    if (!areMemoryViewsMatchingExceptOffset(first, second))
+      return select.emitError(
+          "get_logical_memory_view operations must match except for offset");
+    auto a = first.getStartAddress(), c = second.getStartAddress();
+    initial_offsets.push_back(mode == DoubleBufferingMode::BufferFirst ? a : c);
+    sums.push_back(mlir::arith::AddIOp::create(b, phase.getLoc(), a, c));
+  }
+  phase->setAttr(PROCESSING_MARKER_ATTR, b.getUnitAttr());
+  for (auto [i, select] : llvm::enumerate(selects))
+    select->setAttr(PROCESSING_MARKER_ATTR, b.getI64IntegerAttr(i));
+  auto outer = cloneLoopChainWithDoubleBufferingIterArgs(loops, initial_offsets,
+                                                         sums, mode);
+  mlir::ktdf::BufferPhaseOp cloned_phase;
+  outer.walk([&](mlir::ktdf::BufferPhaseOp op) {
+    if (op->hasAttr(PROCESSING_MARKER_ATTR)) cloned_phase = op;
   });
-
-  if (!cloned_buffer_phase || !cloned_select) {
-    cloned_outermost.emitError(
-        "could not find cloned buffer_phase or select_memref after loop "
-        "cloning");
-    return mlir::failure();
+  assert(cloned_phase && "phase must survive cloning");
+  auto iv = mlir::cast<mlir::BlockArgument>(cloned_phase.getIvs().back());
+  auto inner = mlir::cast<mlir::scf::ForOp>(iv.getOwner()->getParentOp());
+  mlir::ValueRange offsets =
+      inner.getRegionIterArgs().take_back(selects.size());
+  if (mode == DoubleBufferingMode::BufferLast)
+    offsets = inner.getBody()->getTerminator()->getOperands().take_back(
+        selects.size());
+  llvm::SmallVector<mlir::Operation*> users(cloned_phase->getUsers());
+  for (auto* user : users) {
+    auto select = mlir::cast<mlir::ktdf::SelectMemrefOp>(user);
+    auto index =
+        select->getAttrOfType<mlir::IntegerAttr>(PROCESSING_MARKER_ATTR)
+            .getInt();
+    auto view = select.getCandidates()[0]
+                    .getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+    mlir::OpBuilder replace(select);
+    auto result = mlir::dataflow::GetLogicalMemoryViewOp::create(
+        replace, select.getLoc(), view.getType(), view.getFromUnit(),
+        offsets[index], view.getLayoutMapAttr());
+    select.getResult().replaceAllUsesWith(result.getResult());
+    select.erase();
   }
-
-  LDBG(1) << "Found cloned buffer_phase and select_memref";
-
-  // Compute the offset value for get_logical_memory_view.
-  // Mode A: iter_arg (toggle is at yield).
-  // Mode B: subi result inserted at loop body top.
-  auto ivs = cloned_buffer_phase.getIvs();
-  if (ivs.empty()) {
-    cloned_buffer_phase.emitError("buffer_phase must have at least one IV");
-    return mlir::failure();
-  }
-  auto innermost_iv = ivs.back();
-  auto cloned_block_arg = mlir::cast<mlir::BlockArgument>(innermost_iv);
-  auto innermost_loop =
-      mlir::cast<mlir::scf::ForOp>(cloned_block_arg.getOwner()->getParentOp());
-  mlir::Value iter_arg =
-      innermost_loop
-          .getRegionIterArgs()[innermost_loop.getNumRegionIterArgs() - 1];
-
-  mlir::Value mem_view_offset = iter_arg;
-  if (mode == DoubleBufferingMode::BufferLast) {
-    auto* first_op = &innermost_loop.getBody()->front();
-    auto subi = mlir::dyn_cast<mlir::arith::SubIOp>(first_op);
-    assert(
-        subi &&
-        "Expected arith.subi at top of innermost loop body in BufferLast mode");
-    mem_view_offset = subi.getResult();
-  }
-
-  if (mlir::failed(replaceBufferPhaseAndSelectInClonedLoops(
-          cloned_buffer_phase, cloned_select, memref_ty, unit,
-          get_mem_view_0.getLayoutMapAttr(), mem_view_offset))) {
-    return mlir::failure();
-  }
-
-  // Erase cloned intermediates
-  cloned_select.erase();
-  if (cloned_buffer_phase.use_empty()) cloned_buffer_phase.erase();
-
-  // Erase original get_logical_memory_view ops
-  assert(get_mem_view_0.use_empty());
-  get_mem_view_0.erase();
-  assert(get_mem_view_1.use_empty());
-  get_mem_view_1.erase();
-
+  cloned_phase.erase();
   return mlir::success();
 }
 

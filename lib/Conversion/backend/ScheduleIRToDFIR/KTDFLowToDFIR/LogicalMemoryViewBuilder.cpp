@@ -37,7 +37,9 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AffineMap.h"
@@ -246,7 +248,7 @@ mlir::Value walkViewChain(
   while (cursor.hasOneUse()) {
     mlir::Operation* user = *cursor.getUsers().begin();
     auto view = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user);
-    if (!view)
+    if (!view || mlir::isa<mlir::memref::SubViewOp>(user))
       break;
     else if (!rc)
       rc = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(user);
@@ -548,7 +550,8 @@ mlir::LogicalResult replaceSourceAChains(
     // while modifying the use-list.
     llvm::SmallVector<mlir::ViewLikeOpInterface> users;
     for (auto* user : cmv.getResult().getUsers()) {
-      if (auto viewLikeOp = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user))
+      if (auto viewLikeOp = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user);
+          viewLikeOp && !mlir::isa<mlir::memref::SubViewOp>(user))
         users.push_back(viewLikeOp);
     }
 
@@ -624,7 +627,8 @@ static mlir::LogicalResult replaceLoweringConstructMemoryViewOps(
 
     llvm::SmallVector<mlir::ViewLikeOpInterface> chains;
     for (auto* user : cmv.getResult().getUsers()) {
-      if (auto view_like = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user))
+      if (auto view_like = mlir::dyn_cast<mlir::ViewLikeOpInterface>(user);
+          view_like && !mlir::isa<mlir::memref::SubViewOp>(user))
         chains.push_back(view_like);
     }
 
@@ -775,7 +779,7 @@ mlir::LogicalResult propagateTypes(
                                               old_val.getUsers().end());
     for (auto* user : users) {
       if (mlir::isa<mlir::ktdf::DataTransferOp, mlir::ktdf::IndDataTransferOp,
-                    mlir::linalg::LinalgOp>(user)) {
+                    mlir::linalg::LinalgOp, mlir::memref::SubViewOp>(user)) {
         user->replaceUsesOfWith(old_val, new_val);
       } else if (auto sel = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(user)) {
         sel->replaceUsesOfWith(old_val, new_val);
@@ -785,10 +789,11 @@ mlir::LogicalResult propagateTypes(
             mlir::cast<mlir::MemRefType>(new_val.getType()));
         for (auto* sel_user : sel.getResult().getUsers()) {
           if (!mlir::isa<mlir::ktdf::DataTransferOp,
-                         mlir::ktdf::IndDataTransferOp>(sel_user))
+                         mlir::ktdf::IndDataTransferOp, mlir::linalg::LinalgOp>(
+                  sel_user))
             return sel.emitError(
                 "select_memref result used by unexpected op; expected "
-                "data_transfer or ind_data_transfer");
+                "data_transfer, ind_data_transfer or linalg operation");
         }
       } else {
         // Sub-scratchpad spaces (e.g. SFU_REG) are register-file buffers
@@ -805,6 +810,64 @@ mlir::LogicalResult propagateTypes(
         }
       }
     }
+  }
+  return mlir::success();
+}
+
+// A chunk of a resident matrix retains the source row stride. Unlike a
+// reinterpret_cast, subview offsets are relative to its source view. Lower
+// them after the roots so a reshape followed by a slice cannot lose the slice's
+// offset or accidentally regain the full matrix shape.
+mlir::LogicalResult replaceSubviews(mlir::dataflow::ProgramUnitOp pu) {
+  llvm::SmallVector<mlir::memref::SubViewOp> subviews;
+  pu.walk([&](mlir::memref::SubViewOp op) { subviews.push_back(op); });
+  for (auto subview : subviews) {
+    auto source = subview.getSource()
+                      .getDefiningOp<mlir::dataflow::GetLogicalMemoryViewOp>();
+    if (!source)
+      return subview.emitError("subview requires a logical memory view source");
+    auto layout = source.getLayoutMap();
+    if (layout.getNumSymbols() || layout.getNumResults() != 1 ||
+        !subview.getType().hasStaticShape() ||
+        llvm::any_of(subview.getStaticStrides(), mlir::ShapedType::isDynamic))
+      return subview.emitError(
+          "subview requires static shape and strides and a linear memory "
+          "layout");
+    auto source_memref = mlir::cast<mlir::MemRefType>(source.getType());
+    auto source_type = mlir::MemRefType::get(source_memref.getShape(),
+                                             source_memref.getElementType(),
+                                             mlir::AffineMapAttr::get(layout));
+    llvm::SmallVector<int64_t> source_strides;
+    int64_t source_offset;
+    if (mlir::failed(
+            source_type.getStridesAndOffset(source_strides, source_offset)))
+      return subview.emitError("subview requires a linear memory layout");
+    mlir::OpBuilder b(subview);
+    auto loc = subview.getLoc();
+    llvm::SmallVector<mlir::Value> offsets;
+    for (auto offset : subview.getMixedOffsets())
+      offsets.push_back(mlir::getValueOrCreateConstantIndexOp(b, loc, offset));
+    auto displacement =
+        mlir::affine::AffineApplyOp::create(b, loc, layout, offsets);
+    auto address = mlir::arith::AddIOp::create(b, loc, source.getStartAddress(),
+                                               displacement);
+    auto dropped = subview.getDroppedDims();
+    auto relative_layout = b.getAffineConstantExpr(0);
+    unsigned dimension = 0;
+    for (auto [i, stride] : llvm::enumerate(subview.getStaticStrides()))
+      if (!dropped.test(i))
+        relative_layout = relative_layout + b.getAffineDimExpr(dimension++) *
+                                                stride * source_strides[i];
+    // Any constant in the source layout is already included in displacement.
+    // The slice layout contains only strides relative to its new address.
+    auto slice = mlir::AffineMap::get(dimension, 0, relative_layout);
+    auto type = mlir::MemRefType::get(subview.getType().getShape(),
+                                      subview.getType().getElementType());
+    auto view = mlir::dataflow::GetLogicalMemoryViewOp::create(
+        b, loc, type, source.getFromUnit(), address,
+        mlir::AffineMapAttr::get(slice));
+    subview.getResult().replaceAllUsesWith(view.getResult());
+    subview.erase();
   }
   return mlir::success();
 }
@@ -903,6 +966,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
     // Phase 3d: RAUW + type propagation.
     if (mlir::failed(propagateTypes(pu, replacements, memory_tree)))
       return mlir::failure();
+
+    if (mlir::failed(replaceSubviews(pu))) return mlir::failure();
 
     // Erase original Source A chain ops and Source B casts (now dead).
     for (auto& [old_val, new_val] : replacements) {

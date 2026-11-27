@@ -24,6 +24,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "dataflow-scheduler/Analysis/ArchViews/MemoryTree.h"
 #include "dataflow-scheduler/Analysis/ArchViews/RoutingGraph.h"
 #include "dataflow-scheduler/Analysis/PipelineTree.h"
 #include "dataflow-scheduler/Analysis/Utils.h"
@@ -70,6 +71,53 @@ bool containsPipeline(mlir::ktdf::StageOp stage) {
 
 bool isPhaseContainer(mlir::ktdf::PipelineOp pipeline) {
   return llvm::any_of(pipeline.getStages(), containsPipeline);
+}
+
+/// A final export can be a single already-routed memory copy, with no compute
+/// anchor. Accept it only when every transfer has the named unit's direct
+/// source -> unit -> destination datapaths in the architecture graph.
+bool isDirectTransferPipeline(mlir::ktdf::PipelineOp pipeline,
+                              const arch_view::RoutingGraph& graph,
+                              const arch_view::MemoryTree& memories) {
+  if (pipeline.getNumStages() != 1) return false;
+  auto stage = *pipeline.getStages().begin();
+  auto units = stage.getApplicableUnitsAttr();
+  if (!units || units.size() != 1) return false;
+  auto unit = mlir::dyn_cast<ResourceType>(units[0]);
+  auto unit_ids = graph.getNodeIdsForResource(unit);
+  if (unit_ids.empty()) return false;
+  auto resource = [&](mlir::Value buffer) -> ResourceType {
+    auto type = mlir::dyn_cast<mlir::MemRefType>(buffer.getType());
+    if (!type) return {};
+    auto space = mlir::dyn_cast_or_null<ResourceType>(type.getMemorySpace());
+    auto id = space ? memories.getNodeIdForMemory(space) : std::nullopt;
+    return id ? memories.getNode(*id)->memory_resource : ResourceType{};
+  };
+  bool found = false;
+  for (auto& op : *stage.getBody()) {
+    auto transfer = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(op);
+    if (!transfer) {
+      if (!mlir::isMemoryEffectFree(&op)) return false;
+      continue;
+    }
+    found = true;
+    auto src = resource(transfer.getSource());
+    auto dst = resource(transfer.getDestination());
+    if (!src || !dst) return false;
+    bool direct = llvm::any_of(unit_ids, [&](auto unit_id) {
+      if (graph.getNode(unit_id)->kind !=
+          arch_view::RoutingGraph::ResourceNode::ResourceKind::LoadStoreUnit)
+        return false;
+      return llvm::any_of(graph.getNodeIdsForResource(src), [&](auto src_id) {
+        return llvm::any_of(graph.getNodeIdsForResource(dst), [&](auto dst_id) {
+          return graph.getEdgeInfo(src_id, unit_id).has_value() &&
+                 graph.getEdgeInfo(unit_id, dst_id).has_value();
+        });
+      });
+    });
+    if (!direct) return false;
+  }
+  return found;
 }
 
 /// A phase wrapper schedules one nested pipeline, possibly in a loop nest.
@@ -343,6 +391,12 @@ mlir::LogicalResult PathExpansionPass::processPipeline(
     }
     return mlir::success();
   }
+
+  auto& manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
+  auto& memories = manager.getOrCreateView<arch_view::MemoryTree>(
+      *manager.getOrImportDevice());
+  if (isDirectTransferPipeline(pipeline_op, routing_graph, memories))
+    return mlir::success();
 
   // Build PipelineTree for this pipeline
   PipelineTree tree;

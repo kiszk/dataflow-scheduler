@@ -149,3 +149,43 @@ std::optional<llvm::SmallVector<int64_t>> mlir::ktdf::computeChunkDims(
 
   return new_sizes;
 }
+
+FailureOr<ContractionChunkDomain> mlir::ktdf::analyzeContractionChunkDomain(
+    linalg::GenericOp op) {
+  if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1) return failure();
+  auto dims = linalg::inferContractionDims(op);
+  if (failed(dims) || dims->m.size() != 1 || dims->n.size() != 1 ||
+      dims->k.size() != 1)
+    return failure();
+  for (auto value : op->getOperands()) {
+    auto type = dyn_cast<ShapedType>(value.getType());
+    if (!type || !type.hasRank() || !type.hasStaticShape() ||
+        !type.getElementType().isIntOrFloat())
+      return failure();
+    int64_t bytes = llvm::divideCeil(type.getElementTypeBitWidth(), 8);
+    for (int64_t size : type.getShape())
+      if (size <= 0 || __builtin_mul_overflow(bytes, size, &bytes))
+        return failure();
+  }
+  for (auto map : op.getIndexingMapsArray())
+    if (!map.isProjectedPermutation()) return failure();
+  auto sizes = op.getStaticLoopRanges();
+  if (llvm::any_of(sizes, [](int64_t size) { return size <= 0; }))
+    return failure();
+  return ContractionChunkDomain{std::move(sizes), *dims};
+}
+
+SmallVector<int64_t> mlir::ktdf::getReductionChunkSizes(int64_t extent,
+                                                        int64_t granularity) {
+  SmallVector<int64_t> sizes;
+  if (extent <= 0 || granularity <= 0 || extent % granularity) return sizes;
+  // Enumerate divisors in O(sqrt(K / granularity)), not O(K).
+  int64_t units = extent / granularity;
+  for (int64_t d = 1; d <= units / d; ++d) {
+    if (units % d) continue;
+    sizes.push_back(d * granularity);
+    if (d != units / d) sizes.push_back((units / d) * granularity);
+  }
+  llvm::sort(sizes, std::greater<int64_t>());
+  return sizes;
+}

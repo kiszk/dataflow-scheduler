@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 #define DEBUG_TYPE "signal-insertion"
@@ -90,6 +91,41 @@ mlir::LogicalResult scheduler::insertSignals(
   // Normal (intra-iteration) edges: unconditional signal after producer.
   for (const auto& [producer_op, successors] : global_dag.successors) {
     for (auto* consumer_op : successors) {
+      // A chunk's ready/credit pair is directional. S=1 returns credit after
+      // the read; S=2 returns it at entry, releasing the previous iteration's
+      // slot. Neither protocol assumes that a synchronous send is buffered.
+      mlir::linalg::GenericOp chunk;
+      consumer_op->walk([&](mlir::linalg::GenericOp op) {
+        if (op->hasAttr("dataflow_scheduler.mpe_chunk_profile")) chunk = op;
+      });
+      auto loop = consumer_op->getParentOfType<mlir::scf::ForOp>();
+      if (chunk && loop && loop->hasAttr("dataflow_scheduler.mpe_chunk_loop") &&
+          producer_op->getParentOfType<mlir::scf::ForOp>() == loop) {
+        auto units =
+            collectSignalUnits(producer_op, consumer_op, stage_to_units);
+        auto producer = stage_to_units.mapping.find(producer_op);
+        if (units.empty() || producer == stage_to_units.mapping.end()) continue;
+        unsigned consumer_index = producer->second.size();
+        mlir::OpBuilder builder(sharedLevelAncestor(producer_op, consumer_op));
+        builder.setInsertionPointAfter(
+            sharedLevelAncestor(producer_op, consumer_op));
+        auto ready = mlir::ktdf_lowering::SignalOp::create(builder, loc, units);
+        ready->setAttr("dataflow_scheduler.signal_sender",
+                       builder.getI64IntegerAttr(0));
+        ready->setAttr("dataflow_scheduler.mpe_input_ready",
+                       builder.getUnitAttr());
+        auto count = chunk->getAttrOfType<mlir::IntegerAttr>(
+            "dataflow_scheduler.mpe_chunk_buffers");
+        if (!count || count.getInt() == 1)
+          builder.setInsertionPointAfter(consumer_op);
+        auto credit =
+            mlir::ktdf_lowering::SignalOp::create(builder, loc, units);
+        credit->setAttr("dataflow_scheduler.signal_sender",
+                        builder.getI64IntegerAttr(consumer_index));
+        credit->setAttr("dataflow_scheduler.mpe_input_credit",
+                        builder.getUnitAttr());
+        continue;
+      }
       if (!conflicts.count({producer_op, consumer_op})) continue;
       if (back_edge_set.count({producer_op, consumer_op})) continue;
 

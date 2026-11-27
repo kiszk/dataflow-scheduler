@@ -51,6 +51,14 @@ void registerPassPipelinesForScheduler() {
       llvm::cl::value_desc("filename"), llvm::cl::init(""));
 
   mlir::PassPipelineRegistration<>(
+      "schedule-ktdf",
+      "Schedule prepared KTDF and assign capacity-checked buffers",
+      [](mlir::OpPassManager& pm) {
+        scheduler::buildSchedulerOptimizationPipeline(
+            pm, scheduler::SchedulerExtContext::dummyContext());
+      });
+
+  mlir::PassPipelineRegistration<>(
       "ktir-to-dfir", "Schedule and lower KTIR to DataflowIR",
       [&](mlir::OpPassManager& pm) {
         scheduler::buildKTDPToDFIRPipeline(
@@ -83,10 +91,9 @@ auto main(int argc, char** argv) -> int {
   // #spyreop.compare_predicate<...>.  A device is only read once a pass is
   // already running, and MLIR cannot load a new dialect at that point, so load
   // spyreop as soon as ktdf_arch is loaded, while the input is still parsed.
-  registry.addExtension(
-      +[](MLIRContext* context, ktdf_arch::KTDFArchDialect*) {
-        context->getOrLoadDialect<spyreop::SpyreOpDialect>();
-      });
+  registry.addExtension(+[](MLIRContext* context, ktdf_arch::KTDFArchDialect*) {
+    context->getOrLoadDialect<spyreop::SpyreOpDialect>();
+  });
 
   return asMainReturnCode(MlirOptMain(
       argc, argv, "DataflowScheduler modular optimizer driver\n", registry));

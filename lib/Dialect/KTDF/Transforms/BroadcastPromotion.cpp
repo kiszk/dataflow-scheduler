@@ -135,6 +135,12 @@ LogicalResult tryHoistOneBroadcast(ModuleOp module, bool& did_hoist) {
   LogicalResult result = success();
   module.walk<WalkOrder::PostOrder>(
       [&](ktdf::PipelineOp pipeline) -> WalkResult {
+        // Planned matmul groups own their input slots and ready/credit scope.
+        // Hoisting one input out of an output group would change that protocol
+        // and its allocation footprint, including when Q=1 folds away.
+        for (Operation* scope = pipeline; scope; scope = scope->getParentOp())
+          if (scope->hasAttr("dataflow_scheduler.mpe_chunk_group"))
+            return WalkResult::advance();
         if (auto c = ktdf::reuse::findFirstCandidate(pipeline)) {
           if (failed(performHoist(*c))) {
             result = failure();

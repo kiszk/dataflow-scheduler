@@ -33,6 +33,17 @@ bool deferMpeMatmulPipelines(mlir::func::FuncOp func,
 /// Construct the transfer/compute pipelines for validated contractions.
 /// The target extension must validate the original tensor operations first.
 void prepareMpeMatmulPipelines(mlir::func::FuncOp func);
+
+struct MpeMatmulChunkPlan {
+  int64_t k;
+  int64_t buffers;
+};
+/// Plans for a validated, prepared contraction. Full-K is tried by the caller
+/// before these candidates; no target queries are needed for enumeration.
+llvm::SmallVector<MpeMatmulChunkPlan> getMpeMatmulChunkPlans(
+    mlir::linalg::GenericOp op);
+mlir::LogicalResult chunkMpeMatmulPipeline(mlir::linalg::GenericOp op,
+                                           MpeMatmulChunkPlan plan);
 }  // namespace scheduler
 
 #endif  // DATAFLOW_SCHEDULER_KTIRTOSCHEDULEIR_MPEMATMUL_H_

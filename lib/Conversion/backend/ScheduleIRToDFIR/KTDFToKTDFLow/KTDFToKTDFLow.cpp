@@ -52,6 +52,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -148,6 +149,13 @@ static mlir::LogicalResult insertPhaseCompletionSignals(
       stage.walk([&](mlir::ktdf::DataTransferOp transfer) {
         record(transfer.getSource(), stage, false);
         record(transfer.getDestination(), stage, true);
+      });
+      stage.walk([&](mlir::linalg::GenericOp generic) {
+        if (!generic->hasAttr("dataflow_scheduler.mpe_matmul") &&
+            !generic->hasAttr("dataflow_scheduler.mpe_partial_combine"))
+          return;
+        for (auto input : generic.getInputs()) record(input, stage, false);
+        for (auto output : generic.getOutputs()) record(output, stage, true);
       });
       stage.walk([&](mlir::ktdf::IndDataTransferOp transfer) {
         record(transfer.getDirSrc(), stage, false);

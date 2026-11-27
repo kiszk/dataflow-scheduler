@@ -25,6 +25,17 @@
 
 include "mlir/Pass/PassBase.td"
 
+def MpeMatmulChunkingPass : Pass<"mpe-matmul-chunking", "mlir::ModuleOp"> {
+  let summary = "Chunk a validated buffered matmul using explicit LX partial sums";
+  let options = [
+    Option<"chunkSize", "chunk-size", "int64_t", "64", "K elements per chunk">,
+    Option<"buffers", "buffers", "int64_t", "1", "Number of input staging buffers (1 or 2)">
+  ];
+  let dependentDialects = ["mlir::ktdf::KTDFDialect", "mlir::linalg::LinalgDialect",
+      "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect", "mlir::affine::AffineDialect",
+      "mlir::spyreop::SpyreOpDialect"];
+}
+
 def ComputeGroupExtractionPass : Pass<"compute-group-extraction", "mlir::ModuleOp"> {
   let summary = "Extract main and compute group modules from a module";
   let description = [{
