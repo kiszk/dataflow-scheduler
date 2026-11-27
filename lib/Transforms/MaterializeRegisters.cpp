@@ -403,13 +403,107 @@ auto loadFirstLane(Value reg, Operation* reader, RewriterBase& rewriter)
                                 ValueRange{zero});
 }
 
+/// The operand a body argument stands for, or the value itself otherwise.
+auto getGenericOperand(Value value, linalg::GenericOp generic) -> Value {
+  auto argument = dyn_cast<BlockArgument>(value);
+  if (argument && argument.getOwner() == generic.getBody())
+    return generic.getMatchingOpOperand(argument)->get();
+  return value;
+}
+
+/// Values that one arithmetic instruction reads through multiple ports.
+/// A stream can only be consumed once. Its second port cannot reuse a latch
+/// until an earlier instruction has filled that port's latch.
+auto getRepeatedOperands(linalg::GenericOp generic) -> SmallVector<Value> {
+  SetVector<Value> repeated;
+  for (Operation& op : generic.getBody()->without_terminator()) {
+    if (!wantsTheValue(&op)) continue;
+    SmallVector<Value> seen;
+    for (Value value : op.getOperands()) {
+      if ((!value.getType().isF16() && !value.getType().isF32()) ||
+          matchPattern(getGenericOperand(value, generic), m_Constant()))
+        continue;
+      if (llvm::is_contained(seen, value))
+        repeated.insert(value);
+      else
+        seen.push_back(value);
+    }
+  }
+  return llvm::to_vector(repeated);
+}
+
+/// Gives each use its own register read while consuming each shared value
+/// once. The scalar allocations use the same sizing and hoisting as registers
+/// introduced by device patterns. Body arguments are stored at their first
+/// use; OrderFifoSlotsByUse then orders transfers and reads to match the new
+/// consumption order. Computed values are captured at their definition before
+/// a later instruction can overwrite the source register.
+auto materializeRepeatedOperands(linalg::GenericOp generic,
+                                 ArrayRef<Value> repeated,
+                                 ktdf_arch::ExecutionUnitOp compute,
+                                 ktdf_arch::Mapping& mapping,
+                                 SmallVectorImpl<Operation*>& allocations,
+                                 RewriterBase& rewriter) -> LogicalResult {
+  if (repeated.empty()) return success();
+  arch_view::GroupLocalMemory local(mapping.getDevice());
+  const auto registers = local.getLocalMemoryKind(compute.getKind());
+  if (!registers)
+    return generic.emitError(
+        "repeated arithmetic operands require compute-local registers");
+
+  for (Value value : repeated) {
+    // Rewrite every body use, including later instructions. Leaving another
+    // use on the stream would mix its latch lifetime with the register write.
+    SmallVector<OpOperand*> uses;
+    generic.getBody()->walk([&](Operation* op) {
+      for (OpOperand& operand : op->getOpOperands())
+        if (operand.get() == value) uses.push_back(&operand);
+    });
+
+    if (auto load = value.getDefiningOp<memref::LoadOp>();
+        load && load.getMemRefType().getMemorySpace() == registers &&
+        load->getNextNode() == uses.front()->getOwner() &&
+        llvm::all_of(uses, [&](OpOperand* use) {
+          return use->getOwner() == uses.front()->getOwner();
+        })) {
+      // An immediately consumed register needs no copy. Deferred uses must
+      // capture it below: DFIR register loads become physical operand reads,
+      // so cloning a load before an overwriting store would not save its value.
+      rewriter.setInsertionPointAfter(load);
+      for (OpOperand* use : llvm::drop_begin(uses))
+        use->set(rewriter.clone(*load)->getResult(0));
+      continue;
+    }
+
+    if (auto* definition = value.getDefiningOp();
+        definition && definition->getBlock() == generic.getBody())
+      rewriter.setInsertionPointAfter(definition);
+    else
+      rewriter.setInsertionPoint(uses.front()->getOwner());
+    auto type = MemRefType::get({}, value.getType(),
+                                MemRefLayoutAttrInterface{}, registers);
+    auto reg = memref::AllocaOp::create(rewriter, generic.getLoc(), type);
+    allocations.push_back(reg);
+    memref::StoreOp::create(rewriter, generic.getLoc(), value, reg,
+                            ValueRange{});
+    for (OpOperand* use : uses) {
+      rewriter.setInsertionPoint(use->getOwner());
+      Value loaded =
+          memref::LoadOp::create(rewriter, generic.getLoc(), reg, ValueRange{});
+      use->set(loaded);
+    }
+  }
+  return success();
+}
+
 /// Makes the registers \p generic uses real in front of its body.
 auto materializeRegisters(linalg::GenericOp generic,
                           ktdf_arch::Mapping& mapping, RewriterBase& rewriter)
     -> LogicalResult {
   const auto constants = getMappedConstants(generic);
-  const auto allocations = getBodyAllocations(generic);
-  if (constants.empty() && allocations.empty()) {
+  auto allocations = getBodyAllocations(generic);
+  const auto repeated = getRepeatedOperands(generic);
+  if (constants.empty() && allocations.empty() && repeated.empty()) {
     // Nothing to size, so nothing to say about where this one computes.
     return success();
   }
@@ -448,6 +542,10 @@ auto materializeRegisters(linalg::GenericOp generic,
       use->set(loadFirstLane(reg, use->getOwner(), rewriter));
     }
   }
+
+  if (failed(materializeRepeatedOperands(generic, repeated, compute, mapping,
+                                         allocations, rewriter)))
+    return failure();
 
   // The scratch moves out sized to the tile, and the body goes on reading it
   // there. Handing it in as an operand is not open: a generic takes either
