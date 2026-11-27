@@ -830,9 +830,9 @@ struct LowerDataTransferPattern
     mlir::VectorType load_iv_type = vector_type;
     TransferTimeDims src_time_dims(src_static_sizes.size());
     TransferTimeDims dst_time_dims(dst_static_sizes.size());
-    // Set when one time dimension has to leave the time axis for an enclosing
-    // loop; see below.
-    std::optional<unsigned> loop_time_dim;
+    // Dimensions that leave the time axis for enclosing loops, in the
+    // transfer's original outer-to-inner order.
+    llvm::SmallVector<unsigned> loop_time_dims;
 
     if (total > *throttle) {
       if (src_static_sizes.empty() || dst_static_sizes.empty()) {
@@ -887,26 +887,17 @@ struct LowerDataTransferPattern
                            llvm::ArrayRef<int64_t> strides) {
           return step.index_step * strides[step.memref_dim];
         };
-        llvm::SmallVector<unsigned> divergent;
         for (unsigned i = 0, e = src_time_dims.extents.size(); i < e; ++i) {
           if (src_time_dims.extents[i] == 1) continue;
           if (distance(src_time_dims.steps[i], *src_strides) !=
               distance(dst_time_dims.steps[i], *dst_strides)) {
-            divergent.push_back(i);
+            loop_time_dims.push_back(i);
           }
         }
         // A dimension whose distances disagree can still be walked by an
         // enclosing loop: its step then lands in the memref subscripts, where
-        // each side applies its own layout. Several such dimensions would need
-        // a nesting order among them, which nothing here determines.
-        if (divergent.size() > 1) {
-          data_transfer_op.emitError()
-              << "source and destination advance by different distances in "
-              << divergent.size() << " walked dimensions of a transfer of "
-              << total << " elements; only one such dimension can be resolved";
-          return mlir::failure();
-        }
-        if (divergent.size() == 1) loop_time_dim = divergent.front();
+        // each side applies its own layout. Multiple dimensions retain the
+        // source/destination's matching ordered extents as their nesting order.
       }
     }
 
@@ -915,23 +906,24 @@ struct LowerDataTransferPattern
     llvm::SmallVector<mlir::Value> load_indices(src_indices);
     llvm::SmallVector<mlir::Value> store_indices(dst_indices);
 
-    if (loop_time_dim) {
+    for (auto [removed, original_dim] : llvm::enumerate(loop_time_dims)) {
+      unsigned dim = original_dim - removed;
       const auto loc = data_transfer_op.getLoc();
       auto lower = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
       auto upper = mlir::arith::ConstantIndexOp::create(
-          rewriter, loc, src_time_dims.extents[*loop_time_dim]);
+          rewriter, loc, src_time_dims.extents[dim]);
       auto step = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
       auto loop = mlir::scf::ForOp::create(rewriter, loc, lower, upper, step);
 
-      src_map = foldStepIntoSubscripts(context, src_map,
-                                       src_time_dims.steps[*loop_time_dim]);
+      src_map =
+          foldStepIntoSubscripts(context, src_map, src_time_dims.steps[dim]);
       load_indices.push_back(loop.getInductionVar());
-      dst_map = foldStepIntoSubscripts(context, dst_map,
-                                       dst_time_dims.steps[*loop_time_dim]);
+      dst_map =
+          foldStepIntoSubscripts(context, dst_map, dst_time_dims.steps[dim]);
       store_indices.push_back(loop.getInductionVar());
 
-      src_time_dims.eraseDim(*loop_time_dim);
-      dst_time_dims.eraseDim(*loop_time_dim);
+      src_time_dims.eraseDim(dim);
+      dst_time_dims.eraseDim(dim);
 
       rewriter.setInsertionPointToStart(loop.getBody());
     }

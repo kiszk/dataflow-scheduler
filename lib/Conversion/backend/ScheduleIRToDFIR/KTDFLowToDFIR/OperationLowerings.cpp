@@ -246,8 +246,8 @@ struct LowerWriteToFifoPattern
 };
 
 /// Helper to find the current unit's query_map from signal operands
-/// Returns the query_map whose first mapping result matches a program_unit
-/// operand
+/// Returns the query_map with a mapping result that matches a program_unit
+/// operand, including program units executing on a subset of the mapped cores.
 static llvm::FailureOr<mlir::Value> findCurrentUnitQueryMap(
     llvm::ArrayRef<mlir::Value> signal_units,
     llvm::ArrayRef<mlir::Value> program_unit_operands, mlir::Operation* op) {
@@ -267,24 +267,21 @@ static llvm::FailureOr<mlir::Value> findCurrentUnitQueryMap(
       return mlir::failure();
     }
 
-    // Get the first value from the mapping (first result unit)
+    // A program unit may select a nonzero core from a multi-core mapping.
     auto values = def_map_op.getValues();
     if (values.empty()) {
       op->emitError("def_immutable_mapping must have at least one value");
       return mlir::failure();
     }
-    mlir::Value first_unit = values[0];
-
-    // Check if this first unit is in the current program_unit operands
-    for (auto pu_unit : program_unit_operands) {
-      if (first_unit == pu_unit) {
+    for (auto unit : values) {
+      if (llvm::is_contained(program_unit_operands, unit)) {
         return signal_unit;
       }
     }
   }
 
   op->emitError(
-      "signal must include at least one query_map whose first mapping result "
+      "signal must include at least one query_map with a mapping result that "
       "is in the current program_unit");
   return mlir::failure();
 }

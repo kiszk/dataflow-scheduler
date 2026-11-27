@@ -9,7 +9,7 @@ func.func @distributed_view() {
       coordinate_set = #set, memory_space = #ktdp.memory_space<global>
   } : memref<32x64xf16>
 
-  // expected-error @+1 {{V1 does not support ktdp.construct_distributed_memory_view}}
+  // expected-error @+1 {{distributed partition coordinate_sets must not overlap}}
   %A_dist = ktdp.construct_distributed_memory_view (%A_view, %A_view : memref<32x64xf16>, memref<32x64xf16>) : memref<64x64xf16>
 
   return

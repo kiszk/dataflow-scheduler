@@ -22,6 +22,7 @@
 // CHECK-NEXT:   )
 // CHECK-NEXT:   ktir-legality-check
 // CHECK-NEXT:   compute-group-extraction
+// CHECK-NEXT:   ktir-distributed-memory
 // CHECK-NEXT:   indirect-compute-group-split
 // CHECK-NEXT:   indirect-addr-buf-legalization
 // CHECK-NEXT:   indirect-access-loop-materialization

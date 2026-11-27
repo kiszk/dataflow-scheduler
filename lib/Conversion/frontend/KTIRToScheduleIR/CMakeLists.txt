@@ -1,6 +1,7 @@
 add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
     RelayoutMaterialization.cpp
     ComputeGroupExtraction.cpp
+    DistributedMemory.cpp
     FuseLinalg.cpp
     IndirectComputeGroupSplit.cpp
     KTIRBufferize.cpp
@@ -21,6 +22,8 @@ add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
   LINK_LIBS PUBLIC
     KTIR::KtdpDialect
     KTIR::SpyreOpDialect
+    DataflowSchedulerDialects::AgenDialect
+    DataflowSchedulerDialects::DataflowDialect
     DataflowScheduler::Analysis
     DataflowScheduler::ArchViews
     DataflowScheduler::KTDFAnalysis
@@ -35,12 +38,16 @@ add_dataflow_scheduler_library(DataflowSchedulerKTIRToScheduleIR
 
   LINK_MLIR_LIBS
     MLIRIR
+    MLIRAffineAnalysis
     MLIRAffineDialect
     MLIRArithDialect
     MLIRLinalgDialect
+    MLIRMemRefDialect
     MLIRMathDialect
     MLIRPass
+    MLIRPresburger
     MLIRSCFDialect
+    MLIRSCFUtils
     MLIRTensorDialect
     MLIRTransformUtils
 )

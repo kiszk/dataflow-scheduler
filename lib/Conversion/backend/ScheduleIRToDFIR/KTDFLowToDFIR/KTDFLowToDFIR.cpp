@@ -47,6 +47,7 @@
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpTypes.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -55,8 +56,10 @@
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -88,6 +91,138 @@ static void canonicalizeFunc(mlir::func::FuncOp func) {
   mlir::FrozenRewritePatternSet frozen(std::move(patterns));
   // Default GreedyRewriteConfig enables region simplification (DCE).
   (void)mlir::applyPatternsGreedily(func, frozen);
+}
+
+// DistributedMemory marks only mutually independent, whole-packet transfers.
+// Keep one ordered body per physical unit instead of a program per core pair.
+// Do this after one-core helpers have resolved their logical grid and
+// placement; widening their grid before mapping would change their tensor
+// coordinates.
+static mlir::LogicalResult batchDistributedTransfers(mlir::ModuleOp top) {
+  constexpr llvm::StringLiteral marker =
+      "dataflow_scheduler.distributed_transfer_batch";
+  llvm::MapVector<mlir::StringAttr, llvm::SmallVector<mlir::func::FuncOp>>
+      batches;
+  top.walk([&](mlir::func::FuncOp func) {
+    if (auto batch = func->getAttrOfType<mlir::StringAttr>(marker))
+      batches[batch].push_back(func);
+  });
+  for (auto& [name, members] : batches) {
+    for (auto func : members) func->removeAttr(marker);
+    if (members.size() < 2) continue;
+    llvm::SmallVector<mlir::func::CallOp> calls;
+    llvm::SmallVector<mlir::func::FuncOp> ordered;
+    top.walk([&](mlir::func::CallOp call) {
+      for (auto func : members)
+        if (call.getCallee() == func.getName()) {
+          calls.push_back(call);
+          ordered.push_back(func);
+        }
+    });
+    if (calls.size() != members.size())
+      return top.emitError(
+          "distributed transfer batch requires one call per helper");
+    auto first = calls.front();
+    auto type = ordered.front().getFunctionType();
+    for (auto [call, func] : llvm::zip(calls, ordered)) {
+      if (call->getBlock() != first->getBlock() ||
+          call.getOperands() != first.getOperands() ||
+          func.getFunctionType() != type)
+        return call.emitError(
+            "distributed batch must have identical call arguments");
+    }
+    // An intervening effect would invalidate the frontend's independence proof.
+    for (mlir::Operation* op = first; op != calls.back();
+         op = op->getNextNode()) {
+      if (!llvm::is_contained(calls, mlir::dyn_cast<mlir::func::CallOp>(op)) &&
+          !mlir::isMemoryEffectFree(op))
+        return op->emitError(
+            "unexpected effect within distributed transfer batch");
+    }
+
+    mlir::OpBuilder builder(top.getContext());
+    builder.setInsertionPointToEnd(top.getBody());
+    auto module = mlir::ModuleOp::create(builder, first.getLoc(),
+                                         name.getValue().str() + "_batch");
+    mlir::SymbolTable(top).insert(module);
+    builder.setInsertionPointToStart(module.getBody());
+    auto target = mlir::func::FuncOp::create(builder, first.getLoc(),
+                                             *module.getSymName(), type);
+    builder.setInsertionPointToStart(target.addEntryBlock());
+    llvm::SmallVector<mlir::IRMapping> mappings(ordered.size());
+    llvm::SmallVector<mlir::dataflow::GetUnitOp> units;
+    int64_t max_core = 0;
+    // All preludes must dominate all unit bodies, including those appended to
+    // an already existing body. Intern physical unit identities across helpers.
+    for (auto [i, func] : llvm::enumerate(ordered)) {
+      auto& mapping = mappings[i];
+      mapping.map(func.getArguments(), target.getArguments());
+      for (auto& op : func.getBody().front().without_terminator()) {
+        if (mlir::isa<mlir::dataflow::ProgramUnitOp>(op)) continue;
+        if (auto unit = mlir::dyn_cast<mlir::dataflow::GetUnitOp>(op)) {
+          auto found = llvm::find_if(units, [&](auto previous) {
+            return previous->getAttr("type") == unit->getAttr("type") &&
+                   previous->getAttr("core") == unit->getAttr("core") &&
+                   previous->getAttr("corelet") == unit->getAttr("corelet");
+          });
+          if (found != units.end()) {
+            mapping.map(unit.getResults(), found->getResults());
+            continue;
+          }
+          auto cloned =
+              mlir::cast<mlir::dataflow::GetUnitOp>(builder.clone(op, mapping));
+          units.push_back(cloned);
+          if (auto core = cloned->getAttrOfType<mlir::IntegerAttr>("core"))
+            max_core = std::max(max_core, core.getInt());
+        } else {
+          builder.clone(op, mapping);
+        }
+      }
+    }
+    target->setAttr("grid", builder.getI64ArrayAttr({max_core + 1}));
+    llvm::MapVector<mlir::Value, mlir::dataflow::ProgramUnitOp> programs;
+    for (auto [i, func] : llvm::enumerate(ordered)) {
+      for (auto source : func.getOps<mlir::dataflow::ProgramUnitOp>()) {
+        for (mlir::Value old_unit : source.getUnits()) {
+          auto mapping = mappings[i];
+          mlir::Value unit = mapping.lookup(old_unit);
+          auto& destination = programs[unit];
+          if (!destination) {
+            destination = mlir::dataflow::ProgramUnitOp::create(
+                builder, source.getLoc(), mlir::ValueRange{unit},
+                [](mlir::OpBuilder& body, mlir::Location loc,
+                   mlir::ValueRange) {
+                  mlir::dataflow::ReturnOp::create(body, loc);
+                });
+          }
+          // Specialize the helper's uniform queries for this concrete unit.
+          mapping.map(source.getRegion().front().getArgument(0), unit);
+          mlir::OpBuilder body(destination.getRegion().front().getTerminator());
+          for (auto& op : source.getRegion().front().without_terminator())
+            body.clone(op, mapping);
+        }
+      }
+    }
+    mlir::func::ReturnOp::create(builder, target.getLoc());
+    canonicalizeFunc(target);
+
+    auto caller = first->getParentOfType<mlir::ModuleOp>();
+    builder.setInsertionPointToEnd(caller.getBody());
+    auto declaration = mlir::func::FuncOp::create(builder, target.getLoc(),
+                                                  target.getName(), type);
+    declaration.setPrivate();
+    builder.setInsertionPoint(first);
+    mlir::func::CallOp::create(builder, first.getLoc(), declaration,
+                               first.getOperands());
+    for (auto call : calls) call.erase();
+    for (auto func : ordered) {
+      if (auto declaration =
+              caller.lookupSymbol<mlir::func::FuncOp>(func.getName()))
+        declaration.erase();
+      func->getParentOfType<mlir::ModuleOp>().erase();
+    }
+  }
+  return mlir::success();
 }
 
 // Loop normalization introduces index arithmetic. AGEN operands must be loop
@@ -306,7 +441,35 @@ struct KTDFLowToDFIRPass
       canonicalizeFunc(func);
       if (mlir::failed(expandAlternatingBufferOffsets(func)))
         return signalPassFailure();
+
+      // Owner-local distributed-copy programs have a one-element logical
+      // grid. Relocate that whole program, including its local memory units,
+      // only after grid queries and addresses have been resolved. Changing a
+      // memory view's core alone would still execute the load on the wrong LX.
+      if (auto core = func->getAttrOfType<mlir::IntegerAttr>(
+              "dataflow_scheduler.physical_core")) {
+        auto result = func.walk([&](mlir::dataflow::GetUnitOp unit) {
+          auto old = unit->getAttrOfType<mlir::IntegerAttr>("core");
+          if (!old) return mlir::WalkResult::advance();
+          if (old.getInt() != 0 || core.getInt() < 0) {
+            unit.emitError(
+                "fixed placement requires a one-core logical program "
+                "and a nonnegative physical core");
+            return mlir::WalkResult::interrupt();
+          }
+          unit->setAttr("core", core);
+          std::string name = unit.getName().str();
+          if (llvm::StringRef(name).starts_with("C0-"))
+            name.replace(0, 3, "C" + std::to_string(core.getInt()) + "-");
+          unit.setName(name);
+          return mlir::WalkResult::advance();
+        });
+        if (result.wasInterrupted()) return signalPassFailure();
+        func->removeAttr("dataflow_scheduler.physical_core");
+      }
     }
+    if (mlir::failed(batchDistributedTransfers(module_op)))
+      return signalPassFailure();
   }
 
  private:

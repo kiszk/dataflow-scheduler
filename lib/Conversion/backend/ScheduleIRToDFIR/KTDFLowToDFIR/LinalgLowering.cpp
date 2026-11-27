@@ -722,9 +722,12 @@ struct LowerLinalgGenericPattern
                                     mlir::AffineMap identity_map) const {
     mlir::Value input = op.getInput();
     // Fusion has already composed any layout permutation into the generic's
-    // indexing maps. A binary result needs no additional forwarding op. Keep
-    // the OR for a value received by an otherwise empty compute stage.
-    if (input.getDefiningOp<mlir::vectorchain::BinaryOp>()) {
+    // indexing maps. An arithmetic result needs no additional forwarding op.
+    // Keep the OR for a value received by an otherwise empty compute stage.
+    if (mlir::isa_and_nonnull<mlir::vectorchain::BinaryOp,
+                              mlir::vectorchain::FloorOp,
+                              mlir::vectorchain::NegOp>(
+            input.getDefiningOp())) {
       rewriter.replaceOp(op, input);
       return mlir::success();
     }

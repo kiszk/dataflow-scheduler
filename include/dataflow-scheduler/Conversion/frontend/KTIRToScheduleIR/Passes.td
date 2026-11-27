@@ -38,13 +38,54 @@ def KTIRLegalityCheckPass : Pass<"ktir-legality-check", "mlir::ModuleOp"> {
   let description = [{
     Fails fast with a diagnostic when the input contains V1-unsupported
     constructs: scf.for with loop-carried args, scf.while, compute ops outside
-    {add, mul, sub}, or the ktdp distributed-memory-view / indirect-access-tile
-    ops. Mutates nothing; legal input passes through.
+    the supported set, or distributed views outside the static rectangular,
+    disjoint, fixed-owner subset. Mutates nothing; legal input passes through.
   }];
   let constructor = "::scheduler::createKTIRLegalityCheckPass()";
   let dependentDialects = [
     "mlir::scf::SCFDialect",
     "mlir::linalg::LinalgDialect"
+  ];
+}
+
+def KTIRDistributedMemoryPass
+    : Pass<"ktir-distributed-memory", "mlir::ModuleOp"> {
+  let summary = "Resolve static distributed views into owner-local transfers";
+  let description = [{
+    Runs after compute-group extraction. Partitions are disjoint rectangles,
+    with their lower bounds as local origins and explicit ct_id for ct_local.
+    Uses owner-local views directly when the executing core and local access
+    coordinates match. Other accesses use ct_local staging around each
+    compute group. Remote copies use the device's explicit
+    dataflow_scheduler.core_transfer capability (send_unit, receive_unit,
+    bytes), never a memory view referring to another core's local memory.
+    Store tiles must be zero-based rectangles with identity access_tile_order
+    and offsets that are constant after specializing the logical core ID.
+    In-place results use separate core-local output buffers until every old
+    value has been read. Only the intersection of each store with each partition is
+    written back; old output contents are never gathered. Short remote stores
+    travel through a separate owner-local packet relay, followed by an ordinary
+    copy of just the written elements. Known read footprints are narrowed too.
+    Removes unobserved initialization overwritten by the next global copy.
+    Independent whole-packet copies are batched after physical unit mapping.
+    Sequential program calls retain completion ordering, including in an
+    Autopilot launch. Dependent copies retain their boundaries, including
+    publication and reuse of a short-store packet relay.
+    No HBM staging is required.
+  }];
+  let constructor = "::scheduler::createKTIRDistributedMemoryPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::agen::AgenDialect",
+    "mlir::dataflow::DataflowDialect",
+    "mlir::func::FuncDialect",
+    "mlir::ktdp::KtdpDialect",
+    "mlir::ktdf_lowering::KTDFLoweringDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::spyreop::SpyreOpDialect",
+    "mlir::tensor::TensorDialect"
   ];
 }
 

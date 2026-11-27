@@ -49,6 +49,7 @@ void scheduler::buildKTIRFrontendPipeline(
 
   pm.addPass(createKTIRLegalityCheckPass());
   pm.addPass(createComputeGroupExtractionPass());
+  pm.addPass(createKTIRDistributedMemoryPass());
   pm.addPass(createIndirectComputeGroupSplitPass());
   pm.addPass(createIndirectAddrBufLegalizationPass());
   pm.addPass(createIndirectAccessLoopMaterializationPass());

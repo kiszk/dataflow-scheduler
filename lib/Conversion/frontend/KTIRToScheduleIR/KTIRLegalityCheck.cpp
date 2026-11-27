@@ -20,6 +20,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/DistributedMemory.h"
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
@@ -127,12 +128,14 @@ struct KTIRLegalityCheckPass
         return mlir::WalkResult::interrupt();
       }
 
-      // Rule 3 & 4: unsupported ktdp construct ops.
-      if (mlir::isa<mlir::ktdp::ConstructDistributedMemoryViewOp>(op)) {
-        op->emitError(
-            "V1 does not support ktdp.construct_distributed_memory_view");
-        failed = true;
-        return mlir::WalkResult::interrupt();
+      if (auto view =
+              mlir::dyn_cast<mlir::ktdp::ConstructDistributedMemoryViewOp>(
+                  op)) {
+        if (mlir::failed(verifyDistributedMemoryView(view))) {
+          failed = true;
+          return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
       }
       // Rule 2: compute ops.
       // 2a: named linalg ops (anything in the linalg dialect that is not a
